@@ -127,6 +127,9 @@ struct AITextProviderRequest: Equatable {
     let requestID: UUID
     let sourceText: String
     let preparedPrompt: String?
+    /// Frozen at the request boundary. Nil means the provider's verified
+    /// default; a connector must never re-read the workbench selector later.
+    let modelID: String?
     let outputContract: AITextProviderOutputContract
     /// Frozen by the workspace at the request boundary. Ordinary semantic
     /// block requests ignore this value and retain their existing behavior.
@@ -135,11 +138,13 @@ struct AITextProviderRequest: Equatable {
     init(requestID: UUID,
          sourceText: String,
          preparedPrompt: String? = nil,
+         modelID: String? = nil,
          outputContract: AITextProviderOutputContract = .semanticBlocks,
          maximumAlternativeGuessCount: Int = 3) {
         self.requestID = requestID
         self.sourceText = sourceText
         self.preparedPrompt = preparedPrompt
+        self.modelID = modelID
         self.outputContract = outputContract
         self.maximumAlternativeGuessCount = min(
             max(maximumAlternativeGuessCount, 1),
@@ -244,6 +249,9 @@ final class AITextConnectorSelectionStore {
 enum AITextSourcePolicy {
     static func accepts(_ blocks: [BufferModel.Block]) -> Bool {
         blocks.allSatisfy { block in
+            if block.locallyReviewedAsPlainText {
+                return block.pluginMetadata == nil
+            }
             if let metadata = block.pluginMetadata {
                 return metadata.reviewedAsPlainText
             }
@@ -3792,7 +3800,7 @@ final class OpenAICompatibleTextProvider: AITextProvider {
                   onEvent: @escaping (AITextProviderEvent) -> Void,
                   completion: @escaping (Result<[AITextProviderBlock], AITextProviderError>) -> Void)
         -> any AITextCancellable {
-        let configuration: OpenAICompatibleConfiguration
+        var configuration: OpenAICompatibleConfiguration
         do {
             guard let stored = try configurationStore.load() else {
                 completion(.failure(.unavailable("请先配置通用 Open API（OpenAI 兼容）")))
@@ -3802,6 +3810,9 @@ final class OpenAICompatibleTextProvider: AITextProvider {
         } catch {
             completion(.failure(.invalidConfiguration("通用 Open API（OpenAI 兼容）配置不可用")))
             return AITextNoopCancellation()
+        }
+        if let modelID = request.modelID {
+            configuration.model = modelID
         }
         do {
             let urlRequest = try AITextOpenAIRequestBuilder.makeRequest(
@@ -3940,6 +3951,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         let requestID: UUID
         let sourceText: String
         let sourceBlockIDs: [UUID]
+        let format: AITextContentFormat
     }
 
     var kind: AITextProviderKind { provider.kind }
@@ -3947,6 +3959,8 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
     private let provider: any AITextProvider
     private let sourceModel: BufferModel
     private let selectionPredicate: () -> Bool
+    private let generationSelectionResolver:
+        (AITextProviderKind) throws -> AITextGenerationSelection
     private let followsConnectorSelection: Bool
     private let workspaceIdentifier: String
     private var observers: [NSObjectProtocol] = []
@@ -3969,11 +3983,18 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
     init(provider: any AITextProvider,
          sourceModel: BufferModel = .shared,
          pluginKey: PluginKey? = nil,
+         generationSelectionResolver: @escaping
+            (AITextProviderKind) throws -> AITextGenerationSelection = {
+                try AITextGenerationPreferenceStore.shared.requestSelection(
+                    connectorKind: $0
+                )
+            },
          isSelected: @escaping () -> Bool) {
         let resolvedPluginKey = pluginKey ?? provider.kind.pluginKey
         self.pluginKey = resolvedPluginKey
         self.provider = provider
         self.sourceModel = sourceModel
+        self.generationSelectionResolver = generationSelectionResolver
         selectionPredicate = isSelected
         followsConnectorSelection = resolvedPluginKey == AITextBuiltInPluginID.key
         workspaceIdentifier = followsConnectorSelection
@@ -4144,14 +4165,30 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             notifyChange()
             return false
         }
+        let plan: AITextGenerationPlan
+        do {
+            let selection = try generationSelectionResolver(kind)
+            // The command router owns Mailbox requests so the task can outlive
+            // Buffer. A direct workspace call must never accidentally launch
+            // that request on this close-cancelled lifecycle.
+            guard selection.destination == .inline else { return false }
+            plan = try AITextGenerationPlan.capture(
+                sourceModel: sourceModel,
+                selection: selection
+            )
+        } catch {
+            phase = .failed(error.localizedDescription)
+            notifyChange()
+            return false
+        }
         cancelCurrentTask()
         generation &+= 1
-        let requestID = UUID()
         let blocks = sourceModel.blocks
         let job = Job(generation: generation,
-                      requestID: requestID,
-                      sourceText: sourceModel.stagedText,
-                      sourceBlockIDs: blocks.map(\.id))
+                      requestID: plan.requestID,
+                      sourceText: plan.sourceText,
+                      sourceBlockIDs: blocks.map(\.id),
+                      format: plan.selection.format)
         activeJob = job
         capturedSourceText = job.sourceText
         capturedSourceBlockIDs = job.sourceBlockIDs
@@ -4161,14 +4198,19 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         outputBlocks.removeAll()
         phase = .running
         activityStartedAt = ProcessInfo.processInfo.systemUptime
-        activityMessage = "正在启动 \(kind.displayName)"
+        activityMessage = "正在启动 \(plan.selection.connectorKind.displayName)"
         startActivityClock(for: job)
         notifyChange()
 
         let relay = AITextCancellationRelay()
         currentTask = relay
         let task = provider.generate(
-            AITextProviderRequest(requestID: requestID, sourceText: job.sourceText),
+            AITextProviderRequest(
+                requestID: plan.requestID,
+                sourceText: plan.sourceText,
+                preparedPrompt: plan.preparedPrompt,
+                modelID: plan.selection.modelID
+            ),
             onEvent: { [weak self] event in
                 self?.performOnMain { workspace in
                     workspace.receive(event, for: job)
@@ -4207,6 +4249,16 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             activityMessage = message
             notifyChange()
         case let .blockSnapshot(block):
+            guard job.format == .plain else {
+                // A partial Markdown document or JSON value is not a usable
+                // delivery block. Keep it transient until terminal validation
+                // can publish the complete document atomically.
+                let message = "\(kind.displayName) 正在流式返回"
+                guard activityMessage != message else { return }
+                activityMessage = message
+                notifyChange()
+                return
+            }
             guard block.index >= 0,
                   block.index < AITextRuntimeLimits.maximumModelBlockCount,
                   let validated = try? AITextResultDecoder
@@ -4243,7 +4295,10 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             }
         case let .success(blocks):
             do {
-                let fragments = try refinedFragments(blocks)
+                let fragments = try terminalFragments(
+                    blocks,
+                    format: job.format
+                )
                 outputBlocks = makeOutputBlocks(fragments, incomplete: false)
                 streamingLogicalBlocks.removeAll()
                 phase = .ready
@@ -4304,6 +4359,46 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         }
         _ = try AITextResultDecoder.validate(delivery)
         return fragments
+    }
+
+    private func terminalFragments(
+        _ blocks: [AITextProviderBlock],
+        format: AITextContentFormat
+    ) throws -> [SemanticBlockFragment] {
+        switch format {
+        case .plain:
+            return try refinedFragments(blocks)
+        case .markdown, .json:
+            let logical = try AITextResultDecoder.validateLogicalBlocks(blocks)
+            let document = logical.sorted(by: { $0.index < $1.index })
+                .map(\.text)
+                .joined(separator: "\n\n")
+            guard !document.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty,
+                  document.utf8.count
+                    <= AITextRuntimeLimits.maximumWireBytes else {
+                throw AITextProviderError.resultTooLarge
+            }
+            if format == .json {
+                guard let data = document.data(using: .utf8) else {
+                    throw AITextProviderError.invalidResult
+                }
+                do {
+                    _ = try JSONSerialization.jsonObject(
+                        with: data,
+                        options: [.fragmentsAllowed]
+                    )
+                } catch {
+                    throw AITextProviderError.invalidResult
+                }
+            }
+            return [SemanticBlockFragment(
+                key: SemanticBlockKey(sourceIndex: 0, childIndex: 0),
+                text: document,
+                title: logical.first?.title
+            )]
+        }
     }
 
     private func makeOutputBlocks(_ fragments: [SemanticBlockFragment],

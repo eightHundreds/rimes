@@ -65,6 +65,42 @@ protocol DerivedResultSelectionControls: AnyObject {
     @discardableResult func selectResult(blockID: UUID) -> Bool
 }
 
+struct DerivedOptionPickerOption: Equatable {
+    let identifier: String
+    let title: String
+}
+
+/// Optional single-choice filter shown beside the selected workspace. The
+/// option remains owned by the workspace so changing it invalidates stale
+/// results and delivery authority in one transaction.
+protocol DerivedOptionPickerControls: AnyObject {
+    var optionPickerOptions: [DerivedOptionPickerOption] { get }
+    var selectedOptionPickerID: String { get }
+    var optionPickerToolTip: String { get }
+    @discardableResult func setOptionPickerSelection(_ identifier: String)
+        -> Bool
+}
+
+/// A selected result may require a short, local authorization gesture before
+/// it becomes deliverable. This is deliberately separate from ordinary
+/// `BufferDeliveryContentSource` payloads: protected plaintext must never be
+/// exposed through the shared pending-block surface.
+protocol WorkbenchProtectedDeliveryControls: AnyObject {
+    var canRequestProtectedDelivery: Bool { get }
+    var protectedDeliveryPromptActive: Bool { get }
+    var protectedDeliveryPromptProgress: Int { get }
+    var protectedDeliveryPromptStepCount: Int { get }
+    @discardableResult func requestProtectedDelivery(target: FocusLease) -> Bool
+    @discardableResult func cancelProtectedDeliveryPrompt() -> Bool
+}
+
+enum WorkbenchProtectedDeliveryRouter {
+    static var selectedControls: (any WorkbenchProtectedDeliveryControls)? {
+        DerivedBufferWorkspaceRouter.selectedWorkspace
+            as? any WorkbenchProtectedDeliveryControls
+    }
+}
+
 /// The right-side workbench control has one shared state machine whether the
 /// generator is a trusted two-rail workspace or an external prepared Action
 /// Plugin. Keeping this contract outside `DerivedBufferWorkspace` prevents
@@ -124,6 +160,13 @@ extension AITextPluginWorkspace: DerivedBufferWorkspace,
     var workbenchDisplayName: String { "AI 生成 · \(kind.displayName)" }
     var isGenerating: Bool { phase == .running }
     var generationProviderName: String { kind.displayName }
+    var generationRequestDescription: String {
+        let output = AITextGenerationPreferenceStore.shared.output
+        if output.isMailbox {
+            return "发送到 Mailbox；关闭 Buffer 后在后台完成"
+        }
+        return "用 \(kind.displayName) 原地处理当前全部缓冲内容"
+    }
     var generationStatusText: String { statusText }
     var primaryAction: WorkbenchManualGenerationPrimaryAction {
         WorkbenchManualGenerationPrimaryActionRules.resolve(
@@ -164,6 +207,7 @@ enum DerivedBufferWorkspaceRouter {
             AppleTranslationWorkspace.shared,
             AITextPluginRuntimeRegistry.shared.workspace,
             StreamInputWorkspace.shared,
+            CapsuleWorkspace.shared,
         ]
     }
 

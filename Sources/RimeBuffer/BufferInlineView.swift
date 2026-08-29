@@ -257,6 +257,8 @@ enum TranslationRailRoleSymbolRules {
         case "文": return .init(name: "text.bubble.fill", accessibilityLabel: "转换结果")
         case "搜": return .init(name: "magnifyingglass", accessibilityLabel: "提示词查询")
         case "词": return .init(name: "doc.text.magnifyingglass", accessibilityLabel: "提示词结果")
+        case "查": return .init(name: "magnifyingglass", accessibilityLabel: "Capsule 查询")
+        case "囊": return .init(name: "archivebox", accessibilityLabel: "Capsule 条目")
         default:
             return target
                 ? .init(name: "sparkles", accessibilityLabel: "处理结果")

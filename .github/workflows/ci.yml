@@ -271,6 +271,8 @@ jobs:
             update-package-metadata-smoke
             origin-smoke
             inbound-smoke
+            mailbox-store-smoke
+            mailbox-window-smoke
             plugin-smoke
             plugin-stream-smoke
             plugin-platform-smoke
@@ -278,6 +280,8 @@ jobs:
             plugin-configuration-smoke
             translation-smoke
             ai-text-smoke
+            ai-text-mailbox-smoke
+            capsule-smoke
             stream-input-smoke
             settings-routing-smoke
             history-heatmap-smoke
@@ -285,7 +289,6 @@ jobs:
             fly-chord-learning-smoke
             input-telemetry-smoke
             user-lexicon-smoke
-            remote-smoke
           )
           for smoke in "${SMOKES[@]}"; do
             echo "::group::$smoke"
@@ -324,11 +327,11 @@ jobs:
             dimensions="$(sips -g pixelWidth -g pixelHeight "$OUTPUT"/*.png | \
               awk '/pixelWidth:/{w=$2}/pixelHeight:/{print w"x"$2}' | sort -u)"
             echo "mode=$MODE pngs=$png_count routes=$route_count dimensions=$dimensions"
-            # A clean profile renders the 17 always-available routes. The
+            # A clean profile renders the 18 always-available routes. The
             # optional Chording extension adds four more only after enablement.
             test "$png_count" = "$route_count"
-            test "$png_count" = '17'
-            test "$route_count" = '17'
+            test "$png_count" = '18'
+            test "$route_count" = '18'
             test "$translation_route_count" = '0'
             # bitmapImageRepForCachingDisplay follows the hosted runner's
             # backing scale. A headless 1x runner and a Retina 2x runner both

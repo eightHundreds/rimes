@@ -140,6 +140,7 @@ enum RimeShortcutAction: String, CaseIterable {
     case deliverBuffer
     case toggleWorkbench
     case toggleClipboardHistory
+    case openMailbox
     case openSettings
     case previousPlugin
     case nextPlugin
@@ -149,6 +150,7 @@ enum RimeShortcutAction: String, CaseIterable {
         case .deliverBuffer: return "投递缓冲内容"
         case .toggleWorkbench: return "显示或隐藏工作台"
         case .toggleClipboardHistory: return "显示或隐藏剪贴板历史"
+        case .openMailbox: return "显示或隐藏 Mailbox"
         case .openSettings: return "打开设置"
         case .previousPlugin: return "上一个缓冲插件"
         case .nextPlugin: return "下一个缓冲插件"
@@ -163,6 +165,8 @@ enum RimeShortcutAction: String, CaseIterable {
             return "在任何应用中呼出或收起缓冲工作台"
         case .toggleClipboardHistory:
             return "在共享工作台中单独呼出或收起剪贴板历史"
+        case .openMailbox:
+            return "在任何应用中打开或关闭本地保存的外部来源与 AI 会话"
         case .openSettings:
             return "在任何应用中打开 RIMES 设置"
         case .previousPlugin:
@@ -187,6 +191,11 @@ enum RimeShortcutAction: String, CaseIterable {
         case .toggleClipboardHistory:
             return RimeKeyboardShortcut(
                 keyCode: UInt16(kVK_ANSI_P),
+                modifiers: [.command, .shift]
+            )
+        case .openMailbox:
+            return RimeKeyboardShortcut(
+                keyCode: UInt16(kVK_ANSI_M),
                 modifiers: [.command, .shift]
             )
         case .openSettings:
@@ -233,12 +242,12 @@ enum RimeShortcutPreferenceError: Error, Equatable {
 enum RimeShortcutPreferences {
     private static let keyPrefix = "keyboardShortcut.v1."
 
-    /// These actions may already have an explicit user binding from a version
-    /// that did not expose the Clipboard rail shortcut. Upgrade must preserve
-    /// those choices even if one already owns the new Command-Shift-P default.
-    private static let actionsPredatingClipboardHistory: [RimeShortcutAction] = [
+    /// Preserve every other global/custom binding when repairing a missing
+    /// Clipboard shortcut, even if one already owns Command-Shift-P.
+    private static let actionsProtectedFromClipboardMigration: [RimeShortcutAction] = [
         .deliverBuffer,
         .toggleWorkbench,
+        .openMailbox,
         .openSettings,
         .previousPlugin,
         .nextPlugin,
@@ -252,11 +261,34 @@ enum RimeShortcutPreferences {
         UInt16(kVK_ANSI_F), UInt16(kVK_ANSI_G), UInt16(kVK_ANSI_H),
         UInt16(kVK_ANSI_I), UInt16(kVK_ANSI_J), UInt16(kVK_ANSI_K),
         UInt16(kVK_ANSI_L), UInt16(kVK_ANSI_M), UInt16(kVK_ANSI_N),
-        UInt16(kVK_ANSI_O), UInt16(kVK_ANSI_Q), UInt16(kVK_ANSI_R),
+        UInt16(kVK_ANSI_O), UInt16(kVK_ANSI_R),
         UInt16(kVK_ANSI_T), UInt16(kVK_ANSI_U), UInt16(kVK_ANSI_V),
         UInt16(kVK_ANSI_W), UInt16(kVK_ANSI_X), UInt16(kVK_ANSI_Y),
         UInt16(kVK_ANSI_Z), UInt16(kVK_ANSI_A), UInt16(kVK_ANSI_B),
         UInt16(kVK_ANSI_S),
+    ]
+
+    /// Mailbox arrived after the other bindings. Preserve every explicit or
+    /// migrated binding from an older build and choose a deterministic free
+    /// chord only when Command-Shift-M is already occupied.
+    private static let actionsPredatingMailbox: [RimeShortcutAction] = [
+        .deliverBuffer,
+        .toggleWorkbench,
+        .toggleClipboardHistory,
+        .openSettings,
+        .previousPlugin,
+        .nextPlugin,
+    ]
+
+    private static let mailboxFallbackKeyCodes: [UInt16] = [
+        UInt16(kVK_ANSI_N), UInt16(kVK_ANSI_O),
+        UInt16(kVK_ANSI_R), UInt16(kVK_ANSI_T), UInt16(kVK_ANSI_U),
+        UInt16(kVK_ANSI_V), UInt16(kVK_ANSI_W), UInt16(kVK_ANSI_X),
+        UInt16(kVK_ANSI_Y), UInt16(kVK_ANSI_Z), UInt16(kVK_ANSI_A),
+        UInt16(kVK_ANSI_C), UInt16(kVK_ANSI_D), UInt16(kVK_ANSI_E),
+        UInt16(kVK_ANSI_F), UInt16(kVK_ANSI_G), UInt16(kVK_ANSI_H),
+        UInt16(kVK_ANSI_I), UInt16(kVK_ANSI_J), UInt16(kVK_ANSI_K),
+        UInt16(kVK_ANSI_L),
     ]
 
     static func shortcut(for action: RimeShortcutAction,
@@ -264,8 +296,57 @@ enum RimeShortcutPreferences {
         if action == .toggleClipboardHistory {
             migrateClipboardHistoryShortcutIfNeeded(defaults: defaults)
         }
+        if action == .openMailbox {
+            migrateMailboxShortcutIfNeeded(defaults: defaults)
+        }
         return storedShortcut(for: action, defaults: defaults)
             ?? action.defaultShortcut
+    }
+
+    private static func migrateMailboxShortcutIfNeeded(defaults: UserDefaults) {
+        let mailboxAction = RimeShortcutAction.openMailbox
+        let mailboxKey = preferenceKey(for: mailboxAction)
+        if let data = defaults.data(forKey: mailboxKey),
+           let shortcut = try? JSONDecoder().decode(
+               RimeKeyboardShortcut.self,
+               from: data
+           ),
+           mailboxAction.accepts(shortcut) {
+            return
+        }
+
+        // Resolve the Clipboard migration first, then inspect only stored or
+        // pre-Mailbox defaults. This avoids recursive allCases lookup.
+        migrateClipboardHistoryShortcutIfNeeded(defaults: defaults)
+        let occupied = actionsPredatingMailbox.map { action in
+            (action, storedShortcut(for: action, defaults: defaults)
+                ?? action.defaultShortcut)
+        }
+        let desired = mailboxAction.defaultShortcut
+        guard let conflict = occupied.first(where: { $0.1 == desired }) else {
+            return
+        }
+        let fallback = mailboxFallbackKeyCodes.lazy
+            .map {
+                RimeKeyboardShortcut(
+                    keyCode: $0,
+                    modifiers: [.command, .shift]
+                )
+            }
+            .first { candidate in
+                mailboxAction.accepts(candidate)
+                    && !occupied.contains(where: { $0.1 == candidate })
+            }
+        guard let fallback,
+              let data = try? JSONEncoder().encode(fallback) else {
+            IMELog.write("Mailbox shortcut migration failed; no free fallback")
+            return
+        }
+        defaults.set(data, forKey: mailboxKey)
+        IMELog.write(
+            "Mailbox shortcut migrated; preserved=\(conflict.0.rawValue) "
+                + "mailbox=\(fallback.displayTitle)"
+        )
     }
 
     /// This accessor is also used during global-hot-key installation, so the
@@ -285,7 +366,7 @@ enum RimeShortcutPreferences {
             return
         }
 
-        let occupied = actionsPredatingClipboardHistory.map { action in
+        let occupied = actionsProtectedFromClipboardMigration.map { action in
             (action, storedShortcut(for: action, defaults: defaults)
                 ?? action.defaultShortcut)
         }

@@ -1,7 +1,5 @@
 import Cocoa
 import InputMethodKit
-import Network
-import CryptoKit
 import Carbon
 import Darwin
 
@@ -10,6 +8,14 @@ import Darwin
 // startup so the helper can return the saved password and terminate without
 // creating a second input-method process.
 if let status = RemarkableSSHAskPassHandler.handleIfRequested() {
+    exit(status)
+}
+
+// Capsule management is an explicit standalone CLI surface. It runs before
+// AppKit/IMK startup; the password namespace never exposes plaintext output.
+if let status = CapsulePasswordCLI.handleIfRequested(
+    arguments: CommandLine.arguments
+) {
     exit(status)
 }
 
@@ -588,11 +594,27 @@ if CommandLine.arguments.contains("ai-text-smoke") {
 if CommandLine.arguments.contains("ai-text-terminal-receipt-smoke") {
     exit(runAITextTerminalDeliveryReceiptSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("ai-text-mailbox-smoke") {
+    exit(runAITextMailboxGenerationSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("mailbox-store-smoke") {
+    exit(runMailboxStoreSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("mailbox-window-smoke") {
+    exit(runMailboxWindowSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("mailbox-toast-smoke") {
+    exit(runMailboxToastSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("stream-input-smoke") {
     exit(runStreamInputPluginSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("my-prompt-smoke") {
     exit(runMyPromptPluginSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("capsule-smoke")
+    || CommandLine.arguments.contains("capsule-password-smoke") {
+    exit(runCapsulePasswordSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("remarkable-plugin-smoke") {
     exit(runRemarkablePluginSmokeTest() ? 0 : 1)
@@ -617,9 +639,6 @@ if CommandLine.arguments.contains("user-lexicon-smoke") {
 }
 if CommandLine.arguments.contains("user-lexicon-bridge-smoke") {
     exit(runRimeUserLexiconBridgeSmokeTest() ? 0 : 1)
-}
-if CommandLine.arguments.contains("remote-smoke") {
-    exit(runRemoteSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("matrix-smoke") {
     exit(runCandidateMatrixSmokeTest() ? 0 : 1)
@@ -934,10 +953,11 @@ BufferWindowController.shared.showOnLaunchIfNeeded()
 
 // Local gateway: accept MCP / HTTP pushes from local agents into the inbound
 // bus (loopback-only, token-gated). Off is a one-line setting.
+MailboxInteractionBridge.shared.aiReplyCoordinator =
+    AITextMailboxGenerationCoordinator.shared
+_ = InboundToast.shared
 InboundBus.shared.onChange = {
     InboundTrayWindow.refreshIfOpen()
-    InboundToast.shared.update(pendingCount: InboundBus.shared.pendingCount,
-                               trayVisible: InboundTrayWindow.isVisible)
 }
 LocalGateway.shared.startIfEnabled()
 
@@ -948,50 +968,6 @@ StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 // Auto-update: silently check GitHub Releases on launch + hourly, download in the
 // background, and surface it through the input method's controls when ready.
 UpdateManager.shared.startPeriodicUpdateCheck()
-
-// Remote typing ("隔空传字"): text committed here mirrors to a paired Mac; text
-// from the peer lands here — into the focused field if ETInput is active, else
-// on the clipboard as a fallback. Both callbacks run on the main thread.
-var remoteClipboardBuffer = ""   // accumulates received text while no field is focused
-RemoteTypingService.shared.onReceiveText = { text in
-    if RimeBufferController.insertRemoteText(text) {
-        remoteClipboardBuffer = ""
-        IMELog.write("remote: inserted received text into focused field")
-    } else {
-        // No safely deliverable field (focus changed, secure input, or active
-        // composition) — accumulate without clobbering the prior message.
-        remoteClipboardBuffer += text
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(remoteClipboardBuffer, forType: .string)
-        IMELog.write("remote: direct insert unavailable; accumulated \(remoteClipboardBuffer.count) chars to clipboard")
-    }
-}
-// A peer asks to pair — show 同意/拒绝 with the 4-digit SAS. One tap, no code entry.
-RemoteTypingService.shared.onPairRequest = { peerName, sas, respond in
-    let alert = NSAlert()
-    alert.messageText = "「\(peerName)」请求隔空传字"
-    alert.informativeText = "同意后，对方打的字会即时出现在你这里，你打的字也会发给对方。\n验证码：\(sas)（两台显示一致即代表安全，无中间人）"
-    alert.addButton(withTitle: "同意")
-    alert.addButton(withTitle: "拒绝")
-    alert.window.appearance = RimeUI.appKitAppearance
-    NSApp.activate(ignoringOtherApps: true)
-    respond(alert.runModal() == .alertFirstButtonReturn)
-}
-// We initiated pairing and reached the peer — confirm the SAS matches, then request.
-RemoteTypingService.shared.onPairConfirm = { peerName, sas, proceed in
-    let alert = NSAlert()
-    alert.messageText = "与「\(peerName)」配对"
-    alert.informativeText = "请核对两台 Mac 显示的验证码一致：\(sas)\n一致后点「配对」，再请对方点「同意」。"
-    alert.addButton(withTitle: "配对")
-    alert.addButton(withTitle: "取消")
-    alert.window.appearance = RimeUI.appKitAppearance
-    NSApp.activate(ignoringOtherApps: true)
-    proceed(alert.runModal() == .alertFirstButtonReturn)
-}
-RemoteTypingService.shared.onStatusChange = {
-    SettingsWindowController.shared.remoteStatusDidChange()
-}
-RemoteTypingService.shared.restart()   // starts only if enabled
 
 private enum InputSourceChangeDiagnosticRules {
     static func elapsedMilliseconds(previousUptime: TimeInterval?,
@@ -2684,7 +2660,8 @@ func runInboundBusSmokeTest() -> Bool {
         return false
     }
 
-    let bus = InboundBus.shared
+    // A CLI smoke must not persist fixtures into the user's real Mailbox.
+    let bus = InboundBus()
     let model = BufferModel.shared
     let oldEnabled = model.enabled
     defer { model.discardForPrivacy(); bus.clear(); model.enabled = oldEnabled }
@@ -2701,8 +2678,16 @@ func runInboundBusSmokeTest() -> Bool {
     }
 
     // ask source → pending, NOT in the buffer yet.
-    let id = bus.submit(origin: .mcp(client: "codex"), text: "草稿一", title: "t")
-    guard let id, bus.pendingCount == 1, model.blocks.isEmpty else {
+    let id = bus.submit(
+        origin: .mcp(client: "codex"),
+        text: "## 草稿一",
+        title: "t",
+        format: .markdown
+    )
+    guard let id,
+          bus.pendingCount == 1,
+          bus.pending.first?.format == .markdown,
+          model.blocks.isEmpty else {
         print("FAILED: ask source should wait in pending, not enter buffer")
         return false
     }
@@ -2736,10 +2721,17 @@ func runInboundBusSmokeTest() -> Bool {
 
     // Streaming: text updates in place, one pending item, endStream settles it.
     model.discardForPrivacy(); bus.clear()
-    _ = bus.beginStream(origin: .mcp(client: "a"), streamID: "s1")
+    _ = bus.beginStream(
+        origin: .mcp(client: "a"),
+        streamID: "s1",
+        format: .json
+    )
     bus.appendStream(streamID: "s1", delta: "部分")
     bus.appendStream(streamID: "s1", delta: "文本")
-    guard bus.pendingCount == 1, bus.pending[0].text == "部分文本", bus.pending[0].streaming else {
+    guard bus.pendingCount == 1,
+          bus.pending[0].text == "部分文本",
+          bus.pending[0].format == .json,
+          bus.pending[0].streaming else {
         print("FAILED: streaming should update one item in place")
         return false
     }
@@ -2773,6 +2765,106 @@ func runInboundBusSmokeTest() -> Bool {
     for i in 0..<(InboundBus.maxPending + 10) { _ = bus.submit(origin: .mcp(client: "a"), text: "x\(i)") }
     guard bus.pendingCount == InboundBus.maxPending else {
         print("FAILED: pending cap not enforced, got \(bus.pendingCount)")
+        return false
+    }
+
+    // Capacity limits reject atomically. A success response must never hide a
+    // truncated complete push or streaming tail.
+    bus.clear()
+    let oversizedText = String(repeating: "x", count: InboundBus.maxTextCount + 1)
+    guard bus.submitDetailed(
+        origin: .http(source: "oversized"),
+        text: oversizedText
+    ) == .rejected(.tooLarge),
+          bus.pending.isEmpty else {
+        print("FAILED: oversized complete inbound text was not rejected atomically")
+        return false
+    }
+    guard bus.beginStream(
+        origin: .mcp(client: "oversized"),
+        streamID: "oversized-stream"
+    ) != nil,
+          bus.appendStream(
+            streamID: "oversized-stream",
+            delta: String(repeating: "x", count: InboundBus.maxTextCount)
+          ) == .appended,
+          bus.appendStream(
+            streamID: "oversized-stream",
+            delta: "tail"
+          ) == .tooLarge,
+          bus.pending.first?.text.count == InboundBus.maxTextCount else {
+        print("FAILED: oversized stream tail was not rejected atomically")
+        return false
+    }
+    bus.clear()
+
+    // Metadata-free plugin pushes (including restored Mailbox reviews) become
+    // explicit local plain text. They carry no fabricated runtime/focus grant
+    // and may safely enter both ordinary delivery and AI source preparation.
+    model.discardForPrivacy(); bus.clear()
+    guard let pluginReviewID = bus.submit(
+        origin: .plugin(id: "restored-plugin"),
+        text: "已审核插件文本"
+    ),
+          bus.accept(pluginReviewID),
+          model.blocks.count == 1,
+          model.blocks[0].pluginMetadata == nil,
+          model.blocks[0].locallyReviewedAsPlainText,
+          AITextSourcePolicy.accepts(model.blocks) else {
+        print("FAILED: metadata-free plugin review was not safe plain text")
+        return false
+    }
+
+    // Production-style buses must never claim an item is pending when its
+    // Mailbox association could not be committed. This fixture fills the
+    // durable thread capacity and covers complete plus streamed submissions.
+    let persistenceRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "rimebuffer-inbound-persistence-smoke-\(UUID().uuidString)",
+            isDirectory: true
+        )
+    do {
+        defer { try? FileManager.default.removeItem(at: persistenceRoot) }
+        let persistenceStore = try MailboxStore(
+            storageRoot: persistenceRoot,
+            limits: MailboxStoreLimits(
+                maximumThreads: 1,
+                maximumMessagesPerThread: 4,
+                maximumMessageCharacters: 4_096,
+                maximumFileBytes: 1_048_576
+            )
+        )
+        _ = try persistenceStore.createInboundThread(
+            source: .http(source: "capacity fixture"),
+            body: "occupy the only durable thread"
+        )
+        let durableBus = InboundBus(mailboxStore: persistenceStore)
+        guard durableBus.submitDetailed(
+            origin: .http(source: "must fail"),
+            text: "not durable"
+        ) == .rejected(.persistenceUnavailable),
+              durableBus.pending.isEmpty else {
+            print("FAILED: complete persistence failure left hidden pending data")
+            return false
+        }
+        guard durableBus.beginStream(
+            origin: .mcp(client: "must fail"),
+            streamID: "persistence-failure"
+        ) != nil else {
+            print("FAILED: stream persistence fixture did not start")
+            return false
+        }
+        durableBus.appendStream(
+            streamID: "persistence-failure",
+            delta: "not durable"
+        )
+        guard !durableBus.endStream(streamID: "persistence-failure"),
+              durableBus.pending.isEmpty else {
+            print("FAILED: stream persistence failure left hidden pending data")
+            return false
+        }
+    } catch {
+        print("FAILED: inbound persistence fixture threw \(error)")
         return false
     }
 
@@ -5898,6 +5990,46 @@ func runBufferWindowSmokeTest() -> Bool {
         return false
     }
 
+    let mailboxMigrationSuite =
+        "RimeBuffer.MailboxShortcutMigrationSmoke.\(UUID().uuidString)"
+    guard let mailboxMigrationDefaults = UserDefaults(suiteName: mailboxMigrationSuite),
+          let legacyCommandShiftM = try? JSONEncoder().encode(
+            RimeKeyboardShortcut(
+                keyCode: UInt16(kVK_ANSI_M),
+                modifiers: [.command, .shift]
+            )
+          ) else {
+        print("FAILED: could not create Mailbox shortcut migration fixture")
+        return false
+    }
+    defer {
+        mailboxMigrationDefaults.removePersistentDomain(
+            forName: mailboxMigrationSuite
+        )
+    }
+    mailboxMigrationDefaults.set(
+        legacyCommandShiftM,
+        forKey: "keyboardShortcut.v1.\(RimeShortcutAction.openSettings.rawValue)"
+    )
+    let migratedMailboxShortcut = RimeShortcutPreferences.shortcut(
+        for: .openMailbox,
+        defaults: mailboxMigrationDefaults
+    )
+    guard migratedMailboxShortcut == RimeKeyboardShortcut(
+            keyCode: UInt16(kVK_ANSI_N),
+            modifiers: [.command, .shift]
+          ),
+          RimeShortcutPreferences.shortcut(
+            for: .openSettings,
+            defaults: mailboxMigrationDefaults
+          ) == RimeKeyboardShortcut(
+            keyCode: UInt16(kVK_ANSI_M),
+            modifiers: [.command, .shift]
+          ) else {
+        print("FAILED: Mailbox shortcut migration overwrote an existing binding")
+        return false
+    }
+
     let workbenchHotKey = GlobalHotKeyRouting.definition(
         for: .toggleWorkbench,
         defaults: hotKeyDefaults
@@ -5910,9 +6042,14 @@ func runBufferWindowSmokeTest() -> Bool {
         for: .openSettings,
         defaults: hotKeyDefaults
     )
+    let mailboxHotKey = GlobalHotKeyRouting.definition(
+        for: .openMailbox,
+        defaults: hotKeyDefaults
+    )
     let workbenchHotKeyID = workbenchHotKey.identifier
     let clipboardHotKeyID = clipboardHotKey.identifier
     let settingsHotKeyID = settingsHotKey.identifier
+    let mailboxHotKeyID = mailboxHotKey.identifier
     let unrelatedHotKeyID = EventHotKeyID(
         signature: GlobalHotKeyRouting.signature,
         id: UInt32.max
@@ -6069,9 +6206,15 @@ func runBufferWindowSmokeTest() -> Bool {
           settingsHotKey.keyCode == UInt32(kVK_ANSI_S),
           settingsHotKey.modifiers == UInt32(cmdKey | shiftKey),
           settingsHotKey.registrationOptions == OptionBits(kEventHotKeyNoOptions),
+          mailboxHotKey.keyCode == UInt32(kVK_ANSI_M),
+          mailboxHotKey.modifiers == UInt32(cmdKey | shiftKey),
+          mailboxHotKey.registrationOptions == OptionBits(kEventHotKeyExclusive),
           workbenchHotKeyID.id != settingsHotKeyID.id,
           clipboardHotKeyID.id != workbenchHotKeyID.id,
           clipboardHotKeyID.id != settingsHotKeyID.id,
+          mailboxHotKeyID.id != workbenchHotKeyID.id,
+          mailboxHotKeyID.id != clipboardHotKeyID.id,
+          mailboxHotKeyID.id != settingsHotKeyID.id,
           reloadedSettingsHotKey.keyCode == UInt32(kVK_ANSI_G),
           reloadedSettingsHotKey.modifiers == UInt32(controlKey | optionKey),
           reloadedClipboardHotKey.keyCode == UInt32(kVK_ANSI_H),
@@ -6107,6 +6250,11 @@ func runBufferWindowSmokeTest() -> Bool {
           ) == .openSettings,
           GlobalHotKeyRouting.route(
             eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed),
+            identifier: mailboxHotKeyID
+          ) == .openMailbox,
+          GlobalHotKeyRouting.route(
+            eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyReleased),
             identifier: workbenchHotKeyID
           ) == .ignore,
@@ -6115,7 +6263,7 @@ func runBufferWindowSmokeTest() -> Bool {
             eventKind: UInt32(kEventHotKeyPressed),
             identifier: unrelatedHotKeyID
           ) == .ignore else {
-        print("FAILED: global workbench/Clipboard/settings hotkey routing")
+        print("FAILED: global workbench/Clipboard/Mailbox/settings hotkey routing")
         return false
     }
 
@@ -8840,6 +8988,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let derivedInlineComposition = BufferInlineView
         .derivedInlineCompositionSnapshotForSmoke()
     let bufferCandidateSnapshot = CandidateWindow.bufferCaretSnapshotForSmoke()
+    let candidateActionSurface = CandidateWindow.actionSurfaceSnapshotForSmoke()
     guard inlineComposition.renderedText == "wai'mian",
           inlineComposition.renderedPrefix == "wai",
           inlineComposition.renderedSuffix == "'mian",
@@ -8859,10 +9008,33 @@ func runBufferWindowSmokeTest() -> Bool {
           bufferCandidateSnapshot.preeditHidden,
           abs(bufferCandidateSnapshot.stripOnlyHeight
                 - bufferCandidateSnapshot.expectedStripOnlyHeight) < 0.5,
-          bufferCandidateSnapshot.bufferActionHidden,
           bufferCandidateSnapshot.rejectedCachedHostAnchor,
           bufferCandidateSnapshot.scrubbedCandidateViews,
           bufferCandidateSnapshot.scrubbedPreedit,
+          candidateActionSurface.renderedCandidateButtons == 2,
+          candidateActionSurface.renderedLegacyActionButtons == 0,
+          candidateActionSurface.settingsButtonVisible,
+          candidateActionSurface.settingsAccessibilityLabel == "打开设置",
+          !CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: 0x30,
+            isExpanded: false
+          ),
+          !CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: 0x30,
+            isExpanded: true
+          ),
+          !CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: 0x31,
+            isExpanded: false
+          ),
+          CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: 0x31,
+            isExpanded: true
+          ),
+          CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: 0x39,
+            isExpanded: true
+          ),
           BufferCandidateRoutingRules.shouldFollowBufferCaret(
             workbenchVisible: true,
             presentationProtected: false,
@@ -9429,119 +9601,6 @@ func runMarineBridgeSmokeTest() -> Bool {
     return false
 }
 
-// MARK: - Remote-typing transport smoke (crypto + framing + loopback socket)
-
-func runRemoteSmokeTest() -> Bool {
-    print("== \(ProductIdentity.displayName) remote-typing smoke test ==")
-    print("identity fp:", RemoteIdentity.fingerprint)   // must be stable across launches (Keychain)
-
-    // 1) ECDH session key: two identities derive the SAME key; and AES-GCM
-    //    round-trips only under that key.
-    let a = Curve25519.KeyAgreement.PrivateKey()
-    let b = Curve25519.KeyAgreement.PrivateKey()
-    let nA = RemoteCrypto.randomNonce(), nB = RemoteCrypto.randomNonce()
-    func derive(_ priv: Curve25519.KeyAgreement.PrivateKey, _ peer: Curve25519.KeyAgreement.PublicKey) -> SymmetricKey {
-        let shared = try! priv.sharedSecretFromKeyAgreement(with: peer)
-        let salt = nA.lexicographicallyPrecedes(nB) ? nA + nB : nB + nA
-        return shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt,
-                                              sharedInfo: Data("etinput-remote-session-v1".utf8), outputByteCount: 32)
-    }
-    let keyA = derive(a, b.publicKey)
-    let keyB = derive(b, a.publicKey)
-    let wrong = SymmetricKey(size: .bits256)
-    let plain = Data("你好 hello".utf8)
-    guard keyA.withUnsafeBytes({ Data($0) }) == keyB.withUnsafeBytes({ Data($0) }),
-          let sealed = RemoteCrypto.seal(plain, key: keyA),
-          RemoteCrypto.open(sealed, key: keyB) == plain,
-          RemoteCrypto.open(sealed, key: wrong) == nil else {
-        print("FAILED: ECDH key agreement / AES-GCM"); return false
-    }
-    print("ECDH + crypto: OK")
-
-    // 2) Framing: plaintext hello + sealed message, streaming reassembly.
-    let hello = HelloMessage(deviceID: "A", name: "阿 Mac", pubKey: "cHViaw==", nonce: "bm9uYw==")
-    guard let hf = RemoteFrame.encodeHello(hello),
-          let sf = RemoteFrame.encodeSealed(.init(kind: .text, seq: 7, text: "世界B"), key: keyA) else {
-        print("FAILED: frame encode"); return false
-    }
-    let dec = RemoteFrame.Decoder()
-    var helloOK = false, textOK = false
-    for byte in (hf + sf) {
-        guard let frames = dec.feed(Data([byte])) else { print("FAILED: decoder dropped"); return false }
-        for f in frames {
-            switch f.type {
-            case .hello:
-                if let h = try? JSONDecoder().decode(HelloMessage.self, from: f.payload),
-                   h.deviceID == "A", h.name == "阿 Mac" { helloOK = true }
-            case .sealed:
-                if let j = RemoteCrypto.open(f.payload, key: keyB),
-                   let m = try? JSONDecoder().decode(SealedMessage.self, from: j),
-                   m.kind == .text, m.seq == 7, m.text == "世界B" { textOK = true }
-            }
-        }
-    }
-    guard helloOK, textOK else { print("FAILED: framing hello=\(helloOK) text=\(textOK)"); return false }
-    print("framing (hello + sealed, streaming): OK")
-
-    // 3) Loopback transport: real NWListener <- NWConnection over 127.0.0.1.
-    let q = DispatchQueue(label: "remote-smoke")
-    let listener: NWListener
-    do { listener = try NWListener(using: .tcp) } catch { print("FAILED: listener \(error)"); return false }
-    let ldec = RemoteFrame.Decoder()
-    let recvSem = DispatchSemaphore(value: 0)
-    var received: String?
-    listener.newConnectionHandler = { conn in
-        conn.stateUpdateHandler = { st in
-            guard case .ready = st else { return }
-            func loop() {
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, err in
-                    if let data, !data.isEmpty, let frames = ldec.feed(data) {
-                        for f in frames where f.type == .sealed {
-                            if let j = RemoteCrypto.open(f.payload, key: keyA),
-                               let m = try? JSONDecoder().decode(SealedMessage.self, from: j) {
-                                received = m.text; recvSem.signal()
-                            }
-                        }
-                    }
-                    if err == nil && !done { loop() }
-                }
-            }
-            loop()
-        }
-        conn.start(queue: q)
-    }
-    let portSem = DispatchSemaphore(value: 0)
-    var port: NWEndpoint.Port?
-    listener.stateUpdateHandler = { st in
-        switch st {
-        case .ready: port = listener.port; portSem.signal()
-        case .failed: portSem.signal()
-        default: break
-        }
-    }
-    listener.start(queue: q)
-    guard portSem.wait(timeout: .now() + 5) == .success, let port else {
-        print("FAILED: listener did not become ready"); listener.cancel(); return false
-    }
-    let conn = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
-    conn.stateUpdateHandler = { st in
-        guard case .ready = st else { return }
-        if let frame = RemoteFrame.encodeSealed(.init(kind: .text, seq: 1, text: "远程你好"), key: keyA) {
-            conn.send(content: frame, completion: .idempotent)
-        }
-    }
-    conn.start(queue: q)
-    let ok = recvSem.wait(timeout: .now() + 5) == .success
-    conn.cancel(); listener.cancel()
-    guard ok, received == "远程你好" else {
-        print("FAILED: loopback transport received=\(received ?? "nil")"); return false
-    }
-    print("loopback transport: OK")
-
-    print("remote smoke: OK")
-    return true
-}
-
 /// Pins the "unsupported interval" rule behind the candidate-window size controls:
 /// a dependent metric (button height, candidate glyph, index label) can only be
 /// set as high as its container currently allows, because anything taller is
@@ -9599,8 +9658,6 @@ func runCandidateMetricsSmokeTest() -> Bool {
           "the full resolver should then clamp labels to the candidate glyph")
     check(CandidateLayout.candidateSeparatorRunWidth == 14,
           "preview and live candidate separators should occupy the same width")
-    check(CandidateLayout.bufferActionMinWidth == 38,
-          "preview and live buffer actions should share the same minimum width")
 
     // Exercise the real AppKit/CoreText hierarchy at normal, selected, maximum
     // font and extra-tall button sizes. The title view occupies a symmetric

@@ -1272,6 +1272,32 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private let translationSourcePopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let translationTargetPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let translationSwapButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let derivedOptionPickerPopup = FirstMousePopUpButton(
+        frame: .zero,
+        pullsDown: false
+    )
+    private let aiConnectorPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
+    private let aiModelPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
+    private let aiModePopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
+    private let aiOutputPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
+    private struct AIOutputMenuChoice: Equatable {
+        let destination: AITextGenerationDestination
+        let format: AITextContentFormat
+
+        var key: String { "\(destination.rawValue):\(format.rawValue)" }
+        var title: String {
+            destination == .mailbox
+                ? "Mailbox · \(format.displayName)"
+                : format.displayName
+        }
+
+        static let all: [AIOutputMenuChoice] =
+            AITextContentFormat.allCases.map {
+                AIOutputMenuChoice(destination: .inline, format: $0)
+            } + AITextContentFormat.allCases.map {
+                AIOutputMenuChoice(destination: .mailbox, format: $0)
+            }
+    }
     private let sendButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let sendButtonProgressIndicator = NSProgressIndicator()
     private let exchangeEditButton = FirstMouseButton(title: "", target: nil, action: nil)
@@ -1299,9 +1325,13 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private var renderingTranslationControls = false
     private var renderingAIControls = false
     private var renderingBuiltInActionControls = false
+    private var renderingOptionPickerControls = false
     private var renderedBuiltInActionHasOptions: Bool?
     private var renderedTranslationLanguages: [TranslationLanguageOption] = []
     private var renderedBuiltInActionOptions: [BuiltInBufferActionOption] = []
+    private var renderedDerivedOptionPickerOptions: [
+        DerivedOptionPickerOption
+    ] = []
     private var sendButtonUsesAccent = false
     private var openingSide: BufferOpeningSide = .bottomFallback
     private var openingFocusToken: FocusToken?
@@ -1634,6 +1664,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     func hideWithoutPausing() {
         workbenchSessionEpoch &+= 1
         clearInlineComposition()
+        CapsulePasswordUnlockPromptController.shared.dismiss()
         UserDefaults.standard.set(false, forKey: Key.visible)
         panel.orderOut(nil)
         syncClipboardHistoryCapture()
@@ -1667,6 +1698,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     @discardableResult
     func dismissFromEscape() -> Bool {
         guard isVisible else { return false }
+        if WorkbenchProtectedDeliveryRouter.selectedControls?
+                .cancelProtectedDeliveryPrompt() == true {
+            CapsulePasswordUnlockPromptController.shared.dismiss()
+            refresh()
+            RimeBufferController.refreshActiveUI()
+            IMELog.write("capsule protected delivery prompt cancelled")
+            return true
+        }
         pauseAndHide(settleCapturedComposition: true)
         IMELog.write("buffer workbench closed by escape")
         return true
@@ -2144,7 +2183,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
         assert(!contentProtected || bufferRail.isHidden,
                "secure input must leave the text-bearing rail hidden")
+        let protectedDeliveryControls =
+            WorkbenchProtectedDeliveryRouter.selectedControls
         refreshPrimaryAction(controls: WorkbenchManualGenerationRouter.selectedControls,
+                             protectedControls: protectedDeliveryControls,
                              availability: availability,
                              contentProtected: contentProtected)
         refreshExchangeActions(
@@ -2153,6 +2195,9 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             contentProtected: contentProtected
         )
         refreshPluginActions()
+        syncProtectedDeliveryPrompt(
+            controls: protectedDeliveryControls
+        )
         applyAppearance()
         if inlineComposition != nil {
             candidateWindow.syncWorkbenchLayout()
@@ -2390,6 +2435,50 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         translationSourcePopup.action = #selector(translationSourceChanged)
         translationTargetPopup.target = self
         translationTargetPopup.action = #selector(translationTargetChanged)
+
+        derivedOptionPickerPopup.controlSize = .mini
+        derivedOptionPickerPopup.font = .systemFont(ofSize: 10)
+        derivedOptionPickerPopup.target = self
+        derivedOptionPickerPopup.action = #selector(derivedOptionPickerChanged)
+        derivedOptionPickerPopup.translatesAutoresizingMaskIntoConstraints = false
+        derivedOptionPickerPopup.widthAnchor.constraint(
+            equalToConstant: 92
+        ).isActive = true
+        derivedOptionPickerPopup.setContentHuggingPriority(
+            .required,
+            for: .horizontal
+        )
+        derivedOptionPickerPopup.setContentCompressionResistancePriority(
+            .required,
+            for: .horizontal
+        )
+
+        let aiPopupWidths: [(FirstMousePopUpButton, CGFloat)] = [
+            (aiConnectorPopup, 98),
+            (aiModelPopup, 88),
+            (aiModePopup, 62),
+            (aiOutputPopup, 112),
+        ]
+        for (popup, width) in aiPopupWidths {
+            popup.controlSize = .mini
+            popup.font = .systemFont(ofSize: 10)
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            popup.widthAnchor.constraint(equalToConstant: width).isActive = true
+            popup.setContentHuggingPriority(.required, for: .horizontal)
+            popup.setContentCompressionResistancePriority(.required,
+                                                          for: .horizontal)
+        }
+        aiConnectorPopup.target = self
+        aiConnectorPopup.action = #selector(aiConnectorChanged)
+        aiConnectorPopup.toolTip = "选择实际处理请求的 AI 连接器"
+        aiModelPopup.isEnabled = false
+        aiModelPopup.toolTip = "CLI 使用已验证的默认模型；OpenAI 使用连接器设置中的模型"
+        aiModePopup.target = self
+        aiModePopup.action = #selector(aiModeChanged)
+        aiModePopup.toolTip = "选择本次处理方式"
+        aiOutputPopup.target = self
+        aiOutputPopup.action = #selector(aiOutputChanged)
+        aiOutputPopup.toolTip = "选择内容格式，以及原地生成或送入 Mailbox"
 
         builtInActionOptionPopup.controlSize = .mini
         builtInActionOptionPopup.font = .systemFont(ofSize: 10)
@@ -2653,8 +2742,13 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         builtInActionButton.refreshInteractionAppearance()
         pluginSelector.refreshInteractionAppearance()
         builtInActionOptionPopup.refreshInteractionAppearance()
+        derivedOptionPickerPopup.refreshInteractionAppearance()
         translationSourcePopup.refreshInteractionAppearance()
         translationTargetPopup.refreshInteractionAppearance()
+        aiConnectorPopup.refreshInteractionAppearance()
+        aiModelPopup.refreshInteractionAppearance()
+        aiModePopup.refreshInteractionAppearance()
+        aiOutputPopup.refreshInteractionAppearance()
         contextualStatusViews.values.forEach { $0.applyAppearance() }
     }
 
@@ -2666,6 +2760,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         builtInActionOptionPopup.setPreviewPointerState(nil)
         translationSourcePopup.setPreviewPointerState(nil)
         translationTargetPopup.setPreviewPointerState(nil)
+        aiConnectorPopup.setPreviewPointerState(nil)
+        aiModelPopup.setPreviewPointerState(nil)
+        aiModePopup.setPreviewPointerState(nil)
+        aiOutputPopup.setPreviewPointerState(nil)
         translationSwapButton.setPreviewPointerState(nil)
         builtInActionButton.setPreviewPointerState(nil)
         pluginActionButtons.values.forEach { $0.setPreviewPointerState(nil) }
@@ -2686,12 +2784,29 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
     private func refreshPrimaryAction(
         controls: (any WorkbenchManualGenerationControls)?,
+        protectedControls: (any WorkbenchProtectedDeliveryControls)?,
         availability: BufferDeliveryCoordinator.Availability,
         contentProtected: Bool
     ) {
         sendButton.imagePosition = .imageOnly
         sendButton.title = ""
         sendButtonUsesAccent = false
+        if let protectedControls,
+           protectedControls.canRequestProtectedDelivery
+            || protectedControls.protectedDeliveryPromptActive {
+            setSendButtonGenerating(false)
+            setSendButtonSymbol("paperplane.fill")
+            let waiting = protectedControls.protectedDeliveryPromptActive
+            sendButton.isEnabled = !waiting && !contentProtected
+            sendButton.toolTip = waiting
+                ? "等待访问密钥"
+                : "验证访问密钥后上屏（\(deliveryShortcutTitle)）"
+            sendButton.setAccessibilityLabel(
+                waiting ? "等待访问密钥" : "验证后上屏"
+            )
+            sendButtonUsesAccent = true
+            return
+        }
         guard let controls else {
             setSendButtonGenerating(false)
             setSendButtonSymbol("paperplane.fill")
@@ -2743,6 +2858,30 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    private func syncProtectedDeliveryPrompt(
+        controls: (any WorkbenchProtectedDeliveryControls)?
+    ) {
+        guard let controls,
+              controls.protectedDeliveryPromptActive,
+              isVisible,
+              !sessionProtectionActive else {
+            CapsulePasswordUnlockPromptController.shared.dismiss()
+            return
+        }
+        CapsulePasswordUnlockPromptController.shared.present(
+            progress: controls.protectedDeliveryPromptProgress,
+            stepCount: controls.protectedDeliveryPromptStepCount,
+            anchorFrame: panel.frame,
+            level: panel.level
+        ) { [weak self] in
+            guard let current = WorkbenchProtectedDeliveryRouter
+                    .selectedControls else { return }
+            _ = current.cancelProtectedDeliveryPrompt()
+            self?.refresh()
+            RimeBufferController.refreshActiveUI()
+        }
+    }
+
     private func setSendButtonGenerating(_ generating: Bool) {
         if generating {
             guard sendButtonProgressIndicator.isHidden else { return }
@@ -2770,7 +2909,12 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             return
         }
         if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
-            if let controls = workspace as? any DerivedLanguagePairControls {
+            if let controls = workspace as? any DerivedOptionPickerControls {
+                refreshDerivedOptionPickerControls(
+                    workspace: workspace,
+                    controls: controls
+                )
+            } else if let controls = workspace as? any DerivedLanguagePairControls {
                 refreshLanguageControls(workspace: workspace, controls: controls)
             } else if let controls = workspace as? any WorkbenchManualGenerationControls {
                 refreshManualGenerationControls(workspace: workspace, controls: controls)
@@ -2785,7 +2929,8 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         }
         if renderingTranslationControls
             || renderingAIControls
-            || renderingBuiltInActionControls {
+            || renderingBuiltInActionControls
+            || renderingOptionPickerControls {
             resetDerivedControlRendering()
         }
         let allPresentations = ActionPluginHost.shared.presentations
@@ -2946,6 +3091,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             renderingTranslationControls = true
             renderingAIControls = false
             renderingBuiltInActionControls = false
+            renderingOptionPickerControls = false
             renderedPluginKeys.removeAll()
             pluginActionButtons.removeAll()
             pluginButtonRow.arrangedSubviews.forEach {
@@ -2978,6 +3124,41 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         translationSwapButton.isEnabled = controlsEnabled && controls.canSwapLanguages
     }
 
+    private func refreshDerivedOptionPickerControls(
+        workspace: any DerivedBufferWorkspace,
+        controls: any DerivedOptionPickerControls
+    ) {
+        pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)（\(pluginSwitchShortcutTitle) 切换）"
+        pluginLoadingIndicator.isHidden = true
+        pluginLoadingIndicator.stopAnimation(nil)
+
+        if !renderingOptionPickerControls {
+            resetDerivedControlRendering()
+            renderingOptionPickerControls = true
+            pluginButtonRow.addArrangedSubview(derivedOptionPickerPopup)
+        }
+
+        if renderedDerivedOptionPickerOptions != controls.optionPickerOptions {
+            renderedDerivedOptionPickerOptions = controls.optionPickerOptions
+            derivedOptionPickerPopup.removeAllItems()
+            for option in controls.optionPickerOptions {
+                derivedOptionPickerPopup.addItem(withTitle: option.title)
+                derivedOptionPickerPopup.lastItem?.representedObject =
+                    option.identifier
+            }
+        }
+        selectPopupExactly(
+            derivedOptionPickerPopup,
+            representedValue: controls.selectedOptionPickerID
+        )
+        derivedOptionPickerPopup.isEnabled = !lastSecureInputState
+            && !sessionProtectionActive
+        derivedOptionPickerPopup.toolTip = controls.optionPickerToolTip
+        derivedOptionPickerPopup.setAccessibilityLabel(
+            "\(workspace.workbenchDisplayName) 类型"
+        )
+    }
+
     private func refreshManualGenerationControls(
         workspace: any DerivedBufferWorkspace,
         controls _: any WorkbenchManualGenerationControls
@@ -2992,6 +3173,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             renderingAIControls = true
             renderingTranslationControls = false
             renderingBuiltInActionControls = false
+            renderingOptionPickerControls = false
             renderedTranslationLanguages.removeAll()
             renderedPluginKeys.removeAll()
             pluginActionButtons.removeAll()
@@ -2999,6 +3181,68 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                 pluginButtonRow.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
+            pluginButtonRow.addArrangedSubview(aiConnectorPopup)
+            pluginButtonRow.addArrangedSubview(aiModelPopup)
+            pluginButtonRow.addArrangedSubview(aiModePopup)
+            pluginButtonRow.addArrangedSubview(aiOutputPopup)
+        }
+        refreshAIControlSelections()
+    }
+
+    private func refreshAIControlSelections() {
+        if aiConnectorPopup.numberOfItems != AITextProviderKind.allCases.count {
+            aiConnectorPopup.removeAllItems()
+            for kind in AITextProviderKind.allCases {
+                aiConnectorPopup.addItem(withTitle: compactAIConnectorTitle(kind))
+                aiConnectorPopup.lastItem?.representedObject = kind.rawValue
+            }
+        }
+        let connectorKind = AITextConnectorSelectionStore.shared.selectedKind
+        selectPopupExactly(aiConnectorPopup,
+                           representedValue: connectorKind.rawValue)
+
+        let modelID = try? AITextGenerationPreferenceStore.shared
+            .requestSelection(connectorKind: connectorKind)
+            .modelID
+        aiModelPopup.removeAllItems()
+        aiModelPopup.addItem(withTitle: modelID ?? "默认模型")
+        aiModelPopup.lastItem?.representedObject = modelID
+        aiModelPopup.isEnabled = false
+
+        if aiModePopup.numberOfItems != AITextGenerationMode.allCases.count {
+            aiModePopup.removeAllItems()
+            for mode in AITextGenerationMode.allCases {
+                aiModePopup.addItem(withTitle: mode.displayName)
+                aiModePopup.lastItem?.representedObject = mode.rawValue
+            }
+        }
+        selectPopupExactly(
+            aiModePopup,
+            representedValue: AITextGenerationPreferenceStore.shared.mode.rawValue
+        )
+
+        if aiOutputPopup.numberOfItems != AIOutputMenuChoice.all.count {
+            aiOutputPopup.removeAllItems()
+            for choice in AIOutputMenuChoice.all {
+                aiOutputPopup.addItem(withTitle: choice.title)
+                aiOutputPopup.lastItem?.representedObject = choice.key
+            }
+        }
+        let preferenceStore = AITextGenerationPreferenceStore.shared
+        selectPopupExactly(
+            aiOutputPopup,
+            representedValue: AIOutputMenuChoice(
+                destination: preferenceStore.destination,
+                format: preferenceStore.format
+            ).key
+        )
+    }
+
+    private func compactAIConnectorTitle(_ kind: AITextProviderKind) -> String {
+        switch kind {
+        case .codexCLI: return "Codex CLI"
+        case .claudeCodeCLI: return "Claude Code"
+        case .openAICompatible: return "OpenAI API"
         }
     }
 
@@ -3015,9 +3259,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         renderingTranslationControls = false
         renderingAIControls = false
         renderingBuiltInActionControls = false
+        renderingOptionPickerControls = false
         renderedBuiltInActionHasOptions = nil
         renderedTranslationLanguages.removeAll()
         renderedBuiltInActionOptions.removeAll()
+        renderedDerivedOptionPickerOptions.removeAll()
         renderedPluginKeys.removeAll()
         pluginActionButtons.removeAll()
         pluginButtonRow.arrangedSubviews.forEach {
@@ -3339,6 +3585,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         })
         observers.append(center.addObserver(
             forName: .aiTextConnectorAvailabilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refresh()
+            RimeBufferController.refreshActiveUI()
+        })
+        observers.append(center.addObserver(
+            forName: .aiTextGenerationPreferencesDidChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -3909,6 +4163,38 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         schedulePluginSelectorRefresh()
     }
 
+    @objc private func aiConnectorChanged() {
+        guard let raw = aiConnectorPopup.selectedItem?.representedObject as? String,
+              let kind = AITextProviderKind(rawValue: raw) else {
+            refresh()
+            return
+        }
+        _ = AITextConnectorRegistry.shared.select(kind)
+        refresh()
+        RimeBufferController.refreshActiveUI()
+    }
+
+    @objc private func aiModeChanged() {
+        guard let raw = aiModePopup.selectedItem?.representedObject as? String,
+              let mode = AITextGenerationMode(rawValue: raw) else {
+            refresh()
+            return
+        }
+        AITextGenerationPreferenceStore.shared.mode = mode
+    }
+
+    @objc private func aiOutputChanged() {
+        guard let key = aiOutputPopup.selectedItem?.representedObject as? String,
+              let choice = AIOutputMenuChoice.all.first(where: { $0.key == key }) else {
+            refresh()
+            return
+        }
+        AITextGenerationPreferenceStore.shared.set(
+            destination: choice.destination,
+            format: choice.format
+        )
+    }
+
     @objc private func sendTapped() {
         guard !sessionProtectionActive else { return }
         if IsSecureEventInputEnabled() {
@@ -3923,6 +4209,22 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             refresh()
             return
         }
+        if let controls = WorkbenchProtectedDeliveryRouter.selectedControls,
+           controls.protectedDeliveryPromptActive
+            || controls.canRequestProtectedDelivery {
+            guard !controls.protectedDeliveryPromptActive,
+                  let target = InputFocusCoordinator.shared.liveTarget(
+                    forceOverlayVisibilityRefresh: true
+                  ),
+                  controls.requestProtectedDelivery(target: target) else {
+                if !controls.protectedDeliveryPromptActive { NSSound.beep() }
+                refresh()
+                return
+            }
+            refresh()
+            RimeBufferController.refreshActiveUI()
+            return
+        }
         if let controls = WorkbenchManualGenerationRouter.selectedControls {
             switch controls.primaryAction {
             case .requestGeneration:
@@ -3932,9 +4234,23 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                     refresh()
                     return
                 }
-                if !controls.generate() { NSSound.beep() }
-                refresh()
-                RimeBufferController.refreshActiveUI()
+                let result = AITextGenerationCommandRouter.request(
+                    controls: controls
+                )
+                switch result {
+                case .inlineStarted:
+                    refresh()
+                    RimeBufferController.refreshActiveUI()
+                case .mailboxStarted:
+                    // The coordinator now owns the task. Use the ordinary safe
+                    // close path; workspace pause cannot cancel this job.
+                    closeAndPause()
+                case .rejected:
+                    NSSound.beep()
+                    IMELog.write("AI generation request rejected")
+                    refresh()
+                    RimeBufferController.refreshActiveUI()
+                }
                 return
             case .generating, .disabled:
                 return
@@ -4014,6 +4330,22 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             return
         }
         controls.setSourceLanguage(value)
+    }
+
+    @objc private func derivedOptionPickerChanged() {
+        guard !sessionProtectionActive,
+              !IsSecureEventInputEnabled(),
+              let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+                as? any DerivedOptionPickerControls,
+              let identifier = derivedOptionPickerPopup.selectedItem?
+                .representedObject as? String else {
+            return
+        }
+        if !controls.setOptionPickerSelection(identifier) {
+            NSSound.beep()
+        }
+        refresh()
+        RimeBufferController.refreshActiveUI()
     }
 
     @objc private func translationTargetChanged() {

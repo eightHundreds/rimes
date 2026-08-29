@@ -206,17 +206,25 @@ final class BufferModel {
         let origin: Origin
         let createdAt: Date
         var pluginMetadata: PluginMetadata?
+        /// A local Mailbox decision may deliberately downgrade a plugin push
+        /// to ordinary text after the original runtime/focus authority is no
+        /// longer available. This marker is separate from PluginMetadata so a
+        /// restart never has to manufacture an action, context, runtime, or
+        /// FocusToken merely to make reviewed text usable.
+        let locallyReviewedAsPlainText: Bool
 
         init(id: UUID = UUID(),
              text: String,
              origin: Origin = .rime,
              createdAt: Date = Date(),
-             pluginMetadata: PluginMetadata? = nil) {
+             pluginMetadata: PluginMetadata? = nil,
+             locallyReviewedAsPlainText: Bool = false) {
             self.id = id
             self.text = text
             self.origin = origin
             self.createdAt = createdAt
             self.pluginMetadata = pluginMetadata
+            self.locallyReviewedAsPlainText = locallyReviewedAsPlainText
         }
     }
 
@@ -367,9 +375,15 @@ final class BufferModel {
     /// Visibility and content never grant keyboard ownership implicitly.
     func stageExternal(_ text: String,
                        origin: Origin,
-                       pluginMetadata: PluginMetadata? = nil) {
+                       pluginMetadata: PluginMetadata? = nil,
+                       locallyReviewedAsPlainText: Bool = false) {
         transientEnabled = true
-        append(text, origin: origin, pluginMetadata: pluginMetadata)
+        append(
+            text,
+            origin: origin,
+            pluginMetadata: pluginMetadata,
+            locallyReviewedAsPlainText: locallyReviewedAsPlainText
+        )
     }
 
     /// Host-side normalization for plugin results that arrive as one coarse
@@ -394,7 +408,8 @@ final class BufferModel {
 
     func append(_ text: String,
                 origin: Origin = .rime,
-                pluginMetadata: PluginMetadata? = nil) {
+                pluginMetadata: PluginMetadata? = nil,
+                locallyReviewedAsPlainText: Bool = false) {
         guard !text.isEmpty else { return }
         if !captureRouteEnabled { transientEnabled = true }
         if origin == .rime, pluginMetadata == nil {
@@ -404,7 +419,9 @@ final class BufferModel {
         let index = clampedInsertionIndex()
         blocks.insert(Block(text: text,
                             origin: origin,
-                            pluginMetadata: pluginMetadata),
+                            pluginMetadata: pluginMetadata,
+                            locallyReviewedAsPlainText:
+                                locallyReviewedAsPlainText),
                       at: index)
         insertionIndex = index + 1
         IMELog.write("buffer insert block at \(index) origin=\(origin.tag) count=\(blocks.count)")

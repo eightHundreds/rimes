@@ -94,6 +94,7 @@ func runPluginDistributionSmokeTest() -> Bool {
         BuiltInPluginID.aiText,
         BuiltInPluginID.appleTranslation,
         BuiltInPluginID.streamInput,
+        BuiltInPluginID.capsule,
     ]
     let expectedOptionalIDs: Set<String> = []
     let retiredProductIDs: Set<String> = [
@@ -105,6 +106,7 @@ func runPluginDistributionSmokeTest() -> Bool {
         BuiltInPluginID.aiText: "2.1",
         BuiltInPluginID.appleTranslation: "2.1",
         BuiltInPluginID.streamInput: "1.3",
+        BuiltInPluginID.capsule: "0.3",
     ]
 
     func fail(_ message: String) -> Bool {
@@ -281,7 +283,7 @@ func runPluginDistributionSmokeTest() -> Bool {
             == expectedDefaultIDs,
           Set(PresetBufferPluginCatalog.entries.filter { !$0.defaultInstalled }.map(\.id))
             == expectedOptionalIDs else {
-        return fail("fresh catalog must contain exactly three bundled/enabled presets")
+        return fail("fresh catalog must contain exactly four bundled/enabled presets")
     }
     let registeredIDs = Set(BuiltInPlugins.makeAll().map {
         $0.descriptor.key.rawID

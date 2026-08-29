@@ -18,12 +18,40 @@ import {
   BufferSurface,
   bufferInputContextKey,
 } from "../src/surfaces/BufferSurface";
+import { CandidateSurface } from "../src/surfaces/CandidateSurface";
 import { ExtensionsSurface } from "../src/surfaces/ExtensionsSurface";
 import { SettingsSurface } from "../src/surfaces/SettingsSurface";
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("Candidate surface", () => {
+  it("keeps 1-9 selection and Settings after retiring the zero Buffer action", () => {
+    const onCommit = vi.fn();
+    render(
+      <CandidateSurface
+        compactPageSize={9}
+        onCommit={onCommit}
+        showLayoutControl={false}
+      />,
+    );
+
+    const surface = screen.getByRole("region", { name: "输入法候选框" });
+    expect(screen.queryByTitle("开启缓冲区")).toBeNull();
+    expect(screen.getByRole("button", { name: "打开设置" })).toBeTruthy();
+    expect(screen.getAllByRole("option")).toHaveLength(9);
+
+    fireEvent.keyDown(surface, { key: "1" });
+    fireEvent.keyDown(surface, { key: "9" });
+    expect(onCommit).toHaveBeenCalledTimes(2);
+    expect(onCommit.mock.calls[0]?.[1]).toBe(0);
+    expect(onCommit.mock.calls[1]?.[1]).toBe(8);
+
+    fireEvent.keyDown(surface, { key: "0" });
+    expect(onCommit).toHaveBeenCalledTimes(2);
+  });
 });
 
 function PluginHarness() {
@@ -45,6 +73,19 @@ function BufferSettingsHarness() {
   return (
     <SettingsSurface
       initialRouteID="core.buffer"
+      plugins={plugins}
+      setPlugins={setPlugins}
+    />
+  );
+}
+
+function ConnectorSettingsHarness() {
+  const [plugins, setPlugins] = useState<PluginRecord[]>(
+    () => initialPlugins.map((plugin) => ({ ...plugin })),
+  );
+  return (
+    <SettingsSurface
+      initialRouteID="core.connectors"
       plugins={plugins}
       setPlugins={setPlugins}
     />
@@ -220,6 +261,41 @@ describe("Buffer settings mirror", () => {
     fireEvent.click(clipboardHistory);
     expect(closeAfterDelivery.getAttribute("aria-checked")).toBe("false");
     expect(clipboardHistory.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("Connector progressive disclosure", () => {
+  it("keeps only AI Models and Local Gateway and reveals only selected details", () => {
+    render(<ConnectorSettingsHarness />);
+
+    const subpages = screen.getByRole("group", { name: "连接器子页面" });
+    expect(within(subpages).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "AI 模型",
+      "本地网关",
+    ]);
+    expect(screen.queryByText("隔空传字")).toBeNull();
+    expect(screen.getByText("使用 RIMES 专用 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"))
+      .toBeTruthy();
+    expect(screen.queryByText("未找到具备所需流式生成能力的 Claude Code CLI。"))
+      .toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Claude Code\s+官方 CLI 授权$/ }));
+    expect(screen.queryByText("使用 RIMES 专用 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"))
+      .toBeNull();
+    expect(screen.getByText("未找到具备所需流式生成能力的 Claude Code CLI。"))
+      .toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^OpenAI API\s+自定义兼容端点$/ }));
+    expect(screen.getByLabelText("Base URL")).toBeTruthy();
+    expect(screen.getByLabelText("模型")).toBeTruthy();
+    expect(screen.getByLabelText("API Key")).toBeTruthy();
+
+    fireEvent.click(within(subpages).getByRole("button", { name: "本地网关" }));
+    expect(screen.getByLabelText("MCP 配置 JSON").textContent).toContain("Bearer ••••••••");
+    expect(screen.queryByLabelText("Claude Code 注册命令")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code 一键注册/ }));
+    expect(screen.getByLabelText("Claude Code 注册命令").textContent)
+      .toContain("Bearer ••••••••");
   });
 });
 

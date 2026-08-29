@@ -337,6 +337,11 @@ func runTranslationPluginSmokeTest() -> Bool {
         BufferModel.Block(text: "reviewed",
                           origin: .plugin(id: "marine"),
                           pluginMetadata: targetBinding.markingReviewedAsPlainText()),
+    ]),
+    TranslationSourcePolicy.accepts([
+        BufferModel.Block(text: "locally reviewed",
+                          origin: .plugin(id: "mailbox-plugin"),
+                          locallyReviewedAsPlainText: true),
     ]) else {
         return fail("target-bound plugin source isolation")
     }

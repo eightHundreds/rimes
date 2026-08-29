@@ -30,11 +30,11 @@
 | 输入方案 | 雾凇全拼、自然码双拼、小鹤双拼、五笔 86、英文；可选并击扩展 |
 | 缓冲工作台 | `⌘⇧B` 开关；先暂存、再分块投递 |
 | 剪贴板历史 | `⌘⇧P` 显示 / 隐藏；仅在工作台可见且安全时读取 |
+| Mailbox | `⌘⇧M` 打开/关闭；单行会话列表 + 固定 CLI prompt，以全宽等宽 transcript 本地保存 AI 会话与待审核外部推送；Plain / Markdown / JSON 都可用纯文本临时行流式预览，完整结果再按所选格式安全排版 |
 | 设置 | `⌘⇧S` 随时打开设置页面 |
 | 实时翻译 | 默认 Apple 本地翻译（macOS 15+），也可走 AI 渠道 |
-| AI 生成 | Codex CLI / Claude Code CLI / OpenAI 兼容 API |
+| AI 生成 | Codex CLI / Claude Code CLI / OpenAI 兼容 API；内容格式与原地 / Mailbox 目的地可独立组合 |
 | 意识流输入 | 拼音/并击 → 按配置给出最多 5 个互斥猜测 → 选定后投递 |
-| 隔空传字 | Mac ↔ Mac 加密直连，无需同一 Wi‑Fi / Apple ID |
 
 <!-- BEGIN PRESET BUFFER PLUGINS -->
 ## 预置缓冲插件
@@ -46,6 +46,7 @@
 | AI 生成 | `builtin.ai-text` | 2.1 | 随 RIMES 预装 | 启用 |
 | 实时翻译 | `builtin.apple-translation` | 2.1 | 随 RIMES 预装 | 启用 |
 | 意识流输入 | `builtin.stream-input` | 1.3 | 随 RIMES 预装 | 启用 |
+| Capsule | `builtin.capsule` | 0.3 | 随 RIMES 预装 | 启用 |
 
 表中插件均随 RIMES 预装，并在全新安装后默认启用。
 <!-- END PRESET BUFFER PLUGINS -->

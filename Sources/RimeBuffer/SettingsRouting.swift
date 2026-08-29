@@ -37,7 +37,7 @@ enum SettingsCoreRoute: String, CaseIterable, Codable {
         switch self {
         case .inputMethod: return "输入法"
         case .appearance: return "外观"
-        case .buffer: return "缓冲区"
+        case .buffer: return "窗口"
         case .connectors: return "连接器"
         case .plugins: return "插件"
         case .maintenance: return "维护"
@@ -48,7 +48,7 @@ enum SettingsCoreRoute: String, CaseIterable, Codable {
         switch self {
         case .inputMethod: return "keyboard"
         case .appearance: return "paintpalette"
-        case .buffer: return "tray.full"
+        case .buffer: return "square.grid.2x2"
         case .connectors: return "link"
         case .plugins: return "puzzlepiece.extension"
         case .maintenance: return "wrench.and.screwdriver"
@@ -84,12 +84,15 @@ enum CoreSettingsSubpages {
         case .appearance:
             values = [("theme", "主题"), ("size", "尺寸")]
         case .buffer:
-            values = [("buffer", "缓冲区")]
+            values = [
+                ("buffer", "Buffer"),
+                ("clip", "Clip"),
+                ("mailbox", "Mailbox"),
+            ]
         case .connectors:
             values = [
                 ("ai-model", "AI 模型"),
                 ("local-gateway", "本地网关"),
-                ("remote-typing", "隔空传字"),
             ]
         case .plugins:
             return PluginManagementSubpage.allCases.map {
@@ -460,7 +463,7 @@ func runSettingsRoutingSmokeTest() -> Bool {
 
         guard catalog.coreRoutes.map(\.id) == SettingsCoreRoute.allCases.map(\.id),
               catalog.coreRoutes.map(\.title)
-                == ["输入法", "外观", "缓冲区", "连接器", "插件", "维护"],
+                == ["输入法", "外观", "窗口", "连接器", "插件", "维护"],
               catalog.extensionRoutes.map(\.id.rawValue)
                 == ["extension.statistics", "extension.feiyao-learning"],
               catalog.sections.map(\.id) == [.core, .extensions],
@@ -485,12 +488,15 @@ func runSettingsRoutingSmokeTest() -> Bool {
                     SettingsSubpageID(rawValue: "size"),
                 ],
               catalog.route(for: SettingsCoreRoute.buffer.id)?.subpages.map(\.id)
-                == [SettingsSubpageID(rawValue: "buffer")],
+                == [
+                    SettingsSubpageID(rawValue: "buffer"),
+                    SettingsSubpageID(rawValue: "clip"),
+                    SettingsSubpageID(rawValue: "mailbox"),
+                ],
               catalog.route(for: SettingsCoreRoute.connectors.id)?.subpages.map(\.id)
                 == [
                     SettingsSubpageID(rawValue: "ai-model"),
                     SettingsSubpageID(rawValue: "local-gateway"),
-                    SettingsSubpageID(rawValue: "remote-typing"),
                 ] else {
             return fail("stable route catalog")
         }

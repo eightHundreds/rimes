@@ -4,6 +4,7 @@ import Foundation
 enum GlobalHotKeyRoute: Equatable {
     case toggleWorkbench
     case toggleClipboardHistory
+    case openMailbox
     case openSettings
     case ignore
 }
@@ -12,11 +13,13 @@ enum GlobalHotKeyAction: UInt32, CaseIterable, Hashable {
     case toggleWorkbench = 1
     case openSettings = 2
     case toggleClipboardHistory = 3
+    case openMailbox = 4
 
     var shortcutAction: RimeShortcutAction {
         switch self {
         case .toggleWorkbench: return .toggleWorkbench
         case .toggleClipboardHistory: return .toggleClipboardHistory
+        case .openMailbox: return .openMailbox
         case .openSettings: return .openSettings
         }
     }
@@ -31,7 +34,7 @@ struct GlobalHotKeyDefinition {
     /// exclusively so another Carbon listener cannot observe the same chord;
     /// ordinary AppKit editing events remain outside this handler.
     var registrationOptions: OptionBits {
-        action == .toggleClipboardHistory
+        action == .toggleClipboardHistory || action == .openMailbox
             ? OptionBits(kEventHotKeyExclusive)
             : OptionBits(kEventHotKeyNoOptions)
     }
@@ -93,6 +96,7 @@ enum GlobalHotKeyRouting {
         switch action {
         case .toggleWorkbench: return .toggleWorkbench
         case .toggleClipboardHistory: return .toggleClipboardHistory
+        case .openMailbox: return .openMailbox
         case .openSettings: return .openSettings
         }
     }
@@ -121,6 +125,7 @@ final class GlobalHotKeyController {
                let action = RimeShortcutAction(rawValue: rawAction),
                action != .toggleWorkbench,
                action != .toggleClipboardHistory,
+               action != .openMailbox,
                action != .openSettings {
                 return
             }
@@ -277,6 +282,9 @@ final class GlobalHotKeyController {
             case .toggleClipboardHistory:
                 BufferWindowController.shared.toggleClipboardHistory()
                 IMELog.write("global hotkey toggled clipboard history")
+            case .openMailbox:
+                let action = MailboxWindowController.shared.toggleVisibility()
+                IMELog.write("global hotkey toggled Mailbox action=\(action)")
             case .openSettings:
                 SettingsWindowController.shared.show()
                 IMELog.write("global hotkey opened settings")

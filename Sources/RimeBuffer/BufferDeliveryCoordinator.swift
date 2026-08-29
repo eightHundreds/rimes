@@ -930,6 +930,7 @@ final class BufferDeliveryCoordinator {
 
     private func pluginMetadata(in block: BufferModel.Block) -> BufferModel.PluginMetadata? {
         guard case let .plugin(pluginId) = block.origin,
+              !block.locallyReviewedAsPlainText,
               let metadata = block.pluginMetadata,
               metadata.pluginId == pluginId,
               !metadata.reviewedAsPlainText else { return nil }
@@ -939,6 +940,9 @@ final class BufferDeliveryCoordinator {
     private func invalidPluginMetadata(in block: BufferModel.Block) -> Bool {
         switch block.origin {
         case let .plugin(pluginId):
+            if block.locallyReviewedAsPlainText {
+                return block.pluginMetadata != nil
+            }
             guard let metadata = block.pluginMetadata else { return true }
             return metadata.pluginId != pluginId
                 || (metadata.reviewedAsPlainText && metadata.stale)

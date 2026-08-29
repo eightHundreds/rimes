@@ -4,7 +4,6 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { Icon } from "../design-system/Icon";
 import { IconButton } from "../design-system/primitives";
 
 export type CandidateLayout = "compact" | "matrix";
@@ -30,14 +29,12 @@ export type CandidateSurfaceProps = {
   compactPageSize?: number;
   matrixColumns?: number;
   matrixRows?: number;
-  bufferActive?: boolean;
   showLayoutControl?: boolean;
   className?: string;
   onLayoutChange?: (layout: CandidateLayout) => void;
   onSelectedIndexChange?: (index: number, candidate: CandidateItem) => void;
   onPageChange?: (page: number) => void;
   onCommit?: (candidate: CandidateItem, index: number) => void;
-  onActivateBuffer?: () => void;
   onOpenSettings?: () => void;
 };
 
@@ -93,14 +90,12 @@ export function CandidateSurface({
   compactPageSize = 6,
   matrixColumns = 3,
   matrixRows = 3,
-  bufferActive = true,
   showLayoutControl = true,
   className = "",
   onLayoutChange,
   onSelectedIndexChange,
   onPageChange,
   onCommit,
-  onActivateBuffer,
   onOpenSettings,
 }: CandidateSurfaceProps) {
   const [layout, setLayout] = useControllableState(
@@ -314,18 +309,6 @@ export function CandidateSurface({
               <span className="candidate-panel__empty">暂无候选</span>
             )}
           </div>
-
-          {!bufferActive ? (
-            <button
-              className="candidate-panel__buffer-action"
-              onClick={onActivateBuffer}
-              title="开启缓冲区"
-              type="button"
-            >
-              <span className="candidate-panel__buffer-label">0</span>
-              <Icon name="tray" size={13} weight="bold" />
-            </button>
-          ) : null}
 
           <div className="candidate-panel__pagination">
             <button

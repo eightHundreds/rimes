@@ -22,6 +22,24 @@ enum BufferControlRoutingRules {
     }
 }
 
+enum CandidateKeyboardRoutingRules {
+    /// Candidate chrome owns navigation/commit keys, plus 1...9 only while the
+    /// expanded matrix maps those digits onto its visible columns. Zero has no
+    /// candidate-window action and must continue to librime like any other
+    /// schema binding or printable input.
+    static func ownsLocally(keycode: Int32, isExpanded: Bool) -> Bool {
+        switch keycode {
+        case RimeKey.left, RimeKey.right, RimeKey.down, RimeKey.up,
+             RimeKey.return, RimeKey.space:
+            return true
+        case 0x31...0x39:
+            return isExpanded
+        default:
+            return false
+        }
+    }
+}
+
 enum BufferWorkbenchEscapeDisposition: Equatable {
     case passThrough
     case closeWorkbench
@@ -587,7 +605,8 @@ final class RimeBufferController: IMKInputController {
     private var pendingFlyChordBase: (context: RimeContextModel,
                                       policy: FlyChordSettlementPolicy,
                                       owner: FocusToken,
-                                      clientIdentity: ObjectIdentifier)?
+                                      clientIdentity: ObjectIdentifier,
+                                      protectedDelivery: Bool)?
     private var mutualPairingState = FlyChordMutualPairingState()
     private var chordDurationObserver: NSObjectProtocol?
     private var chordExtensionObserver: NSObjectProtocol?
@@ -771,13 +790,6 @@ final class RimeBufferController: IMKInputController {
         return BufferWindowController.shared.isOwnClient(bundleID: bundleId(of: client))
     }
 
-    private func mirrorDirectTextIfExternal(_ text: String,
-                                            client: IMKTextInput,
-                                            externalTarget: Bool? = nil) {
-        guard externalTarget ?? !isOwnClient(client) else { return }
-        RemoteTypingService.shared.send(text)
-    }
-
     private func clearCompositionPresentation(client: IMKTextInput) {
         if let focusToken {
             BufferWindowController.shared.clearInlineComposition(owner: focusToken)
@@ -830,9 +842,6 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         composition.commitDidInsert()
-        mirrorDirectTextIfExternal(text,
-                                   client: client,
-                                   externalTarget: externalTarget)
         return true
     }
 
@@ -2443,6 +2452,12 @@ final class RimeBufferController: IMKInputController {
                                                 hardwareKeyCode: hardwareKeyCode)
             return true
         }
+        if handleWorkbenchProtectedDeliveryBufferEnterIfNeeded(
+            client: client,
+            hardwareKeyCode: hardwareKeyCode
+        ) {
+            return true
+        }
         if handleWorkbenchManualGenerationBufferEnterIfNeeded(
             client: client,
             hardwareKeyCode: hardwareKeyCode
@@ -2451,6 +2466,45 @@ final class RimeBufferController: IMKInputController {
         }
         beginBufferEnterGesture(client: client,
                                 hardwareKeyCode: hardwareKeyCode)
+        return true
+    }
+
+    /// Protected Capsule results use the ordinary Return gesture, but Return
+    /// starts only the local authorization prompt. No password plaintext is
+    /// exposed to the shared delivery coordinator before that prompt succeeds.
+    private func handleWorkbenchProtectedDeliveryBufferEnterIfNeeded(
+        client: IMKTextInput,
+        hardwareKeyCode: UInt16
+    ) -> Bool {
+        guard let controls = WorkbenchProtectedDeliveryRouter.selectedControls,
+              controls.canRequestProtectedDelivery
+                || controls.protectedDeliveryPromptActive else {
+            return false
+        }
+        suppressBufferEnterForImmediateAction(
+            client: client,
+            hardwareKeyCode: hardwareKeyCode
+        )
+        if controls.protectedDeliveryPromptActive {
+            updateUI(client: client)
+            BufferWindowController.shared.refresh()
+            return true
+        }
+        guard let lease = currentLease(matching: client),
+              InputFocusCoordinator.shared.liveTarget(
+                expected: lease.token,
+                forceOverlayVisibilityRefresh: true
+              ) === lease,
+              controls.requestProtectedDelivery(target: lease) else {
+            NSSound.beep()
+            IMELog.write("capsule protected delivery prompt rejected")
+            updateUI(client: client)
+            BufferWindowController.shared.refresh()
+            return true
+        }
+        IMELog.write("capsule protected delivery prompt opened")
+        updateUI(client: client)
+        BufferWindowController.shared.refresh()
         return true
     }
 
@@ -2500,8 +2554,20 @@ final class RimeBufferController: IMKInputController {
         }
         switch action {
         case .requestGeneration:
-            let requested = controls.generate()
-            IMELog.write("buffer enter requested generation accepted=\(requested)")
+            let result = AITextGenerationCommandRouter.request(
+                controls: controls
+            )
+            switch result {
+            case .inlineStarted:
+                IMELog.write("buffer enter requested inline AI generation")
+            case .mailboxStarted:
+                IMELog.write("buffer enter handed AI generation to Mailbox")
+                BufferWindowController.shared.closeAndPause()
+                return true
+            case .rejected:
+                NSSound.beep()
+                IMELog.write("buffer enter AI generation rejected")
+            }
         case .generating:
             IMELog.write("buffer enter consumed while generation is running")
         case .disabled:
@@ -3937,13 +4003,33 @@ final class RimeBufferController: IMKInputController {
         let isPress = mask & RimeKey.releaseMask == 0
         // A chord key is a PLAIN press of a chording letter — anything carrying
         // Ctrl/Opt/Cmd is a shortcut/binding, never chord material.
-        let isChordKey = chordGated && isPress && RimeKey.isChordingKey(keycode)
-            && mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0
+        let hasCommandModifier = mask & (
+            RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask
+        ) != 0
+        let capsuleUnlockChordKey = isPress
+            && !hasCommandModifier
+            && CapsuleWorkspace.shared.acceptsUnlockChordKey(keycode)
+        let capsulePromptActive = CapsuleWorkspace.shared
+            .protectedDeliveryPromptActive
+        let isChordKey = isPress
+            && !hasCommandModifier
+            && RimeKey.isChordingKey(keycode)
+            && (capsulePromptActive
+                ? capsuleUnlockChordKey
+                : chordGated)
         // Prototype semantics: a PRESS of a non-chord key resolves the pending
         // chord before processing; release events never pre-flush.
         if isPress, !isChordKey {
             chord.flush()
             mutualPairingState.reset()
+            if capsulePromptActive, !hasCommandModifier,
+               CapsuleWorkspace.shared.rejectProtectedDeliveryInput() {
+                IMELog.write("capsule protected delivery input rejected")
+                NSSound.beep()
+                updateUI(client: client)
+                BufferWindowController.shared.refresh()
+                return true
+            }
         }
 
         if isChordKey {
@@ -3953,13 +4039,17 @@ final class RimeBufferController: IMKInputController {
                     IMELog.write("FlyYao press rejected without a focus owner")
                     return false
                 }
+                let policy: FlyChordSettlementPolicy = capsuleUnlockChordKey
+                    ? .sameBatchOnly
+                    : flyChordSettlementPolicy
                 pendingFlyChordBase = (
                     context: rimeEngine.getContext(session: session),
-                    policy: flyChordSettlementPolicy,
+                    policy: policy,
                     owner: focusToken,
-                    clientIdentity: ObjectIdentifier(client as AnyObject)
+                    clientIdentity: ObjectIdentifier(client as AnyObject),
+                    protectedDelivery: capsuleUnlockChordKey
                 )
-                batchPolicy = pendingFlyChordBase?.policy ?? flyChordSettlementPolicy
+                batchPolicy = pendingFlyChordBase?.policy ?? policy
             } else {
                 batchPolicy = pendingFlyChordBase?.policy ?? flyChordSettlementPolicy
             }
@@ -4278,6 +4368,36 @@ final class RimeBufferController: IMKInputController {
             // whether to recover it into the buffer or discard it safely.
             initialTarget = nil
         }
+        if let initialTarget {
+            switch CapsuleWorkspace.shared.handleUnlockChord(
+                keys,
+                target: initialTarget
+            ) {
+            case .notMatched:
+                if base.protectedDelivery {
+                    mutualPairingState.reset()
+                    NSSound.beep()
+                    if let client { updateUI(client: client) }
+                    BufferWindowController.shared.refresh()
+                    return
+                }
+            case .progressed:
+                mutualPairingState.reset()
+                if let client { updateUI(client: client) }
+                BufferWindowController.shared.refresh()
+                return
+            case .delivered:
+                mutualPairingState.reset()
+                if let client { updateUI(client: client) }
+                return
+            case .rejected, .deliveryFailed:
+                mutualPairingState.reset()
+                NSSound.beep()
+                if let client { updateUI(client: client) }
+                BufferWindowController.shared.refresh()
+                return
+            }
+        }
         guard let shape = FlyChordBatchShape(keys: keys) else {
             IMELog.write("FlyYao batch rejected unknown keyboard-half shape")
             return
@@ -4499,16 +4619,10 @@ final class RimeBufferController: IMKInputController {
         if candidateOptionSelecting || candidateWindow.isSingleCharacterSelectionActive {
             return handleCandidateOptionSelectionKey(keycode, client: client)
         }
-        let isLocalCandidateAction: Bool
-        switch keycode {
-        case RimeKey.left, RimeKey.right, RimeKey.down, RimeKey.up,
-             RimeKey.return, RimeKey.space, 0x30:
-            isLocalCandidateAction = true
-        case 0x31...0x39:
-            isLocalCandidateAction = candidateWindow.isExpanded
-        default:
-            isLocalCandidateAction = false
-        }
+        let isLocalCandidateAction = CandidateKeyboardRoutingRules.ownsLocally(
+            keycode: keycode,
+            isExpanded: candidateWindow.isExpanded
+        )
         if isLocalCandidateAction {
             if chord.hasPending {
                 IMELog.write("candidate key \(keycode) resolving pending chord before local action")
@@ -4543,27 +4657,6 @@ final class RimeBufferController: IMKInputController {
         case RimeKey.space:
             guard let selection = candidateWindow.selectedCandidateSelection else { return false }
             selectCandidate(selection)
-            return true
-        case 0x30:
-            guard !BufferModel.shared.active else { return true }
-            let selection = candidateWindow.selectedCandidateSelection
-            let candidateText = candidateWindow.selectedCandidateText ?? ""
-            let originalBlockCount = BufferModel.shared.blocks.count
-            IMELog.write("buffer zero begin text=\(IMELog.redact(candidateText)) pageOffset=\(selection?.pageOffset ?? -1) index=\(selection?.index ?? -1)")
-            candidateWindow.performBufferAction()
-            guard let selection else {
-                IMELog.write("buffer zero enabled without candidate selection")
-                return true
-            }
-            let selected = selectCandidate(selection)
-            let finalBlockCount = BufferModel.shared.blocks.count
-            if selected, finalBlockCount > originalBlockCount {
-                IMELog.write("buffer zero committed text=\(IMELog.redact(candidateText)) blocks=\(originalBlockCount)->\(finalBlockCount)")
-            } else if selected {
-                IMELog.write("buffer zero selected but no commit text=\(IMELog.redact(candidateText))")
-            } else {
-                IMELog.write("buffer zero failed text=\(IMELog.redact(candidateText)) buffer remains enabled")
-            }
             return true
         case 0x31...0x39 where candidateWindow.isExpanded:
             let visibleIndex = Int(keycode - 0x31)
@@ -4844,7 +4937,7 @@ final class RimeBufferController: IMKInputController {
     }
 
     /// Token-aware destination used only by BufferDeliveryCoordinator.
-    func deliverBufferedBlock(_ text: String, origin: Origin, target: FocusLease) -> Bool {
+    func deliverBufferedBlock(_ text: String, origin _: Origin, target: FocusLease) -> Bool {
         guard target.controller === self,
               focusToken == target.token,
               InputFocusCoordinator.shared.liveTarget(
@@ -4860,30 +4953,19 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         composition.commitDidInsert()
-        // Echo guard: a block that arrived FROM a paired Mac is never mirrored
-        // back, or the two Macs bounce it forever. Everything else mirrors.
-        if origin.allowsRemoteMirror {
-            RemoteTypingService.shared.send(text)   // no-op if remote typing off
-        }
         return true
     }
 
-    /// Insert text RECEIVED from a paired Mac into the currently focused field.
-    /// Returns false when there's no live client to insert into (caller falls
-    /// back to the clipboard). Goes straight through Delivery.insert so received
-    /// text is never re-broadcast back to the sender (no echo loop). Main thread.
-    static func insertRemoteText(_ text: String) -> Bool {
-        guard let target = InputFocusCoordinator.shared.liveTarget(),
-              !target.compositionActive,
-              let controller = target.controller else {
-            return false
-        }
-        return controller.deliverRemoteText(text, target: target)
-    }
-
-    /// Token-aware remote insert. Remote text is never allowed to replace an
-    /// active marked-text session; the caller falls back to the clipboard.
-    private func deliverRemoteText(_ text: String, target: FocusLease) -> Bool {
+    /// Capsule passwords never enter BufferModel. The selected record is
+    /// decrypted only after a physical chord and arrives here with a one-shot,
+    /// record/focus/client-bound permit. This is the only path allowed to use
+    /// Delivery.insert while macOS secure event input is active.
+    func deliverCapsulePassword(
+        _ password: String,
+        recordID: UUID,
+        permit: CapsulePasswordDeliveryPermit,
+        target: FocusLease
+    ) -> Bool {
         guard target.controller === self,
               focusToken == target.token,
               !target.compositionActive,
@@ -4893,7 +4975,15 @@ final class RimeBufferController: IMKInputController {
               ) === target,
               let client = target.client,
               ObjectIdentifier(client as AnyObject) == target.clientIdentity,
-              Delivery.insert(text, into: client) else { return false }
+              Delivery.insert(
+                password,
+                into: client,
+                capsulePasswordRecordID: recordID,
+                targetToken: target.token,
+                permit: permit
+              ) else {
+            return false
+        }
         composition.commitDidInsert()
         updateUI(client: client)
         return true

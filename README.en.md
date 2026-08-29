@@ -46,6 +46,7 @@ This table is generated from [`Catalog/buffer-plugins.json`](Catalog/buffer-plug
 | AI Generation | `builtin.ai-text` | 2.1 | Bundled with RIMES | Enabled |
 | Real-time Translation | `builtin.apple-translation` | 2.1 | Bundled with RIMES | Enabled |
 | Stream of Consciousness Input | `builtin.stream-input` | 1.3 | Bundled with RIMES | Enabled |
+| Capsule | `builtin.capsule` | 0.3 | Bundled with RIMES | Enabled |
 
 Every plug-in in the table is bundled with RIMES and enabled on a clean first run.
 <!-- END PRESET BUFFER PLUGINS -->

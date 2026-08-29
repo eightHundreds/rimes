@@ -272,7 +272,6 @@ enum CandidateLayout {
     static let preeditCornerRadius: CGFloat = 5
     static let preeditHorizontalPadding: CGFloat = 6
     static let annotationFontSize: CGFloat = 9
-    static let bufferActionMinWidth: CGFloat = 38
     static let rootSpacing: CGFloat = 5
 
     /// Vertical inset between the strip edge and its tallest child.
@@ -437,10 +436,16 @@ struct CandidateBufferCaretSnapshot {
     let preeditHidden: Bool
     let stripOnlyHeight: CGFloat
     let expectedStripOnlyHeight: CGFloat
-    let bufferActionHidden: Bool
     let rejectedCachedHostAnchor: Bool
     let scrubbedCandidateViews: Bool
     let scrubbedPreedit: Bool
+}
+
+struct CandidateActionSurfaceSnapshot {
+    let renderedCandidateButtons: Int
+    let renderedLegacyActionButtons: Int
+    let settingsButtonVisible: Bool
+    let settingsAccessibilityLabel: String?
 }
 
 /// In-process candidate window. Candidates default to a compact one-line strip
@@ -584,8 +589,6 @@ final class CandidateWindow {
         return CandidateSelection(pageOffset: 0,
                                   index: clamp(selectedIndex, count: currentContext.candidates.count))
     }
-    private let bufferActionTag = -1000
-
     init() {
         let metrics = CandidateWindowMetrics.current
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0,
@@ -1110,20 +1113,6 @@ final class CandidateWindow {
         return true
     }
 
-    func performBufferAction() {
-        guard !BufferModel.shared.active else {
-            IMELog.write("candidate buffer action ignored; already enabled")
-            renderCandidates()
-            BufferWindowController.shared.show()
-            return
-        }
-        let activated = BufferWindowController.shared
-            .activateCaptureForCurrentFocus(showWorkbench: true)
-        IMELog.write("candidate buffer action -> \(activated ? "capture" : "direct")")
-        renderCandidates()
-        BufferWindowController.shared.refresh()
-    }
-
     /// Resolve a number-key selection against the row that currently owns the
     /// matrix labels. Keys count the columns actually on screen, so they map
     /// through the column viewport onto the candidate's real page index.
@@ -1413,7 +1402,6 @@ final class CandidateWindow {
         candidateStack.spacing = Self.candidateSpacing
 
         let panelWidth = activePanelWidth()
-        let available = candidateAvailableWidth(panelWidth: panelWidth)
         let indices = currentVisualCandidateIndices(panelWidth: panelWidth)
         let renderedIndices = indices
         for (offset, i) in renderedIndices.enumerated() {
@@ -1432,9 +1420,6 @@ final class CandidateWindow {
             ))
         }
 
-        if showsBufferAction {
-            candidateStack.addArrangedSubview(bufferActionButton(width: min(bufferActionWidth(), available)))
-        }
     }
 
     private func renderExpandedMatrix() {
@@ -1741,19 +1726,6 @@ final class CandidateWindow {
         return line
     }
 
-    private func bufferActionButton(width: CGFloat) -> NSButton {
-        let button = BufferActionPillButton()
-        button.tag = bufferActionTag
-        button.target = self
-        button.action = #selector(candidateTapped(_:))
-        button.toolTip = "开启缓冲区"
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: width),
-            button.heightAnchor.constraint(equalToConstant: Self.actionButtonSize),
-        ])
-        return button
-    }
-
     private func candidateSeparatorView() -> NSView {
         let label = NSTextField(labelWithString: "|")
         label.font = .systemFont(ofSize: 10, weight: .regular)
@@ -1783,28 +1755,15 @@ final class CandidateWindow {
         return max(80, panelWidth - Self.barHorizontalPadding * 2 - sideControlsWidth)
     }
 
-    private func bufferActionWidth() -> CGFloat {
-        CandidateLayout.bufferActionMinWidth
-    }
-
     private func candidateMaxWidth(panelWidth: CGFloat) -> CGFloat {
-        let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let bufferSpace = showsBufferAction
-            ? min(bufferActionWidth(), available) + Self.candidateSpacing
-            : 0
-        let remaining = available - bufferSpace
-        return max(64, remaining)
+        max(64, candidateAvailableWidth(panelWidth: panelWidth))
     }
 
     private func candidatePages(panelWidth: CGFloat) -> [[Int]] {
         guard !currentContext.candidates.isEmpty else { return [] }
 
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let bufferSpace = showsBufferAction
-            ? min(bufferActionWidth(), available) + Self.candidateSpacing
-            : 0
-        let remaining = available - bufferSpace
-        let pageWidth = max(64, remaining)
+        let pageWidth = max(64, available)
         let maxItemWidth = max(64, pageWidth)
 
         var pages: [[Int]] = []
@@ -1933,7 +1892,7 @@ final class CandidateWindow {
     private func candidateAreaHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
         let rowHeight = compactCandidateButtonHeight(for: metrics)
         guard isExpanded, !isSingleCharacterSelectionActive else {
-            return showsBufferAction ? max(rowHeight, Self.actionButtonSize) : rowHeight
+            return rowHeight
         }
         return Self.matrixViewportHeight(rowHeight: rowHeight,
                                          rowCount: expandedPages.count)
@@ -1941,10 +1900,6 @@ final class CandidateWindow {
 
     private func effectiveStripHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
         max(metrics.compactStripHeight, candidateAreaHeight(for: metrics) + 2 * barVerticalPadding(for: metrics))
-    }
-
-    private var showsBufferAction: Bool {
-        presentationMode == .caret && !BufferModel.shared.active
     }
 
     /// AppKit-backed seam for `buffer-window-smoke`. Unlike the pure viewport
@@ -2048,7 +2003,6 @@ final class CandidateWindow {
             caretRect: .zero,
             metrics: metrics
         ).height
-        let bufferActionHidden = !candidateWindow.showsBufferAction
         candidateWindow.lastGoodCaretRect = NSRect(
             x: 200,
             y: 200,
@@ -2068,10 +2022,39 @@ final class CandidateWindow {
             preeditHidden: candidateWindow.preeditPill.isHidden,
             stripOnlyHeight: stripOnlyHeight,
             expectedStripOnlyHeight: metrics.compactStripHeight,
-            bufferActionHidden: bufferActionHidden,
             rejectedCachedHostAnchor: rejectedCachedHostAnchor,
             scrubbedCandidateViews: scrubbedCandidateViews,
             scrubbedPreedit: scrubbedPreedit
+        )
+    }
+
+    /// Pins the candidate strip's action boundary: only numbered candidates
+    /// live in the scrolling area, while the gear remains the sole trailing
+    /// control. The retired `0 + tray` Buffer shortcut must not reappear as a
+    /// hidden button or accessibility element.
+    static func actionSurfaceSnapshotForSmoke() -> CandidateActionSurfaceSnapshot {
+        let candidateWindow = CandidateWindow()
+        candidateWindow.presentationMode = .caret
+        var context = RimeContextModel()
+        context.input = "smoke"
+        context.preedit = "smoke"
+        context.candidates = [
+            RimeCandidateModel(text: "候选", comment: "", label: "1"),
+            RimeCandidateModel(text: "测试", comment: "", label: "2"),
+        ]
+        candidateWindow.currentContext = context
+        candidateWindow.strip.isHidden = false
+        candidateWindow.renderCandidates()
+        candidateWindow.panel.layoutIfNeeded()
+
+        let buttons = candidateWindow.candidateStack.arrangedSubviews
+            .compactMap { $0 as? NSButton }
+        return CandidateActionSurfaceSnapshot(
+            renderedCandidateButtons: buttons.count,
+            renderedLegacyActionButtons: buttons.filter { $0.tag < 0 }.count,
+            settingsButtonVisible: !candidateWindow.settingsButton.isHidden,
+            settingsAccessibilityLabel:
+                candidateWindow.settingsButton.accessibilityLabel()
         )
     }
 
@@ -2247,10 +2230,6 @@ final class CandidateWindow {
             hideAll()
             return
         }
-        if sender.tag == bufferActionTag {
-            performBufferAction()
-            return
-        }
         guard hasInteractableCandidates else {
             hideAll()
             return
@@ -2385,98 +2364,6 @@ private final class CandidatePillButton: CandidateTextButton {
             layer.borderWidth = 1
             layer.shadowOpacity = 0
         }
-    }
-}
-
-private final class BufferActionPillButton: NSButton {
-    private let countLabel = NSTextField(labelWithString: "0")
-    private let trayIcon = NSImageView()
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false
-
-    init() {
-        super.init(frame: .zero)
-        title = ""
-        isBordered = false
-        setButtonType(.momentaryChange)
-        focusRingType = .none
-        wantsLayer = true
-        layer?.cornerRadius = CandidateLayout.selectedCandidateCornerRadius
-        translatesAutoresizingMaskIntoConstraints = false
-        setContentHuggingPriority(.required, for: .horizontal)
-        setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        countLabel.font = .monospacedDigitSystemFont(
-            ofSize: CandidateLayout.annotationFontSize,
-            weight: .regular
-        )
-        countLabel.translatesAutoresizingMaskIntoConstraints = false
-        trayIcon.image = RimeUI.symbol("tray", pointSize: 13, weight: .bold)
-        trayIcon.image?.isTemplate = true
-        trayIcon.imageScaling = .scaleProportionallyDown
-        trayIcon.translatesAutoresizingMaskIntoConstraints = false
-
-        let contents = NSStackView(views: [countLabel, trayIcon])
-        contents.orientation = .horizontal
-        contents.alignment = .centerY
-        contents.spacing = 4
-        contents.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(contents)
-        NSLayoutConstraint.activate([
-            contents.centerXAnchor.constraint(equalTo: centerXAnchor),
-            contents.centerYAnchor.constraint(equalTo: centerYAnchor),
-            trayIcon.widthAnchor.constraint(equalToConstant: 13),
-            trayIcon.heightAnchor.constraint(equalToConstant: 13),
-        ])
-        setAccessibilityElement(true)
-        setAccessibilityRole(.button)
-        setAccessibilityLabel("开启缓冲区")
-        applyAppearance()
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let replacement = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(replacement)
-        trackingArea = replacement
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        applyAppearance()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        applyAppearance()
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        // The count label and template icon are visual-only; keep the whole
-        // 38×28 control as the button's first-click target.
-        super.hitTest(point) == nil ? nil : self
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    private func applyAppearance() {
-        countLabel.textColor = isHovered ? RimeUI.accentTextColor : RimeUI.textSecondary
-        trayIcon.contentTintColor = isHovered ? RimeUI.accentTextColor : RimeUI.textSecondary
-        layer?.backgroundColor = RimeUI.surface2.cgColor
-        layer?.borderWidth = 1
-        let hoverBorder = RimeUI.border.blended(
-            withFraction: 0.48,
-            of: RimeUI.accentTextColor
-        ) ?? RimeUI.accentTextColor
-        layer?.borderColor = (isHovered ? hoverBorder : RimeUI.border).cgColor
     }
 }
 
@@ -2849,10 +2736,7 @@ final class CandidatePreviewView: NSView {
         }
         let gearArea = CandidateLayout.actionButtonSize + CandidateLayout.barSpacing * 2 + 1
         let available = windowWidth - 2 * CandidateLayout.barHorizontalPadding - gearArea
-        let bufferWidth = CandidateLayout.bufferActionMinWidth
-        let candidateAvailable = max(64,
-                                     available - bufferWidth
-                                         - CandidateLayout.candidateSpacing)
+        let candidateAvailable = max(64, available)
         var used: CGFloat = 0
         for (i, item) in sampleCandidates.enumerated() {
             let attr = candidateAttr(label: item.label, text: item.text, highlighted: i == 0, m: m)
@@ -2870,11 +2754,6 @@ final class CandidatePreviewView: NSView {
                                                           width: w,
                                                           height: buttonHeight))
         }
-        candidateRow.addArrangedSubview(bufferActionPill(
-            width: min(bufferWidth, available),
-            height: CandidateLayout.actionButtonSize
-        ))
-
         heightConstraint.constant = scrollHeight + statusSpacing + statusHeight + 4
         let maxScrollX = max(0, documentWidth - maxWidth)
         previewScroll.contentView.scroll(to: NSPoint(x: min(max(0, previousScrollX), maxScrollX),
@@ -2913,42 +2792,6 @@ final class CandidatePreviewView: NSView {
             pill.heightAnchor.constraint(equalToConstant: height),
             label.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
             label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-        ])
-        return pill
-    }
-
-    private func bufferActionPill(width: CGFloat, height: CGFloat) -> NSView {
-        let pill = NSView()
-        pill.wantsLayer = true
-        pill.layer?.cornerRadius = CandidateLayout.selectedCandidateCornerRadius
-        pill.layer?.backgroundColor = RimeUI.surface2.cgColor
-        pill.layer?.borderColor = RimeUI.border.cgColor
-        pill.layer?.borderWidth = 1
-        pill.translatesAutoresizingMaskIntoConstraints = false
-
-        let count = NSTextField(labelWithString: "0")
-        count.font = .monospacedDigitSystemFont(
-            ofSize: CandidateLayout.annotationFontSize,
-            weight: .regular
-        )
-        count.textColor = RimeUI.textSecondary
-        let icon = NSImageView()
-        icon.image = RimeUI.symbol("tray", pointSize: 13, weight: .bold)
-        icon.image?.isTemplate = true
-        icon.contentTintColor = RimeUI.textSecondary
-        let contents = NSStackView(views: [count, icon])
-        contents.orientation = .horizontal
-        contents.alignment = .centerY
-        contents.spacing = 4
-        contents.translatesAutoresizingMaskIntoConstraints = false
-        pill.addSubview(contents)
-        NSLayoutConstraint.activate([
-            pill.widthAnchor.constraint(equalToConstant: width),
-            pill.heightAnchor.constraint(equalToConstant: height),
-            contents.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
-            contents.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 13),
-            icon.heightAnchor.constraint(equalToConstant: 13),
         ])
         return pill
     }

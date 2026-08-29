@@ -227,11 +227,6 @@ export function App() {
       case "candidate":
         return (
           <CandidateSurface
-            onActivateBuffer={() => {
-              setBufferPaused(false);
-              setSurfaceID("buffer");
-              setNotice("已打开 Buffer 设计场景");
-            }}
             onCommit={(candidate) => setNotice(`候选“${candidate.text}”已提交到模拟状态`)}
             onOpenSettings={() => openSettings()}
           />

@@ -7,6 +7,10 @@
 上游输入：七张早期视觉探索稿（已退役）+ 产品负责人 2026-07-16 口头需求收敛
 关系：本文档记录工作台路线与历史裁决；`ARCHITECTURE.md` 是 P1 时代交接文档。运行时事实与本文冲突时以 `SYSTEM-ARCHITECTURE.md` 为准。
 
+> **2026-08-26 连接器覆盖决策（当前）**：连接器只保留「AI 模型 / 本地网关」；隔空传字的设置入口、启动服务、配对传输、文本镜像与接收投递均已下架。本文后续关于 `RemoteTypingService`、`.remotePeer` 回镜、配对 Mac 与隔空传字页面的内容只用于追溯旧方案，不代表当前产品能力。
+
+> **2026-08-26 Mailbox 覆盖决策（当前）**：「缓冲区」设置改名为「窗口」，分为 Buffer / Clip / Mailbox。Mailbox 是可通过 `⌘⇧M` 独立打开或关闭的本地持久化双栏会话窗口，并复用在设置页；左侧会话统一为单行，右侧使用固定时间/来源/提示符/正文列的全宽等宽 CLI transcript，固定底栏只保留无边框 prompt + 单行输入，Return 提交，不使用聊天气泡或发送按钮。AI 工具栏把内容格式（Plain / Markdown / JSON）与目的地（原地 / Mailbox）作为两个独立维度；任一 Mailbox 组合都会在主按钮或 Return 后关闭 Buffer、由独立协调器后台完成。三种格式的安全正文快照都可在进程内以稳定的纯文本临时行流式显示，但不写入会话、不参与续问、不标未读也不通知；只有完整且通过格式校验的终态才按所选格式原子写入本地会话、标未读并通知。MCP/HTTP/SSE/SSH/插件等单向来源只能添加本地备注，不显示为“真正回复”；待决内容仍需明确“加入 Buffer”或“拒绝”。本文后续关于嵌入工作台传入轨、旧收件箱和 Buffer 内 Mailbox 的描述均为历史路线。
+
 > **2026-08-22 输入方案与并击扩展覆盖决策（当前）**：核心输入法设置只保留「输入方案 / 词库」，五个普通方案是雾凇全拼、自然码双拼、小鹤双拼、五笔 86 与英文。原「键入模式」页已删除；`my_combo`、飞耀并击 / 互击模式、组键间隔、课程、练习和进度统一归入默认关闭的「并击」扩展。意识流在扩展开启时继续把飞耀批次映射为连续全拼，关闭时回到逐字连续全拼。
 
 > 2026-07-17 早期决策（已被下一条覆盖）：缓冲区从候选 panel 拆成独立工作台，曾采用内嵌候选投影、全文预览与发送后留块方案。
@@ -14,6 +18,8 @@
 > **2026-07-28 工作台工具栏覆盖决策（当前）**：顶部功能栏永久展开；主条只保留缓冲轨与右侧主操作，不再显示左侧拖拽手柄或展开/收起按钮。功能栏空白、间距与弹性留白可拖动窗口，按钮、下拉框、状态控件和正文轨保持原有交互且不能拖窗。普通工作台固定为 78pt，1/2/3 个 target rows 固定为 112/143/174pt；旧折叠偏好静默忽略，仅 frame 与 pin 继续持久化，候选位置改为按当前逻辑 caret 实时计算。本文后续所有 44pt 折叠、drag handle、disclosure 和展开态持久化描述均为历史方案。
 >
 > **2026-08-21 Rime 组字与候选呈现覆盖决策（当前）**：直输时由宿主文本控件呈现 marked text；Buffer 捕获同一精确 `FocusToken` 时，`BufferInlineView` 在逻辑插入 caret 处内联投影 preedit。Rime 候选始终由同一个独立 `nonactivatingPanel`（`CandidateWindow`）悬浮呈现，只在宿主 caret 与 Buffer 逻辑 caret 之间切换 anchor，不迁入或贴靠工作台，也不占工作台高度。候选显示、点击与重定位继续通过 exact-focus、secure input、active Space 与 WindowServer 可见性门禁；任一门禁失配都先清除 inline preedit 与候选明文，再 fail closed 隐藏。本文后续若仍描述候选区内嵌、贴靠工作台外沿或候选几何参与工作台高度，均视为历史方案。
+
+> **2026-08-26 候选条精简（当前）**：删除 `0 + tray` Buffer 入口及其快捷键、hover、tooltip 和无障碍节点。候选条只保留 `1`–`9` 选重与齿轮设置；`0` 交回 librime/当前输入路由，不再开启 Buffer 或提交高亮候选。
 >
 > **2026-07-22 简化工作台覆盖决策（被 2026-07-28 工具栏决策及 2026-08-21 候选呈现决策部分覆盖）**：刷新/重置始终保留缓冲正文：对外部插件取消过时任务并重新探测上下文，对内置派生工作区保留源文并重启 generation。工作台不再提供块编辑器或面板内缓冲开关；底层缓冲启停、pin 和移屏仍从设置或输入法菜单进入。手动遮蔽、历史/恢复、清空/撤销已移除。Buffer 只在逻辑 caret 处内联呈现 Rime preedit，常规 `CandidateWindow` 继续作为唯一候选选择面板；意识流 target rows 不是 Rime 候选。普通/Shift+Return 与 Backspace 保持宿主隔离，Return 轻按逐块、长按批量，纸飞机每次只发送下一块。单独且小于 500 ms 的 Shift 轻点才切换中英；与字母/标点组合或长按后保持按下前模式。成功发送的 block 立即从 live buffer 消失且不保留明文历史，失败和未发送 block 原位保留。本文后续若仍描述“Rime 候选投影 / 全文预览 / 已发送对号留块”，均视为历史方案。
 
@@ -239,7 +245,7 @@ Provider 侧：当前 LocalGateway 持有独立 NW 队列并切回主线程调�
 
 当前一个监听器绑定 `127.0.0.1:47700`（可配置），基于 Network.framework `NWListener` 手写极简 HTTP/1.1。响应使用 `Content-Length` 并保持 keep-alive；**没有 chunked 响应、MCP SSE 下行流或可删除的 MCP session**。MCP 采用 stateless Streamable HTTP：每次 `POST /mcp` 返回一个 JSON 响应。SSE 订阅是后续独立 provider，不是当前 LocalGateway 的第三种协议。
 
-除公开健康检查外，端点要求 `Authorization: Bearer <token>`。token 生成后写入 `~/Library/RimeBuffer/gateway-token`（0600，与 RemoteIdentity 的既有决策一致——**不用 Keychain**，因为 ad-hoc 签名下 Keychain ACL 每次重装都会弹窗；拿到 Developer ID 正式签名后再评估迁移）。当前设置页可复制 token、MCP 配置和 curl 命令，但**没有重新生成 token 的 UI**。
+除公开健康检查外，端点要求 `Authorization: Bearer <token>`。token 生成后写入 `~/Library/RimeBuffer/gateway-token`（0600；**不用 Keychain**，避免 ad-hoc 签名重建时反复触发 ACL 提示；拿到 Developer ID 正式签名后再评估迁移）。当前设置页默认只展示脱敏的通用 MCP JSON，复制时才写入真实 token；Claude Code 注册命令收在可选展开区，仍**没有重新生成 token 的 UI**。
 
 端点：
 

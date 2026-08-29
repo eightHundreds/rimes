@@ -3,9 +3,9 @@ import CryptoKit
 
 /// Bearer token for the local gateway, stored 0600 at ~/Library/RimeBuffer/
 /// gateway-token. Not in the Keychain — ad-hoc signing makes Keychain ACLs
-/// re-prompt on every rebuild (see RemoteIdentity for the same call). The token
-/// only guards against OTHER users / the network; a same-user process in the
-/// trust domain can read the file, which is the documented threat model.
+/// re-prompt on every rebuild. The token only guards against OTHER users / the
+/// network; a same-user process in the trust domain can read the file, which is
+/// the documented threat model.
 enum GatewayToken {
     private static var url: URL {
         let dir = ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"].map {

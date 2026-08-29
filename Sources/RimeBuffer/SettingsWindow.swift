@@ -495,7 +495,7 @@ private final class SettingsCardActionSmokeProbe: NSObject {
 }
 
 /// Central settings surface for input schemas, candidate UI, buffer mode,
-/// remote typing, and local diagnostics.
+/// AI/local connectors, and diagnostics.
 final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDelegate {
     static let shared = SettingsWindowController()
     private static let previewContentSize = NSSize(width: 980, height: 680)
@@ -509,6 +509,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private lazy var navigation = SettingsNavigationState(catalog: routeCatalog)
     private var navButtons: [SettingsRouteID: NSButton] = [:]
     private var activePluginSettingsController: NSViewController?
+    private var activeMailboxController: MailboxPaneViewController?
     private var statsObserver: NSObjectProtocol?
     private var pluginObserver: NSObjectProtocol?
     private var registryObserver: NSObjectProtocol?
@@ -530,9 +531,15 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private let resetOnAppSwitchCheck = RimeFixedAccentSwitch(frame: .zero)
     private let gatewayEnableCheck = RimeFixedAccentSwitch(frame: .zero)
     private let gatewayConfigField = NSTextField(string: "")
-    private let gatewayCopyConfigButton = NSButton(title: "复制配置 (JSON)", target: nil, action: nil)
+    private let gatewayCopyConfigButton = NSButton(title: "复制配置", target: nil, action: nil)
+    private let gatewayClaudeDisclosureButton = NSButton(
+        title: "Claude Code 一键注册（可选）",
+        target: nil,
+        action: nil
+    )
     private let gatewayCommandField = NSTextField(string: "")
     private let gatewayCopyButton = NSButton(title: "复制 Claude Code 命令", target: nil, action: nil)
+    private var gatewayClaudeDisclosureOpen = false
     private let aiBaseURLField = NSTextField(string: "")
     private let aiModelField = NSTextField(string: "")
     private let aiAPIKeyField = NSSecureTextField(string: "")
@@ -574,12 +581,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private let statsTopKey = NSTextField(labelWithString: "")
     private let installStatus = NSTextField(labelWithString: "")
     private let heatmapView = KeyboardHeatmapView()
-    private let remoteCheck = RimeFixedAccentSwitch(frame: .zero)
-    private let remoteNameField = NSTextField(string: "")
-    private let remoteStatusLabel = NSTextField(labelWithString: "")
-    private let remoteDevicesStack = NSStackView()
-    private var remoteDiscoveredIDs: [String] = []
-    private var remoteTrustedKeys: [String] = []
     private let pluginRowsStack = NSStackView()
     private let pluginStatusLabel = NSTextField(labelWithString: "")
     private let settingsStatusLabel = NSTextField(labelWithString: "设置会立即应用并保存在本机")
@@ -1257,7 +1258,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.refreshAIConnectorSelection()
+            guard let self else { return }
+            self.refreshAIConnectorSelection()
+            guard self.window?.isVisible == true,
+                  self.selectedCoreRoute == .connectors,
+                  self.navigation.selectedSubpage()?.rawValue == "ai-model" else { return }
+            // Connector selection notifications are synchronous. Rebuild after
+            // the card action has returned so the selected control is not
+            // removed while AppKit is still dispatching its click.
+            DispatchQueue.main.async { [weak self] in
+                self?.showCurrentRoute()
+            }
         }
         aiConnectorAvailabilityObserver = NotificationCenter.default.addObserver(
             forName: .aiTextConnectorAvailabilityDidChange,
@@ -1307,7 +1318,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         settingsStatusLabel.textColor = RimeUI.textMuted
         settingsRouteLabel.textColor = RimeUI.textMuted
         installStatus.textColor = RimeUI.textMuted
-        remoteStatusLabel.textColor = RimeUI.textSecondary
         statsTopKey.textColor = RimeUI.textSecondary
         candidateMetricSliders.values.forEach { $0.trackFillColor = RimeUI.accentGreen }
         bufferWidthSlider.trackFillColor = RimeUI.accentGreen
@@ -1344,6 +1354,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         // hidden AppKit work on the IME main thread.
         contentHost.subviews.forEach { $0.removeFromSuperview() }
         activePluginSettingsController = nil
+        activeMailboxController = nil
         candidatePreview = nil
     }
 
@@ -1383,6 +1394,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         codexLoginSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
         codexLoginStatusLabel.font = .systemFont(ofSize: 11)
         codexLoginStatusLabel.textColor = RimeUI.textMuted
+        codexLoginStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        codexLoginStatusLabel.widthAnchor.constraint(equalToConstant: 626).isActive = true
         claudeLoginButton.target = self
         claudeLoginButton.action = #selector(claudeLoginButtonPressed)
         claudeLoginSpinner.style = .spinning
@@ -1393,6 +1406,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         claudeLoginSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
         claudeLoginStatusLabel.font = .systemFont(ofSize: 11)
         claudeLoginStatusLabel.textColor = RimeUI.textMuted
+        claudeLoginStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        claudeLoginStatusLabel.widthAnchor.constraint(equalToConstant: 626).isActive = true
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
         bufferCheck.setAccessibilityLabel("启用缓冲模式")
@@ -1422,16 +1437,30 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         gatewayConfigField.lineBreakMode = .byCharWrapping
         gatewayConfigField.maximumNumberOfLines = 12
         gatewayConfigField.translatesAutoresizingMaskIntoConstraints = false
-        gatewayConfigField.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        gatewayConfigField.widthAnchor.constraint(equalToConstant: 626).isActive = true
         gatewayCopyConfigButton.target = self
         gatewayCopyConfigButton.action = #selector(copyGatewayConfig)
+        gatewayClaudeDisclosureButton.target = self
+        gatewayClaudeDisclosureButton.action = #selector(toggleGatewayClaudeDisclosure)
+        gatewayClaudeDisclosureButton.isBordered = false
+        gatewayClaudeDisclosureButton.alignment = .left
+        gatewayClaudeDisclosureButton.imagePosition = .imageTrailing
+        gatewayClaudeDisclosureButton.wantsLayer = true
+        gatewayClaudeDisclosureButton.layer?.cornerRadius = 6
+        gatewayClaudeDisclosureButton.layer?.borderColor = RimeUI.border.cgColor
+        gatewayClaudeDisclosureButton.layer?.borderWidth = SettingsVisualStyle.hairline(
+            backingScale: window?.backingScaleFactor
+        )
+        gatewayClaudeDisclosureButton.translatesAutoresizingMaskIntoConstraints = false
+        gatewayClaudeDisclosureButton.widthAnchor.constraint(equalToConstant: 626).isActive = true
+        gatewayClaudeDisclosureButton.heightAnchor.constraint(equalToConstant: 30).isActive = true
         gatewayCommandField.isEditable = false
         gatewayCommandField.isSelectable = true
         gatewayCommandField.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         gatewayCommandField.lineBreakMode = .byCharWrapping
         gatewayCommandField.maximumNumberOfLines = 4
         gatewayCommandField.translatesAutoresizingMaskIntoConstraints = false
-        gatewayCommandField.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        gatewayCommandField.widthAnchor.constraint(equalToConstant: 626).isActive = true
         gatewayCopyButton.target = self
         gatewayCopyButton.action = #selector(copyGatewayCommand)
 
@@ -1448,6 +1477,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         aiConfigurationStatus.font = .systemFont(ofSize: 11)
         aiConfigurationStatus.textColor = RimeUI.textMuted
         aiConfigurationStatus.lineBreakMode = .byTruncatingTail
+        aiConfigurationStatus.translatesAutoresizingMaskIntoConstraints = false
+        aiConfigurationStatus.widthAnchor.constraint(equalToConstant: 626).isActive = true
 
         appearancePopUp.removeAllItems()
         for mode in RimeAppearanceMode.allCases {
@@ -1471,18 +1502,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         installStatus.textColor = RimeUI.textMuted
         heatmapView.translatesAutoresizingMaskIntoConstraints = false
         heatmapView.heightAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
-
-        remoteCheck.target = self
-        remoteCheck.action = #selector(remoteToggled)
-        remoteCheck.setAccessibilityLabel("启用隔空传字")
-        remoteNameField.placeholderString = Host.current().localizedName ?? "Mac"
-        remoteNameField.translatesAutoresizingMaskIntoConstraints = false
-        remoteNameField.widthAnchor.constraint(equalToConstant: 220).isActive = true
-        remoteStatusLabel.font = .systemFont(ofSize: 12)
-        remoteStatusLabel.textColor = RimeUI.textSecondary
-        remoteDevicesStack.orientation = .vertical
-        remoteDevicesStack.alignment = .leading
-        remoteDevicesStack.spacing = 6
 
         pluginStatusLabel.font = .systemFont(ofSize: 11)
         pluginStatusLabel.textColor = RimeUI.textSecondary
@@ -1672,6 +1691,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         guard let route = selectedRoute else { return }
         refreshSidebarSelection()
         activePluginSettingsController = nil
+        activeMailboxController = nil
         contentHost.subviews.forEach { $0.removeFromSuperview() }
 
         let subpageID = navigation.selectedSubpage()?.rawValue
@@ -1707,7 +1727,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         switch route.source {
         case .core(.appearance): refreshCandidateMetricControls()
-        case .core(.connectors): refreshRemoteStatus()
         case .core(.plugins): refreshPluginList()
         case .builtInPlugin(let key) where key.rawID == BuiltInPluginID.statistics:
             refreshStats()
@@ -1799,7 +1818,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         ])
 
         let bodyHost: NSView
-        if body is NSScrollView {
+        if body is NSScrollView
+            || body.identifier?.rawValue == "settings.mailbox-pane" {
             // Page-owned controllers may preserve their own scroll positions;
             // do not nest them in another scroll view with zero intrinsic height.
             bodyHost = body
@@ -1882,9 +1902,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             case .appearance:
                 return "主题同时作用于候选框、缓冲工作台与设置页预览。"
             case .buffer:
-                return "控制暂存、独立工作台、跨桌面显示与切换应用行为。"
+                return "管理 Buffer、Clip 与跨重启保存在本机的 Mailbox。"
             case .connectors:
-                return "管理 AI 模型、本地网关与已配对设备。"
+                return "管理 AI 模型与本地网关。"
             case .plugins:
                 return "管理工作台可用的缓冲插件与随应用提供的内部扩展。"
             case .maintenance:
@@ -2020,10 +2040,48 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         return card
     }
 
+    private func connectorDetailPanel(_ views: [NSView],
+                                      enabled: Bool = true) -> NSView {
+        let panel = NSStackView(views: views)
+        panel.orientation = .vertical
+        panel.alignment = .leading
+        panel.spacing = 10
+        panel.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = RimeUI.surface2.cgColor
+        panel.layer?.borderColor = RimeUI.border.cgColor
+        panel.layer?.borderWidth = SettingsVisualStyle.hairline(
+            backingScale: window?.backingScaleFactor
+        )
+        panel.layer?.cornerRadius = 10
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.widthAnchor.constraint(equalToConstant: 650).isActive = true
+        panel.alphaValue = enabled ? 1 : 0.55
+        return panel
+    }
+
+    private func connectorStatusBadge(_ text: String, active: Bool) -> NSTextField {
+        let badge = NSTextField(labelWithString: text)
+        badge.font = .systemFont(ofSize: 9, weight: .semibold)
+        badge.textColor = active ? themeStatusColor : RimeUI.textMuted
+        badge.setContentHuggingPriority(.required, for: .horizontal)
+        return badge
+    }
+
+    private func connectorNote(_ text: String) -> NSTextField {
+        let note = NSTextField(wrappingLabelWithString: text)
+        note.font = .systemFont(ofSize: 9)
+        note.textColor = RimeUI.textMuted
+        note.translatesAutoresizingMaskIntoConstraints = false
+        note.widthAnchor.constraint(equalToConstant: 626).isActive = true
+        return note
+    }
+
     private func settingsRow(title: String,
                              detail: String,
                              symbolName: String,
-                             control: NSView) -> NSView {
+                             control: NSView,
+                             width: CGFloat = 650) -> NSView {
         control.removeFromSuperview()
         let icon = SettingsIconTileView(
             symbolName: symbolName,
@@ -2057,7 +2115,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         )
         row.layer?.cornerRadius = 8
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: 650).isActive = true
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
         row.heightAnchor.constraint(greaterThanOrEqualToConstant: 58).isActive = true
         control.setContentHuggingPriority(.required, for: .horizontal)
         return row
@@ -2266,7 +2324,24 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         ])
     }
 
-    private func bufferPage(subpageID _: String) -> NSView {
+    private func bufferPage(subpageID: String) -> NSView {
+        switch subpageID {
+        case "clip":
+            return clipSettingsPage()
+        case "mailbox":
+            let controller = MailboxPaneViewController()
+            activeMailboxController = controller
+            let pane = controller.view
+            pane.identifier = NSUserInterfaceItemIdentifier(
+                "settings.mailbox-pane"
+            )
+            return pane
+        default:
+            return bufferSettingsPage()
+        }
+    }
+
+    private func bufferSettingsPage() -> NSView {
         let deliveryShortcut = RimeShortcutPreferences
             .shortcut(for: .deliverBuffer)
             .displayTitle
@@ -2296,12 +2371,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
                 control: bufferWindowVisibleCheck
             ),
             settingsRow(
-                title: "启用剪贴板历史",
-                detail: "仅在工作台实际显示时读取；历史只保留在当前输入法进程。",
-                symbolName: "clipboard",
-                control: clipboardHistoryCheck
-            ),
-            settingsRow(
                 title: "最后一块上屏后关闭工作台",
                 detail: "适用于 Default 与所有缓冲插件；部分失败或内容变化时保持打开。",
                 symbolName: "checkmark.rectangle",
@@ -2329,179 +2398,241 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         ])
     }
 
+    private func clipSettingsPage() -> NSView {
+        contentColumn([
+            title("Clip"),
+            caption("剪贴板历史只在工作台显示时读取，并且只保留在当前输入法进程。"),
+            settingsRow(
+                title: "启用剪贴板历史",
+                detail: "通过工作台或快捷键临时查看最近复制的文本。",
+                symbolName: "clipboard",
+                control: clipboardHistoryCheck
+            ),
+            secondaryLabel(
+                "Mailbox 会话使用独立的本地持久化；关闭 Clip 或重启输入法不会把剪贴板历史写入 Mailbox。"
+            ),
+        ])
+    }
+
     private func connectionsPage(subpageID: String) -> NSView {
         if subpageID == "ai-model" {
             return aiModelConnectionsPage()
         }
-        let applyNameBtn = NSButton(title: "应用名称", target: self, action: #selector(applyRemoteName))
-        let nameRow = NSStackView(views: [remoteNameField, applyNameBtn])
-        nameRow.orientation = .horizontal
-        nameRow.alignment = .centerY
-        nameRow.spacing = 8
-
-        let sourcesNote = NSTextField(wrappingLabelWithString:
-            "标准 MCP（Streamable HTTP，2025-06-18）端点，任何 MCP 客户端／智能体都能接入——"
-            + "把文字送进缓冲区收件箱，需你逐条确认后才成为可发送的块。")
-        sourcesNote.font = .systemFont(ofSize: 11)
-        sourcesNote.textColor = RimeUI.textMuted
-
-        let cliNote = NSTextField(wrappingLabelWithString:
-            "或用 Claude Code 命令行一键注册（等价于上面的配置）：")
-        cliNote.font = .systemFont(ofSize: 11)
-        cliNote.textColor = RimeUI.textMuted
-
-        let laterSources = NSStackView(views: [
-            comingSoonRow("SSE 订阅", "订阅外部事件流，流式进缓冲区", "M6"),
-            comingSoonRow("SSH", "远程主机命令输出流式进缓冲区", "M6"),
-        ])
-        laterSources.orientation = .vertical
-        laterSources.alignment = .leading
-        laterSources.spacing = 8
-
-        if subpageID == "local-gateway" {
+        guard subpageID == "local-gateway" else {
             return contentColumn([
                 title("本地网关"),
-                caption("仅监听 127.0.0.1，并要求 Token 鉴权；所有内容仍需手动确认。"),
-                settingsRow(
-                    title: "启用本地网关",
-                    detail: "允许本机 Claude Code、Codex 等工具推送待确认内容。",
-                    symbolName: "network",
-                    control: gatewayEnableCheck
-                ),
-                sectionLabel("MCP / HTTP 接入"),
-                sourcesNote,
-                spacer(6),
-                secondaryLabel("接入配置（标准 MCP，任意客户端通用）"),
-                gatewayConfigField,
-                gatewayCopyConfigButton,
-                spacer(10),
-                cliNote,
-                gatewayCommandField,
-                gatewayCopyButton,
-                spacer(16),
-                sectionLabel("更多来源"),
-                laterSources,
+                caption("这个连接器页面已经移除。"),
             ])
         }
+
+        let gatewayEnabled = LocalGateway.shared.enabled
+        gatewayCopyConfigButton.removeFromSuperview()
+        gatewayConfigField.removeFromSuperview()
+        gatewayClaudeDisclosureButton.removeFromSuperview()
+        gatewayCommandField.removeFromSuperview()
+        gatewayCopyButton.removeFromSuperview()
+        gatewayCopyConfigButton.isEnabled = gatewayEnabled
+        gatewayClaudeDisclosureButton.isEnabled = gatewayEnabled
+        gatewayCopyButton.isEnabled = gatewayEnabled
+        gatewayClaudeDisclosureButton.image = NSImage(
+            systemSymbolName: gatewayClaudeDisclosureOpen ? "chevron.up" : "chevron.down",
+            accessibilityDescription: gatewayClaudeDisclosureOpen ? "收起" : "展开"
+        )?.withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        gatewayClaudeDisclosureButton.setAccessibilityExpanded(
+            gatewayClaudeDisclosureOpen
+        )
+
+        let configurationTitle = NSTextField(labelWithString: "接入配置")
+        configurationTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        configurationTitle.textColor = RimeUI.textPrimary
+        let configurationDetail = NSTextField(
+            wrappingLabelWithString:
+                "标准 MCP（Streamable HTTP）。Cursor、Codex、Claude Code 等客户端通用。"
+        )
+        configurationDetail.font = .systemFont(ofSize: 9)
+        configurationDetail.textColor = RimeUI.textMuted
+        let configurationCopy = NSStackView(views: [
+            configurationTitle,
+            configurationDetail,
+        ])
+        configurationCopy.orientation = .vertical
+        configurationCopy.alignment = .leading
+        configurationCopy.spacing = 3
+        configurationCopy.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        let configurationHeader = NSStackView(views: [
+            configurationCopy,
+            flexSpacer(),
+            gatewayCopyConfigButton,
+        ])
+        configurationHeader.orientation = .horizontal
+        configurationHeader.alignment = .top
+        configurationHeader.spacing = 12
+        configurationHeader.translatesAutoresizingMaskIntoConstraints = false
+        configurationHeader.widthAnchor.constraint(equalToConstant: 626).isActive = true
+
+        var configurationViews: [NSView] = [
+            configurationHeader,
+            gatewayConfigField,
+            gatewayClaudeDisclosureButton,
+        ]
+        if gatewayClaudeDisclosureOpen {
+            let commandActions = NSStackView(views: [gatewayCopyButton, flexSpacer()])
+            commandActions.orientation = .horizontal
+            commandActions.alignment = .centerY
+            commandActions.translatesAutoresizingMaskIntoConstraints = false
+            commandActions.widthAnchor.constraint(equalToConstant: 626).isActive = true
+            configurationViews.append(contentsOf: [
+                connectorNote(
+                    "等价于上方通用配置；仅在已安装 Claude Code CLI 时需要。"
+                ),
+                gatewayCommandField,
+                commandActions,
+            ])
+        }
+
         return contentColumn([
-            title("隔空传字"),
-            caption("配对设备使用端到端加密通道；收到的文字按既有直通规则处理。"),
+            title("本地网关"),
+            caption("仅监听 127.0.0.1，并要求 Token 鉴权；推入内容仍需你在收件箱逐条确认。"),
             settingsRow(
-                title: "启用隔空传字",
-                detail: "允许已配对的 RIMES 设备发现这台 Mac。",
+                title: "启用本地网关",
+                detail: "允许本机智能体通过标准 MCP / HTTP 推送待确认内容。",
                 symbolName: "network",
-                control: remoteCheck
+                control: gatewayEnableCheck
             ),
-            remoteStatusLabel,
-            spacer(8),
-            secondaryLabel("本机名称"),
-            nameRow,
-            spacer(6),
-            secondaryLabel("设备"),
-            remoteDevicesStack,
+            connectorDetailPanel(configurationViews, enabled: gatewayEnabled),
         ])
     }
 
     private func aiModelConnectionsPage() -> NSView {
         let connectors = AITextConnectorRegistry.shared
-        let codexAvailability = connectors.availability(for: .codexCLI)
-        let claudeAvailability = connectors.availability(for: .claudeCodeCLI)
-        let codexReady = codexAvailability == .ready
-        let claudeReady = claudeAvailability == .ready
-        let codexDetail: String
-        switch codexAvailability {
-        case .ready:
-            codexDetail = "使用 \(ProductIdentity.displayName) 专用的 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"
-        case let .unavailable(message):
-            codexDetail = message
-        }
-        let claudeDetail: String
-        switch claudeAvailability {
-        case .ready:
-            claudeDetail = "使用本机已登录的 claude 命令行；工具调用与会话持久化被关闭。"
-        case let .unavailable(message):
-            claudeDetail = message
-        }
-        refreshCodexLoginControls(
-            hasCredential: connectors.codexHasStoredChatGPTCredential
-        )
-        refreshClaudeLoginControls(
-            authenticationStatus: connectors.claudeAuthenticationStatus
-        )
-        codexLoginButton.removeFromSuperview()
-        codexCopyLoginLinkButton.removeFromSuperview()
-        codexLoginSpinner.removeFromSuperview()
-        codexLoginStatusLabel.removeFromSuperview()
-        let codexLoginActions = NSStackView(views: [
-            codexLoginButton,
-            codexCopyLoginLinkButton,
-            codexLoginSpinner,
-            flexSpacer(),
-        ])
-        codexLoginActions.orientation = .horizontal
-        codexLoginActions.alignment = .centerY
-        codexLoginActions.spacing = 8
-        claudeLoginButton.removeFromSuperview()
-        claudeLoginSpinner.removeFromSuperview()
-        claudeLoginStatusLabel.removeFromSuperview()
-        let claudeLoginActions = NSStackView(views: [
-            claudeLoginButton,
-            claudeLoginSpinner,
-            flexSpacer(),
-        ])
-        claudeLoginActions.orientation = .horizontal
-        claudeLoginActions.alignment = .centerY
-        claudeLoginActions.spacing = 8
-        let save = NSButton(title: "保存配置",
-                            target: self,
-                            action: #selector(saveAIModelConfiguration))
-        let clearKey = NSButton(title: "清除密钥",
+        let selected = AITextConnectorSelectionStore.shared.selectedKind
+        let detailPanel: NSView
+
+        switch selected {
+        case .codexCLI:
+            let availability = connectors.availability(for: .codexCLI)
+            let ready = availability == .ready
+            let detail: String
+            switch availability {
+            case .ready:
+                detail = "使用 \(ProductIdentity.displayName) 专用的 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"
+            case let .unavailable(message):
+                detail = message
+            }
+            refreshCodexLoginControls(
+                hasCredential: connectors.codexHasStoredChatGPTCredential
+            )
+            codexLoginButton.removeFromSuperview()
+            codexCopyLoginLinkButton.removeFromSuperview()
+            codexLoginSpinner.removeFromSuperview()
+            codexLoginStatusLabel.removeFromSuperview()
+            let actions = NSStackView(views: [
+                codexLoginButton,
+                codexCopyLoginLinkButton,
+                codexLoginSpinner,
+                flexSpacer(),
+            ])
+            actions.orientation = .horizontal
+            actions.alignment = .centerY
+            actions.spacing = 8
+            actions.translatesAutoresizingMaskIntoConstraints = false
+            actions.widthAnchor.constraint(equalToConstant: 626).isActive = true
+            detailPanel = connectorDetailPanel([
+                settingsRow(
+                    title: "Codex CLI",
+                    detail: detail,
+                    symbolName: "chevron.left.forwardslash.chevron.right",
+                    control: connectorStatusBadge(ready ? "可用" : "不可用", active: ready),
+                    width: 626
+                ),
+                actions,
+                codexLoginStatusLabel,
+                connectorNote(
+                    "CLI 在本机启动，但不代表本地推理：点击生成后，缓冲全文会经已登录服务发送。\(ProductIdentity.displayName) 不会把环境中的 API Key 透传给 Codex。"
+                ),
+            ])
+
+        case .claudeCodeCLI:
+            let availability = connectors.availability(for: .claudeCodeCLI)
+            let ready = availability == .ready
+            let detail: String
+            switch availability {
+            case .ready:
+                detail = "使用本机已登录的 claude 命令行；工具调用与会话持久化被关闭。"
+            case let .unavailable(message):
+                detail = message
+            }
+            refreshClaudeLoginControls(
+                authenticationStatus: connectors.claudeAuthenticationStatus
+            )
+            claudeLoginButton.removeFromSuperview()
+            claudeLoginSpinner.removeFromSuperview()
+            claudeLoginStatusLabel.removeFromSuperview()
+            let actions = NSStackView(views: [
+                claudeLoginButton,
+                claudeLoginSpinner,
+                flexSpacer(),
+            ])
+            actions.orientation = .horizontal
+            actions.alignment = .centerY
+            actions.spacing = 8
+            actions.translatesAutoresizingMaskIntoConstraints = false
+            actions.widthAnchor.constraint(equalToConstant: 626).isActive = true
+            detailPanel = connectorDetailPanel([
+                settingsRow(
+                    title: "Claude Code CLI",
+                    detail: detail,
+                    symbolName: "sparkles",
+                    control: connectorStatusBadge(ready ? "可用" : "不可用", active: ready),
+                    width: 626
+                ),
+                actions,
+                claudeLoginStatusLabel,
+                connectorNote(
+                    "CLI 在本机启动，但不代表本地推理：点击生成后，缓冲全文会经已登录服务发送。\(ProductIdentity.displayName) 不会把环境中的 API Key 透传给 Claude Code。"
+                ),
+            ])
+
+        case .openAICompatible:
+            refreshAIModelConfiguration()
+            aiBaseURLField.removeFromSuperview()
+            aiModelField.removeFromSuperview()
+            aiAPIKeyField.removeFromSuperview()
+            aiConfigurationStatus.removeFromSuperview()
+            let save = NSButton(title: "保存配置",
                                 target: self,
-                                action: #selector(clearAIModelAPIKey))
-        let actions = NSStackView(views: [save, clearKey])
-        actions.orientation = .horizontal
-        actions.alignment = .centerY
-        actions.spacing = 8
-
-        let privacy = NSTextField(wrappingLabelWithString:
-            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的授权状态发送。\(ProductIdentity.displayName) 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
-        privacy.font = .systemFont(ofSize: 11)
-        privacy.textColor = RimeUI.textMuted
-
-        let keyNote = NSTextField(wrappingLabelWithString:
-            "Base URL 应包含 API 前缀（例如 /v1），程序会追加 /chat/completions。远程地址必须使用 HTTPS；HTTP 仅允许 localhost、127.0.0.1 或 ::1。密钥保存在权限为 0600 的本地配置文件，不写入偏好设置或日志。")
-        keyNote.font = .systemFont(ofSize: 11)
-        keyNote.textColor = RimeUI.textMuted
+                                action: #selector(saveAIModelConfiguration))
+            let clearKey = NSButton(title: "清除密钥",
+                                    target: self,
+                                    action: #selector(clearAIModelAPIKey))
+            let actions = NSStackView(views: [save, clearKey, flexSpacer()])
+            actions.orientation = .horizontal
+            actions.alignment = .centerY
+            actions.spacing = 8
+            actions.translatesAutoresizingMaskIntoConstraints = false
+            actions.widthAnchor.constraint(equalToConstant: 626).isActive = true
+            detailPanel = connectorDetailPanel([
+                labeledSettingsRow("Base URL", control: aiBaseURLField),
+                labeledSettingsRow("模型", control: aiModelField),
+                labeledSettingsRow("API Key", control: aiAPIKeyField),
+                actions,
+                aiConfigurationStatus,
+                connectorNote(
+                    "Base URL 应包含 API 前缀（例如 /v1），程序会追加 /chat/completions。远程地址必须使用 HTTPS；HTTP 仅允许 localhost、127.0.0.1 或 ::1。密钥保存在权限为 0600 的本地配置文件，不写入偏好设置或日志。"
+                ),
+            ])
+        }
 
         return contentColumn([
             title("AI 模型"),
-            caption("“AI 生成”是一个统一缓冲插件；在这里切换它使用的模型连接器。生成结果进入独立下层缓冲区，由你确认后发送。"),
+            caption("“AI 生成”是统一缓冲插件；在这里切换它使用的模型连接器。正文只会在你明确点击生成时发送。"),
             spacer(8),
-            sectionLabel("当前连接器"),
+            sectionLabel("AI 模型"),
             aiConnectorSelectionView(),
-            spacer(12),
-            sectionLabel("本地 CLI"),
-            inputModeCard(title: "Codex CLI",
-                          detail: codexDetail,
-                          active: codexReady,
-                          inactiveLabel: "不可用"),
-            codexLoginActions,
-            codexLoginStatusLabel,
-            inputModeCard(title: "Claude Code CLI",
-                          detail: claudeDetail,
-                          active: claudeReady,
-                          inactiveLabel: "不可用"),
-            claudeLoginActions,
-            claudeLoginStatusLabel,
-            privacy,
-            spacer(16),
-            sectionLabel("通用 Open API（OpenAI 兼容 Chat Completions）"),
-            labeledSettingsRow("Base URL", control: aiBaseURLField),
-            labeledSettingsRow("模型", control: aiModelField),
-            labeledSettingsRow("API Key", control: aiAPIKeyField),
-            actions,
-            aiConfigurationStatus,
-            keyNote,
+            detailPanel,
         ])
     }
 
@@ -2554,15 +2685,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     /// Client-agnostic MCP server config — the `mcpServers` shape Claude Desktop,
     /// Cursor, Cline, VS Code and most agents read. Any client that speaks
     /// Streamable HTTP can drop this in.
-    private func gatewayConfigJSON() -> String {
-        """
+    private func gatewayConfigJSON(redactingToken: Bool = false) -> String {
+        let token = redactingToken ? "••••••••" : GatewayToken.current()
+        return """
         {
           "mcpServers": {
             "etinput": {
               "type": "http",
               "url": "http://127.0.0.1:\(LocalGateway.shared.port)/mcp",
               "headers": {
-                "Authorization": "Bearer \(GatewayToken.current())"
+                "Authorization": "Bearer \(token)"
               }
             }
           }
@@ -2570,23 +2702,42 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         """
     }
 
-    private func gatewayCommand() -> String {
-        "claude mcp add --transport http etinput http://127.0.0.1:\(LocalGateway.shared.port)/mcp "
-            + "--header \"Authorization: Bearer \(GatewayToken.current())\""
+    private func gatewayCommand(redactingToken: Bool = false) -> String {
+        let token = redactingToken ? "••••••••" : GatewayToken.current()
+        return "claude mcp add --transport http etinput http://127.0.0.1:\(LocalGateway.shared.port)/mcp "
+            + "--header \"Authorization: Bearer \(token)\""
     }
 
     @objc private func gatewayToggled() {
-        LocalGateway.shared.enabled = gatewayEnableCheck.state == .on
+        let enabled = gatewayEnableCheck.state == .on
+        LocalGateway.shared.enabled = enabled
+        settingsStatusLabel.stringValue = enabled ? "已启用本地网关" : "已关闭本地网关"
+        settingsStatusLabel.textColor = RimeUI.textMuted
+        DispatchQueue.main.async { [weak self] in
+            self?.showCurrentRoute()
+        }
+    }
+
+    @objc private func toggleGatewayClaudeDisclosure() {
+        guard LocalGateway.shared.enabled else { return }
+        gatewayClaudeDisclosureOpen.toggle()
+        DispatchQueue.main.async { [weak self] in
+            self?.showCurrentRoute()
+        }
     }
 
     @objc private func copyGatewayConfig() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(gatewayConfigJSON(), forType: .string)
+        settingsStatusLabel.stringValue = "已复制通用 MCP 配置"
+        settingsStatusLabel.textColor = RimeUI.textMuted
     }
 
     @objc private func copyGatewayCommand() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(gatewayCommand(), forType: .string)
+        settingsStatusLabel.stringValue = "已复制 Claude Code 注册命令"
+        settingsStatusLabel.textColor = RimeUI.textMuted
     }
 
     @objc private func saveAIModelConfiguration() {
@@ -3143,8 +3294,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         bufferPinnedCheck.state = BufferWindowController.shared.pinned ? .on : .off
         resetOnAppSwitchCheck.state = BufferModel.shared.resetOnAppSwitch ? .on : .off
         gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
-        gatewayConfigField.stringValue = gatewayConfigJSON()
-        gatewayCommandField.stringValue = gatewayCommand()
+        gatewayConfigField.stringValue = gatewayConfigJSON(redactingToken: true)
+        gatewayCommandField.stringValue = gatewayCommand(redactingToken: true)
         refreshAIConnectorSelection()
         refreshAIModelConfiguration()
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
@@ -3154,7 +3305,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
         refreshCandidateMetricControls()
         refreshBufferWidthControls()
-        refreshRemoteStatus()
         refreshStats()
     }
 
@@ -3365,11 +3515,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         settingsStatusLabel.textColor = isError ? .systemRed : RimeUI.textMuted
     }
 
-    func remoteStatusDidChange() {
-        guard selectedCoreRoute == .connectors else { return }
-        refreshRemoteStatus()
-    }
-
     private func refreshCandidateMetricControls() {
         var stored: [CandidateWindowMetric: Double] = [:]
         for metric in CandidateWindowMetric.allCases {
@@ -3458,50 +3603,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             statsTopKey.stringValue = "最高频：\(KeyboardLayout.displayName(for: top)) · \(count) 次 · \(String(format: "%.1f", ratio))%"
         } else {
             statsTopKey.stringValue = "最高频：暂无"
-        }
-    }
-
-    private func refreshRemoteStatus() {
-        remoteCheck.state = RemoteConfig.enabled ? .on : .off
-        remoteNameField.stringValue = RemoteConfig.deviceName
-        let status = RemoteTypingService.shared.status
-        remoteStatusLabel.stringValue = "状态：\(RemoteTypingService.shared.statusSummary)"
-
-        remoteDevicesStack.arrangedSubviews.forEach {
-            remoteDevicesStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        remoteDiscoveredIDs.removeAll()
-        remoteTrustedKeys.removeAll()
-
-        guard RemoteConfig.enabled else {
-            remoteDevicesStack.addArrangedSubview(secondaryLabel("开启后会在局域网和附近设备中发现可配对的 Mac。"))
-            return
-        }
-
-        let untrusted = status.discovered.filter { !$0.trusted }
-        if !untrusted.isEmpty {
-            remoteDevicesStack.addArrangedSubview(secondaryLabel("发现的设备"))
-            for peer in untrusted {
-                let button = NSButton(title: "配对：\(peer.name)", target: self, action: #selector(pairRemoteDevice(_:)))
-                button.tag = remoteDiscoveredIDs.count
-                remoteDiscoveredIDs.append(peer.id)
-                remoteDevicesStack.addArrangedSubview(button)
-            }
-        }
-
-        if !status.trusted.isEmpty {
-            remoteDevicesStack.addArrangedSubview(secondaryLabel("已配对设备"))
-            for peer in status.trusted {
-                let button = NSButton(title: "取消配对：\(peer.name)", target: self, action: #selector(unpairRemoteDevice(_:)))
-                button.tag = remoteTrustedKeys.count
-                remoteTrustedKeys.append(peer.pubB64)
-                remoteDevicesStack.addArrangedSubview(button)
-            }
-        }
-
-        if untrusted.isEmpty, status.trusted.isEmpty {
-            remoteDevicesStack.addArrangedSubview(secondaryLabel("尚未发现设备。确认另一台 Mac 已开启隔空传字。"))
         }
     }
 
@@ -3955,8 +4056,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     @objc private func aiConnectorSelected(_ sender: RimeFixedAccentChoiceButton) {
         guard AITextProviderKind.allCases.indices.contains(sender.tag) else { return }
         let kind = AITextProviderKind.allCases[sender.tag]
-        _ = AITextConnectorRegistry.shared.select(kind)
+        let changed = AITextConnectorRegistry.shared.select(kind)
         refreshAIConnectorSelection()
+        if changed {
+            settingsStatusLabel.stringValue = "已切换到 \(kind.displayName)"
+            settingsStatusLabel.textColor = RimeUI.textMuted
+        }
         BufferWindowController.shared.refresh()
         RimeBufferController.refreshActiveUI()
     }
@@ -4251,36 +4356,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         BufferWindowController.shared.show()
         BufferWindowController.shared.moveToCurrentScreen()
         reload()
-    }
-
-    @objc private func remoteToggled() {
-        RemoteConfig.enabled = remoteCheck.state == .on
-        if RemoteConfig.enabled {
-            RemoteTypingService.shared.restart()
-        } else {
-            RemoteTypingService.shared.stop()
-        }
-        IMELog.write("settings: remote typing enabled -> \(RemoteConfig.enabled)")
-        refreshRemoteStatus()
-    }
-
-    @objc private func applyRemoteName() {
-        let trimmed = remoteNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        RemoteConfig.deviceName = trimmed
-        if RemoteConfig.enabled { RemoteTypingService.shared.restart() }
-        IMELog.write("settings: remote device name -> \(trimmed)")
-        refreshRemoteStatus()
-    }
-
-    @objc private func pairRemoteDevice(_ sender: NSButton) {
-        guard remoteDiscoveredIDs.indices.contains(sender.tag) else { return }
-        RemoteTypingService.shared.requestPair(peerID: remoteDiscoveredIDs[sender.tag])
-    }
-
-    @objc private func unpairRemoteDevice(_ sender: NSButton) {
-        guard remoteTrustedKeys.indices.contains(sender.tag) else { return }
-        RemoteTypingService.shared.unpair(pubB64: remoteTrustedKeys[sender.tag])
     }
 
     @objc private func appearanceChosen() {

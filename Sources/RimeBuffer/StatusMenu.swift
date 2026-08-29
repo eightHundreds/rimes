@@ -47,7 +47,7 @@ final class StatusMenu {
         menu.addItem(settings)
 
         let inbox = NSMenuItem(
-            title: inboundTrayTitle,
+            title: mailboxTitle,
             action: #selector(RimeBufferController.openInboundTrayFromInputMenu(_:)),
             keyEquivalent: "")
         inbox.target = target
@@ -139,11 +139,14 @@ final class StatusMenu {
         return menu
     }
 
-    private var inboundTrayTitle: String {
-        let count = InboundBus.shared.pendingCount
-        return count > 0
-            ? "外部来源收件箱…（\(count) 项待审）"
-            : "外部来源收件箱…"
+    private var mailboxTitle: String {
+        let unreadCount = MailboxStore.shared.snapshot.unreadCount
+        let shortcut = RimeShortcutPreferences
+            .shortcut(for: .openMailbox)
+            .displayTitle
+        return unreadCount > 0
+            ? "Mailbox…（\(unreadCount) 条未读 · \(shortcut)）"
+            : "Mailbox…（\(shortcut)）"
     }
 
     func openSettings() {
@@ -168,7 +171,8 @@ final class StatusMenu {
     }
 
     func openInboundTray() {
-        InboundTrayWindow.shared.show()
+        let threadID = MailboxStore.shared.selectLatestUnreadOrMostRecent()
+        InboundTrayWindow.shared.show(selecting: threadID)
     }
 
     func checkUpdate() {

@@ -295,6 +295,10 @@ final class LocalGateway {
         private let marineChromeAvailable: () -> Bool
         private let onClose: (Connection) -> Void
         private var buffer = Data()
+        /// While an inbound mutation is running on the main thread, keep later
+        /// pipelined requests buffered. HTTP/1.1 responses must be emitted in
+        /// request order even though InboundBus is main-thread confined.
+        private var awaitingAsyncResponse = false
         // Stateless MCP has no server-side session. Keep only a connection-local,
         // unverified client name as a best-effort source label.
         private var mcpClientName = "MCP"
@@ -352,6 +356,12 @@ final class LocalGateway {
                     self.drain()
                 }
                 if isDone || err != nil { self.close(); return }
+                // An inbound mutation is waiting for its durable result on the
+                // main thread. Stop issuing reads so a pipelining client is
+                // back-pressured by TCP instead of growing this Data buffer
+                // without bound. jsonAfterMain resumes receive after sending
+                // the matching response and draining already-buffered bytes.
+                if self.awaitingAsyncResponse { return }
                 self.receive()
             }
         }
@@ -359,6 +369,7 @@ final class LocalGateway {
         private func drain() {
             dispatchPrecondition(condition: .onQueue(gatewayQueue))
             while true {
+                guard !awaitingAsyncResponse else { return }
                 guard isGatewayCurrent() else {
                     close()
                     return
@@ -377,6 +388,7 @@ final class LocalGateway {
                 }
                 buffer.removeSubrange(0..<consumed)
                 handle(req)
+                guard !awaitingAsyncResponse else { return }
                 if (req.headers["connection"] ?? "").lowercased() == "close" { return }
             }
         }
@@ -454,6 +466,38 @@ final class LocalGateway {
         private func json(_ obj: Any, status: String = "200 OK") {
             let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
             send(status, headers: ["Content-Type": "application/json"], body: data)
+        }
+
+        /// InboundBus and MailboxStore are main-thread confined. Defer the
+        /// response until that mutation returns, then resume parsing buffered
+        /// requests only after the matching response has been enqueued.
+        private func jsonAfterMain(
+            _ operation: @escaping () -> (object: Any, status: String)
+        ) {
+            dispatchPrecondition(condition: .onQueue(gatewayQueue))
+            precondition(!awaitingAsyncResponse)
+            awaitingAsyncResponse = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.isGatewayCurrent() else {
+                    self.gatewayQueue.async { [weak self] in self?.close() }
+                    return
+                }
+                let response = operation()
+                self.gatewayQueue.async { [weak self] in
+                    guard let self else { return }
+                    guard self.isGatewayCurrent() else {
+                        self.close()
+                        return
+                    }
+                    self.json(response.object, status: response.status)
+                    self.awaitingAsyncResponse = false
+                    self.drain()
+                    if !self.awaitingAsyncResponse {
+                        self.receive()
+                    }
+                }
+            }
         }
 
         private func marineChromeHeaders(origin: String) -> [String: String] {
@@ -944,13 +988,37 @@ final class LocalGateway {
                   let text = obj["text"] as? String else {
                 json(["error": "bad request"], status: "400 Bad Request"); return
             }
+            let format: AITextContentFormat
+            if let raw = obj["format"] {
+                guard let value = raw as? String,
+                      let parsed = AITextContentFormat(rawValue: value) else {
+                    json(["error": "format must be plain, markdown, or json"],
+                         status: "400 Bad Request")
+                    return
+                }
+                format = parsed
+            } else {
+                format = .plain
+            }
             let source = obj["source"] as? String ?? "http"
             let title = obj["title"] as? String
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isGatewayCurrent() else { return }
-                InboundBus.shared.submit(origin: .http(source: source), text: text, title: title)
+            jsonAfterMain {
+                let result = InboundBus.shared.submitDetailed(
+                    origin: .http(source: source),
+                    text: text,
+                    title: title,
+                    format: format
+                )
+                switch result {
+                case .pending:
+                    return (["accepted": true, "disposition": "mailbox"], "200 OK")
+                case .staged:
+                    return (["accepted": true, "disposition": "buffer"], "200 OK")
+                case .rejected(let reason):
+                    return (["accepted": false, "error": Self.rejectionMessage(reason)],
+                            Self.rejectionHTTPStatus(reason))
+                }
             }
-            json(["accepted": true])
         }
 
         // MCP Streamable HTTP, protocol rev 2025-06-18 (negotiates down to older
@@ -1020,43 +1088,152 @@ final class LocalGateway {
             func ok(_ text: String) {
                 json(["jsonrpc": "2.0", "id": id, "result": ["content": [["type": "text", "text": text]]]])
             }
+            func error(_ text: String) {
+                json(["jsonrpc": "2.0", "id": id, "result": [
+                    "content": [["type": "text", "text": text]],
+                    "isError": true,
+                ]])
+            }
             switch name {
             case "buffer_push":
                 let text = args["text"] as? String ?? ""
                 let title = args["title"] as? String ?? args["kind"] as? String
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.isGatewayCurrent() else { return }
-                    InboundBus.shared.submit(origin: .mcp(client: client), text: text, title: title)
+                let format: AITextContentFormat
+                if let raw = args["format"] {
+                    guard let value = raw as? String,
+                          let parsed = AITextContentFormat(rawValue: value) else {
+                        error("format must be plain, markdown, or json")
+                        return
+                    }
+                    format = parsed
+                } else {
+                    format = .plain
                 }
-                ok("queued \(text.count) chars into the buffer inbox")
+                jsonAfterMain {
+                    let result = InboundBus.shared.submitDetailed(
+                        origin: .mcp(client: client),
+                        text: text,
+                        title: title,
+                        format: format
+                    )
+                    let responseText: String
+                    let isError: Bool
+                    switch result {
+                    case .pending:
+                        responseText = "accepted \(text.count) chars into Mailbox for review"
+                        isError = false
+                    case .staged:
+                        responseText = "staged \(text.count) chars into Buffer"
+                        isError = false
+                    case .rejected(let reason):
+                        responseText = Self.rejectionMessage(reason)
+                        isError = true
+                    }
+                    return (["jsonrpc": "2.0", "id": id, "result": [
+                        "content": [["type": "text", "text": responseText]],
+                        "isError": isError,
+                    ]], "200 OK")
+                }
             case "buffer_stream_begin":
-                let sid = "st-" + UUID().uuidString.prefix(8)
+                let sid = "st-" + String(UUID().uuidString.prefix(8))
                 let title = args["title"] as? String
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.isGatewayCurrent() else { return }
-                    InboundBus.shared.beginStream(origin: .mcp(client: client), streamID: sid, title: title)
+                let format: AITextContentFormat
+                if let raw = args["format"] {
+                    guard let value = raw as? String,
+                          let parsed = AITextContentFormat(rawValue: value) else {
+                        error("format must be plain, markdown, or json")
+                        return
+                    }
+                    format = parsed
+                } else {
+                    format = .plain
                 }
-                json(["jsonrpc": "2.0", "id": id, "result": [
-                    "content": [["type": "text", "text": "stream \(sid) open"]],
-                    "structuredContent": ["stream_id": sid]]])
+                jsonAfterMain {
+                    let opened = InboundBus.shared.beginStream(
+                        origin: .mcp(client: client),
+                        streamID: sid,
+                        title: title,
+                        format: format
+                    ) != nil
+                    if opened {
+                        return (["jsonrpc": "2.0", "id": id, "result": [
+                            "content": [["type": "text", "text": "stream \(sid) open"]],
+                            "structuredContent": ["stream_id": sid],
+                            "isError": false,
+                        ]], "200 OK")
+                    }
+                    return (["jsonrpc": "2.0", "id": id, "result": [
+                        "content": [["type": "text", "text": "stream could not be opened"]],
+                        "isError": true,
+                    ]], "200 OK")
+                }
             case "buffer_stream_append":
-                if let sid = args["stream_id"] as? String, let delta = args["delta"] as? String {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.isGatewayCurrent() else { return }
-                        InboundBus.shared.appendStream(streamID: sid, delta: delta)
-                    }
+                guard let sid = args["stream_id"] as? String,
+                      let delta = args["delta"] as? String else {
+                    error("stream_id and delta are required")
+                    return
                 }
-                ok("appended")
+                jsonAfterMain {
+                    let result = InboundBus.shared.appendStream(streamID: sid, delta: delta)
+                    let text: String
+                    let isError: Bool
+                    switch result {
+                    case .appended:
+                        text = "appended"
+                        isError = false
+                    case .notFound:
+                        text = "stream was not found"
+                        isError = true
+                    case .tooLarge:
+                        text = "stream text is too large"
+                        isError = true
+                    }
+                    return (["jsonrpc": "2.0", "id": id, "result": [
+                        "content": [["type": "text", "text": text]],
+                        "isError": isError,
+                    ]], "200 OK")
+                }
             case "buffer_stream_end":
-                if let sid = args["stream_id"] as? String {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.isGatewayCurrent() else { return }
-                        InboundBus.shared.endStream(streamID: sid)
-                    }
+                guard let sid = args["stream_id"] as? String else {
+                    error("stream_id is required")
+                    return
                 }
-                ok("stream closed")
+                jsonAfterMain {
+                    let ended = InboundBus.shared.endStream(streamID: sid)
+                    let text = ended
+                        ? "stream committed to Mailbox for review"
+                        : "stream could not be committed to Mailbox"
+                    return (["jsonrpc": "2.0", "id": id, "result": [
+                        "content": [["type": "text", "text": text]],
+                        "isError": !ended,
+                    ]], "200 OK")
+                }
             default:
                 json(["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "unknown tool"]])
+            }
+        }
+
+        private static func rejectionMessage(
+            _ reason: InboundBus.SubmissionRejection
+        ) -> String {
+            switch reason {
+            case .empty: return "text is empty"
+            case .blocked: return "source is blocked"
+            case .full: return "Mailbox review queue is full"
+            case .tooLarge: return "text is too large"
+            case .persistenceUnavailable: return "Mailbox persistence is unavailable"
+            }
+        }
+
+        private static func rejectionHTTPStatus(
+            _ reason: InboundBus.SubmissionRejection
+        ) -> String {
+            switch reason {
+            case .empty: return "400 Bad Request"
+            case .blocked: return "403 Forbidden"
+            case .full: return "429 Too Many Requests"
+            case .tooLarge: return "413 Content Too Large"
+            case .persistenceUnavailable: return "503 Service Unavailable"
             }
         }
 
@@ -1074,13 +1251,17 @@ final class LocalGateway {
              "description": "把一段文字送进 \(ProductIdentity.displayName) 的缓冲区收件箱，等用户确认后上屏。不会自动上屏。",
              "inputSchema": ["type": "object",
                              "properties": ["text": ["type": "string", "description": "要送入的文字"],
-                                            "title": ["type": "string", "description": "可选来源标题"]],
+                                            "title": ["type": "string", "description": "可选来源标题"],
+                                            "format": ["type": "string", "enum": ["plain", "markdown", "json"], "description": "可选正文格式"]],
                              "required": ["text"]],
              "annotations": ["title": "送入缓冲区", "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]],
             ["name": "buffer_stream_begin",
              "title": "开始流式条目",
              "description": "开一个流式条目，返回 stream_id。",
-             "inputSchema": ["type": "object", "properties": ["title": ["type": "string"]]],
+             "inputSchema": ["type": "object", "properties": [
+                "title": ["type": "string"],
+                "format": ["type": "string", "enum": ["plain", "markdown", "json"]],
+             ]],
              "annotations": ["title": "开始流式条目", "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]],
             ["name": "buffer_stream_append",
              "title": "追加流式内容",

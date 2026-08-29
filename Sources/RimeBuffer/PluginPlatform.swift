@@ -412,7 +412,7 @@ final class PluginRegistry {
             legacyDisabledIDs: disabledInternalIDs
         )
         // A clean first run has no legacy preference. Catalog defaults are
-        // the sole authority: the three bundled Buffer presets start enabled, while
+        // the sole authority: the four bundled Buffer presets start enabled, while
         // optional presets remain absent and disabled until downloaded.
         if !hadLegacyEnablement, let presetInstallationStore {
             let managedIDs = Set(internalPlugins.keys).intersection(

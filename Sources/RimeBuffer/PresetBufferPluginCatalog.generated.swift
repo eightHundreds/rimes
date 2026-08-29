@@ -39,6 +39,18 @@ enum PresetBufferPluginCatalog {
             downloadAssetName: nil,
             sha256: nil
         ),
+        PresetBufferPluginCatalogEntry(
+            id: "builtin.capsule",
+            nameZH: "Capsule",
+            nameEN: "Capsule",
+            version: "0.3",
+            summaryZH: "本机 Markdown 管理 Prompt、Memory、Password 与 Skill；支持分类搜索、原地添加和弹窗验证上屏。",
+            summaryEN: "Manage Prompt, Memory, Password, and Skill entries as local Markdown with type-filtered search, inline creation, and prompted protected insertion.",
+            defaultInstalled: true,
+            defaultEnabled: true,
+            downloadAssetName: nil,
+            sha256: nil
+        ),
     ]
 
     static func entry(id: String) -> PresetBufferPluginCatalogEntry? {

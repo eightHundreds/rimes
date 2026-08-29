@@ -50,6 +50,7 @@ func runPluginPlatformSmokeTest() -> Bool {
         BuiltInPluginID.appleTranslation,
         BuiltInPluginID.streamInput,
         BuiltInPluginID.aiText,
+        BuiltInPluginID.capsule,
     ]) else {
         return fail("shipped buffer plugin registry")
     }

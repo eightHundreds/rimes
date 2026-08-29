@@ -164,6 +164,9 @@ enum TranslationLanguageIdentity {
 enum TranslationSourcePolicy {
     static func accepts(_ blocks: [BufferModel.Block]) -> Bool {
         blocks.allSatisfy { block in
+            if block.locallyReviewedAsPlainText {
+                return block.pluginMetadata == nil
+            }
             if let metadata = block.pluginMetadata {
                 return metadata.reviewedAsPlainText
             }
