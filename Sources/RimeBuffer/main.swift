@@ -6809,13 +6809,13 @@ func runBufferWindowSmokeTest() -> Bool {
         phase: .ready
     )
     guard BufferWorkbenchLayout.mainBar
-            == [.bufferRail, .copyResult, .send],
+            == [.bufferRail, .send],
           BufferWorkbenchLayout.toolbar
             == [.status, .pluginActions, .exchangeEdit, .close],
           BufferWorkbenchLayout.hoverControls
             == [.copyResult, .send, .pluginActions, .exchangeEdit, .close],
           BufferWorkbenchLayout.passiveControls == [.bufferRail, .status],
-          !BufferWorkbenchLayout.toolbarInitiallyExpanded,
+          BufferWorkbenchLayout.toolbarInitiallyExpanded,
           BufferWorkbenchLayout.toolbarEmptySpaceDraggable,
           BufferWorkbenchToolbarDragRules.disposition(
             hitIsInteractiveControl: false
@@ -6825,6 +6825,7 @@ func runBufferWindowSmokeTest() -> Bool {
           ) == .interactWithControl,
           runBufferWorkbenchToolbarHitTestProbe(),
           runBufferInlineToolbarToggleInteractionProbe(),
+          runBufferInlineGeneratedResultCopyPlacementProbe(),
           BufferWorkbenchPointerRules.state(
             enabled: true, hovered: false, pressed: false
           ) == .idle,
@@ -9790,7 +9791,7 @@ func runBufferWindowSmokeTest() -> Bool {
     )
     guard primary.contains(restored),
           restored.width >= BufferWindowGeometry.standardMinimumWidth,
-          restored.height == BufferWindowGeometry.collapsedHeight else {
+          restored.height == BufferWindowGeometry.expandedHeight else {
         print("FAILED: offscreen frame was not restored to fallback screen", restored)
         return false
     }
@@ -9871,29 +9872,29 @@ func runBufferWindowSmokeTest() -> Bool {
         NSRect(x: 10.24, y: 20.26, width: 680.24, height: 44),
         scale: 2
     )
-    guard migrated.height == BufferWindowGeometry.collapsedHeight,
+    guard migrated.height == BufferWindowGeometry.expandedHeight,
           migrated.maxY == legacyWorkbench.maxY,
           migratedOldCompact.minY == oldCompact.minY,
-          migratedOldCompact.height == BufferWindowGeometry.collapsedHeight,
+          migratedOldCompact.height == BufferWindowGeometry.expandedHeight,
           legacyCollapsed.height == BufferWindowGeometry.collapsedHeight,
           legacyCollapsed.minY == migratedOldCompact.minY,
-          translationExpanded.height == BufferWindowGeometry.translationCollapsedHeight,
+          translationExpanded.height == BufferWindowGeometry.translationExpandedHeight,
           translationExpanded.minY == migratedOldCompact.minY,
-          compactDerivedExpanded.height == BufferWindowGeometry.collapsedHeight,
+          compactDerivedExpanded.height == BufferWindowGeometry.expandedHeight,
           compactDerivedExpanded.minY == translationExpanded.minY,
           streamCandidatesTwoExpanded.height
-            == BufferWindowGeometry.translationCollapsedHeight,
+            == BufferWindowGeometry.translationExpandedHeight,
           streamCandidatesTwoExpanded.minY == translationExpanded.minY,
           streamCandidatesExpanded.height
-            == BufferWindowGeometry.translationCollapsedHeight,
+            == BufferWindowGeometry.translationExpandedHeight,
           streamCandidatesExpanded.minY == streamCandidatesTwoExpanded.minY,
-          standardAfterTranslation.height == BufferWindowGeometry.collapsedHeight,
+          standardAfterTranslation.height == BufferWindowGeometry.expandedHeight,
           standardAfterTranslation.minY == translationExpanded.minY,
           BufferWindowGeometry.height(expanded: false) == 44,
           BufferWindowGeometry.height(expanded: false, mode: .translation) == 78,
           BufferWindowGeometry.height(expanded: true) == 78,
           BufferWindowGeometry.height(expanded: true, mode: .translation) == 112,
-          floatingCandidateInvariant.height == 78,
+          floatingCandidateInvariant.height == 112,
           floatingCandidateInvariant.minY == migratedOldCompact.minY,
           canonicalFrame.height == BufferWindowGeometry.collapsedHeight,
           clampedCandidate.x + candidateSize.width <= primary.maxX - 6,
@@ -9911,7 +9912,7 @@ func runBufferWindowSmokeTest() -> Bool {
         fallback: primary
     )
     guard fitted.width <= secondary.width,
-          fitted.height == BufferWindowGeometry.collapsedHeight,
+          fitted.height == BufferWindowGeometry.expandedHeight,
           secondary.contains(fitted) else {
         print("FAILED: oversized frame was not clamped to its screen", fitted)
         return false
@@ -10014,15 +10015,15 @@ func runBufferWindowSmokeTest() -> Bool {
           abs(transition.standardAfter.width
               - transition.standardBefore.width) <= transitionEpsilon,
           toolbarTransition.renderedAllFrames,
-          toolbarTransition.toolbarHiddenInitially,
+          !toolbarTransition.toolbarHiddenInitially,
           toolbarTransition.toolbarVisibleWhenExpanded,
-          toolbarTransition.toolbarHiddenAfterCollapse,
+          !toolbarTransition.toolbarHiddenAfterCollapse,
           abs(toolbarTransition.collapsed.height
-              - BufferWindowGeometry.collapsedHeight) <= transitionEpsilon,
+              - BufferWindowGeometry.expandedHeight) <= transitionEpsilon,
           abs(toolbarTransition.expanded.height
               - BufferWindowGeometry.expandedHeight) <= transitionEpsilon,
           abs(toolbarTransition.collapsedAgain.height
-              - BufferWindowGeometry.collapsedHeight) <= transitionEpsilon,
+              - BufferWindowGeometry.expandedHeight) <= transitionEpsilon,
           abs(toolbarTransition.collapsed.minY
               - toolbarTransition.expanded.minY) <= transitionEpsilon,
           abs(toolbarTransition.collapsedAgain.minY

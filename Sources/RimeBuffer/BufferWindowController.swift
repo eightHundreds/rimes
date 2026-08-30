@@ -677,7 +677,7 @@ enum BufferWorkbenchShelfLayout {
 /// Shared by the live stack construction and the pure layout smoke test.
 enum BufferWorkbenchLayout {
     static let mainBar: [BufferWorkbenchControl] = [
-        .bufferRail, .copyResult, .send,
+        .bufferRail, .send,
     ]
     static let toolbar: [BufferWorkbenchControl] = [
         .status, .pluginActions, .exchangeEdit, .close,
@@ -686,7 +686,7 @@ enum BufferWorkbenchLayout {
         .copyResult, .send, .pluginActions, .exchangeEdit, .close,
     ]
     static let passiveControls: Set<BufferWorkbenchControl> = [.bufferRail, .status]
-    static let toolbarInitiallyExpanded = false
+    static let toolbarInitiallyExpanded = true
     static let toolbarEmptySpaceDraggable = true
     static let windowBackgroundDraggable = false
 }
@@ -1297,10 +1297,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private let exchangeEditButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let closeButton = FirstMouseButton(title: "", target: nil, action: nil)
     private lazy var exchangeEditSlot = BufferToolbarControlSlot(control: exchangeEditButton)
-    private lazy var copyResultSlot = BufferMainControlSlot(
-        control: copyResultButton,
-        row: .target
-    )
     private lazy var sendSlot = BufferMainControlSlot(control: sendButton, row: .target)
     private var hiddenForSession = false
     private var sessionInactive = false
@@ -1511,9 +1507,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         bufferRail.onCaptureRequested = { [weak self] insertionIndex in
             self?.activateLogicalInput(at: insertionIndex)
         }
-        bufferRail.onToolbarToggleRequested = { [weak self] in
-            self?.toggleToolbar()
-        }
+        bufferRail.generatedResultCopyControl = copyResultButton
         buildWindow()
         restoreFrame()
         installObservers()
@@ -1836,14 +1830,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                 snapshot: translationSnapshot,
                 style: previewStyle
             ))
+            let showsCopy = translationSnapshot.phase == .ready
+                && !translationSnapshot.outputBlocks.isEmpty
+            copyResultButton.isHidden = !showsCopy
+            copyResultButton.isEnabled = showsCopy
             _ = bufferRail.renderTranslationForPreview(
                 translationSnapshot,
                 presentationStyle: previewStyle
             )
-            let showsCopy = translationSnapshot.phase == .ready
-                && !translationSnapshot.outputBlocks.isEmpty
-            copyResultSlot.setControlVisible(showsCopy)
-            copyResultButton.isEnabled = showsCopy
             applyAppearance()
         } else {
             refresh()
@@ -1875,11 +1869,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         let standardMode = BufferWorkbenchLayoutMode.standard
         let derivedMode = BufferWorkbenchLayoutMode.translation
         let expectedStandardHeight = BufferWindowGeometry.height(
-            expanded: false,
+            expanded: true,
             mode: standardMode
         )
         let expectedDerivedHeight = BufferWindowGeometry.height(
-            expanded: false,
+            expanded: true,
             mode: derivedMode
         )
 
@@ -1961,9 +1955,9 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         )
     }
 
-    /// Exercises the leading-icon presentation state against the real AppKit
-    /// stack. The toolbar is never persisted: the second transition returns to
-    /// the exact compact frame and hidden arranged-subview state.
+    /// Exercises the permanent toolbar against the real AppKit stack. Collapse
+    /// requests are ignored, so every sampled frame stays at the expanded
+    /// height with the shelf visible.
     func exerciseToolbarToggleForSmoke(
         collapsedPath: String? = nil,
         expandedPath: String? = nil,
@@ -2168,6 +2162,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             syncLayoutMode(nextLayoutMode)
             panel.contentView?.layoutSubtreeIfNeeded()
         }
+        refreshGeneratedResultCopy(contentProtected: contentProtected)
         _ = bufferRail.refresh(
             preedit: inlineComposition?.text ?? "",
             preeditCursorPosUTF8: inlineComposition?.cursorPosUTF8 ?? 0,
@@ -2246,7 +2241,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             contentProtected: contentProtected
         )
         refreshPluginActions()
-        refreshGeneratedResultCopy(contentProtected: contentProtected)
         refreshInputOptionsControl(contentProtected: contentProtected)
         applyAppearance()
         if inlineComposition != nil {
@@ -2287,7 +2281,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private func refreshGeneratedResultCopy(contentProtected: Bool) {
         let available = !contentProtected
             && BufferGeneratedResultCopyRules.freeze(protected: false) != nil
-        copyResultSlot.setControlVisible(available)
+        copyResultButton.isHidden = !available
         copyResultButton.isEnabled = available
         copyResultButton.toolTip = available
             ? "复制当前生成结果并关闭 Buffer（⌘C）"
@@ -2441,7 +2435,15 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             "复制当前生成结果并关闭 Buffer（⌘C）",
             #selector(copyResultTapped)
         )
-        copyResultSlot.setControlVisible(false)
+        copyResultButton.isHidden = true
+        NSLayoutConstraint.activate([
+            copyResultButton.widthAnchor.constraint(
+                equalToConstant: BufferWorkbenchMetrics.primaryControlWidth
+            ),
+            copyResultButton.heightAnchor.constraint(
+                equalToConstant: BufferWorkbenchMetrics.primaryControlHeight
+            ),
+        ])
         configurePrimaryButton(
             sendButton,
             "paperplane.fill",
@@ -2782,7 +2784,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private func view(for control: BufferWorkbenchControl) -> NSView {
         switch control {
         case .bufferRail: return bufferRail
-        case .copyResult: return copyResultSlot
+        case .copyResult: return copyResultButton
         case .send: return sendSlot
         case .status: return statusLabel
         case .pluginActions: return pluginActionsControl
@@ -3332,15 +3334,16 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func setToolbarExpanded(_ expanded: Bool, resize: Bool) {
-        let presentationChanged = toolbarExpanded != expanded
-            || utilityShelf.isHidden == expanded
-            || shelfDivider.isHidden == expanded
+        _ = expanded
+        let presentationChanged = !toolbarExpanded
+            || utilityShelf.isHidden
+            || shelfDivider.isHidden
         guard presentationChanged else { return }
 
-        toolbarExpanded = expanded
-        utilityShelf.isHidden = !expanded
-        shelfDivider.isHidden = !expanded
-        bufferRail.setToolbarExpanded(expanded)
+        toolbarExpanded = true
+        utilityShelf.isHidden = false
+        shelfDivider.isHidden = false
+        bufferRail.setToolbarExpanded(true)
         panel.contentView?.layoutSubtreeIfNeeded()
 
         if resize {
@@ -3432,7 +3435,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateMainControlAlignment(for mode: BufferWorkbenchLayoutMode) {
-        copyResultSlot.update(for: mode)
         sendSlot.update(for: mode)
     }
 
@@ -4154,14 +4156,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func toggleToolbar() {
-        guard isVisible,
-              !sessionProtectionActive,
-              !hiddenForSession,
-              !IsSecureEventInputEnabled() else {
-            return
-        }
-        setToolbarExpanded(!toolbarExpanded, resize: true)
-        refresh()
+        setToolbarExpanded(true, resize: true)
     }
 
     @objc private func copyResultTapped() {

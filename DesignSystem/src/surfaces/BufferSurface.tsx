@@ -340,6 +340,15 @@ function BufferTrack({
       className={`buffer-track buffer-track--${kind}${protectedContent ? " is-protected" : ""}`}
     >
       {leadingControl}
+      {kind === "target" && targetCount > 0 && onCopy ? (
+        <IconButton
+          className="buffer-track__copy"
+          disabled={copyDisabled || interactionDisabled}
+          icon="copy"
+          label="复制当前结果并关闭 Buffer"
+          onClick={onCopy}
+        />
+      ) : null}
 
       <div className="buffer-track__content">
         {protectedContent ? (
@@ -410,15 +419,6 @@ function BufferTrack({
           {status}
         </span>
       ) : null}
-      {kind === "target" && targetCount > 0 && onCopy ? (
-        <IconButton
-          className="buffer-track__copy"
-          disabled={copyDisabled || interactionDisabled}
-          icon="copy"
-          label="复制当前结果并关闭 Buffer"
-          onClick={onCopy}
-        />
-      ) : null}
     </div>
   );
 }
@@ -427,8 +427,6 @@ function BufferInputControl({
   mode,
   descriptor,
   availableModes,
-  disabled,
-  expanded,
   configurationDisabled,
   protectedContent,
   sourceLanguage,
@@ -455,13 +453,10 @@ function BufferInputControl({
   onRetry,
   onOpenSettings,
   onClose,
-  onToggle,
 }: {
   mode: BufferMode;
   descriptor: ModeDescriptor;
   availableModes: readonly BufferMode[];
-  disabled: boolean;
-  expanded: boolean;
   configurationDisabled: boolean;
   protectedContent: boolean;
   sourceLanguage: string;
@@ -488,36 +483,24 @@ function BufferInputControl({
   onRetry: () => void;
   onOpenSettings?: () => void;
   onClose?: () => void;
-  onToggle: () => void;
 }) {
   return (
     <div className="buffer-input-control">
-      <button
-        aria-controls="buffer-toolbar"
-        aria-expanded={expanded}
-        aria-label={expanded ? "收起 Buffer 工具栏" : "展开 Buffer 工具栏"}
-        className={`buffer-input-control__trigger${expanded ? " is-open" : ""}`}
-        disabled={disabled}
-        onClick={onToggle}
-        title={`${descriptor.label} · 点击${expanded ? "收起" : "展开"}工具栏`}
-        type="button"
+      <span
+        aria-hidden="true"
+        className="buffer-input-control__trigger"
+        title={descriptor.label}
       >
         <Icon name={protectedContent ? "lock" : descriptor.icon} size={14} weight="bold" />
-      </button>
+      </span>
 
-      {expanded ? (
-        <section
-          aria-label="Buffer 工具栏"
-          className="buffer-toolbar"
-          data-native-window-drag-region="true"
-          id="buffer-toolbar"
-          onKeyDown={(event) => {
-            if (event.key !== "Escape") return;
-            event.preventDefault();
-            onToggle();
-          }}
-          role="toolbar"
-        >
+      <section
+        aria-label="Buffer 工具栏"
+        className="buffer-toolbar"
+        data-native-window-drag-region="true"
+        id="buffer-toolbar"
+        role="toolbar"
+      >
           <header className="buffer-plugin-popover__header">
             <span>
               <strong>工作插件</strong>
@@ -685,7 +668,6 @@ function BufferInputControl({
             ) : null}
           </footer>
         </section>
-      ) : null}
     </div>
   );
 }
@@ -776,7 +758,6 @@ export function BufferSurface({
   const [deliveryTone, setDeliveryTone] = useState<BufferPhase>("ready");
   const [sending, setSending] = useState(false);
   const [copying, setCopying] = useState(false);
-  const [toolbarExpanded, setToolbarExpanded] = useState(false);
   const [targetsAreCurrent, setTargetsAreCurrent] = useState(
     () => (controlledTargets ?? defaultTargets ?? []).length > 0,
   );
@@ -826,10 +807,6 @@ export function BufferSurface({
   useEffect(() => {
     setStreamLatency(requestedStreamLatency);
   }, [requestedStreamLatency]);
-
-  useEffect(() => {
-    if (paused || phase === "protected") setToolbarExpanded(false);
-  }, [paused, phase]);
 
   const availableModes = useMemo<readonly BufferMode[]>(() => {
     if (availablePluginIDs === undefined) return MODE_ORDER;
@@ -1684,17 +1661,10 @@ export function BufferSurface({
       canReturnToSource={canReturnToSource}
       configurationDisabled={paused || protectedContent || loading || sending || copying}
       descriptor={descriptor}
-      disabled={protectedContent}
-      expanded={toolbarExpanded}
       languageOptions={languageOptions}
       mode={effectiveMode}
       onAIConnectorChange={changeAIConnector}
-      onClose={onClose
-        ? () => {
-          setToolbarExpanded(false);
-          onClose();
-        }
-        : undefined}
+      onClose={onClose}
       onModeChange={changeMode}
       onOpenSettings={activePluginID && onOpenPluginSettings
         ? () => onOpenPluginSettings(activePluginID)
@@ -1708,7 +1678,6 @@ export function BufferSurface({
       onTargetLanguageChange={changeTargetLanguage}
       onTranslationContinuouslyChange={changeTranslationContinuously}
       onTranslationProviderChange={changeTranslationProvider}
-      onToggle={() => setToolbarExpanded((expanded) => !expanded)}
       protectedContent={protectedContent}
       sourceLanguage={sourceLanguage}
       streamCandidateCount={streamCandidateCount}
@@ -1723,8 +1692,8 @@ export function BufferSurface({
   return (
     <section
       aria-label="缓冲工作台"
-      className={`buffer-surface buffer-surface--${effectiveMode}${toolbarExpanded ? " is-toolbar-expanded" : ""}${className ? ` ${className}` : ""}`}
-      data-base-height={(showLiveTargetRail ? 78 : 44) + (toolbarExpanded ? 34 : 0)}
+      className={`buffer-surface buffer-surface--${effectiveMode} is-toolbar-expanded${className ? ` ${className}` : ""}`}
+      data-base-height={showLiveTargetRail ? 112 : 78}
       data-layout={layout}
       data-mode={effectiveMode}
       data-phase={phase}

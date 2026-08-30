@@ -1,10 +1,10 @@
 # RIMES · 系统架构
 
-> **2026-08-30 Buffer UI、结果复制与主题最新覆盖（当前最高优先级）**：Buffer 初始为单行紧凑原生工作台。普通/source-only/target-only 折叠为 44pt，实时 source+target 折叠为 78pt；点击正文唯一的前置输入/插件图标可展开或收起恢复的 33pt 顶部工具栏及 1pt divider，对应展开高度为 78/112pt。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭；空白 chrome、状态、间距和弹性留白是拖窗区，控件保持首击交互。右侧专用 24pt 拖拽条不存在。展开态只在当前进程/会话生效，不写偏好，并在隐藏或 secure/session protection 时重置折叠。alternative 数量与独立候选浮窗均不增高；target rail 不显示角色图标。完整且新鲜的非 `BufferModel` 生成结果提供复制按钮，纯 `Command+C` 与点击按钮等价：冻结并在写入前重新验证同一 source/workspace/generation/有序 block IDs 与文本，将 block 文本按顺序无分隔写入系统剪贴板，再走安全关闭/暂停生命周期。复制不经过 `prepare`、`consume`、`BufferDeliveryCoordinator` 或 `Delivery.insert`，不提交、修改或消费 source；普通 Buffer 原文、空/未完成、protected 或 stale/drifted 结果 fail closed/按既有规则透传。墨竹、翡翠、静谧归为 **Classic** 家族的三种配色；**Rasta** 是独立完整的红黄绿语义主题。本文后续 toolbarless、非持久弹层、专用右侧拖动区、常显工具栏、旧高度、target 角色图标、旧主题分类或把复制写成 Delivery 的表述均属历史，由本条覆盖。
+> **2026-08-31 Buffer UI、结果复制与主题最新覆盖（当前最高优先级）**：Buffer 始终显示 33pt 顶部工具栏及 1pt divider，不可折叠、不可由前置图标关闭。普通/source-only/target-only 为 78pt，实时 source+target 为 112pt。前置输入/插件图标只标识当前插件，不再切换工具栏。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭；空白 chrome、状态、间距和弹性留白是拖窗区，控件保持首击交互。右侧专用 24pt 拖拽条不存在。工具栏常显不写偏好，隐藏或 secure/session protection 也不收起工具栏。alternative 数量与独立候选浮窗均不增高；target rail 不显示角色图标。完整且新鲜的非 `BufferModel` 生成结果在回传框左侧、结果文字之前显示复制按钮，纯 `Command+C` 与点击按钮等价：冻结并在写入前重新验证同一 source/workspace/generation/有序 block IDs 与文本，将 block 文本按顺序无分隔写入系统剪贴板，再走安全关闭/暂停生命周期。复制不经过 `prepare`、`consume`、`BufferDeliveryCoordinator` 或 `Delivery.insert`，不提交、修改或消费 source；普通 Buffer 原文、空/未完成、protected 或 stale/drifted 结果 fail closed/按既有规则透传。墨竹、翡翠、静谧归为 **Classic** 家族的三种配色；**Rasta** 是独立完整的红黄绿语义主题。本文后续可折叠工具栏、前置图标切换、44/78 折叠高度、回传框右侧复制、toolbarless、专用右侧拖动区、target 角色图标、旧主题分类或把复制写成 Delivery 的表述均属历史，由本条覆盖。
 
-> **2026-08-30 Buffer 点击、指针与拖动补充**：前置输入/插件图标在祖先 rail 手势识别前被排除，点击只切换顶部工具栏；enabled 的按钮、弹出控件与可选 chip 在 nonactivating panel 内主动显示 pointing-hand。只有展开工具栏的空白 chrome、状态、间距和弹性留白使用 open/closed-hand 并执行拖窗；正文轨、窗口背景、插件/配置控件、复制、发送和关闭命中区都不参与拖动。
+> **2026-08-31 Buffer 点击、指针与拖动补充**：前置输入/插件图标在祖先 rail 手势识别前被排除，点击不再切换工具栏；enabled 的按钮、弹出控件与可选 chip 在 nonactivating panel 内主动显示 pointing-hand。只有常显工具栏的空白 chrome、状态、间距和弹性留白使用 open/closed-hand 并执行拖窗；正文轨、窗口背景、插件/配置控件、复制、发送和关闭命中区都不参与拖动。
 
-版本：2026-08-30 · 权威全局架构文档
+版本：2026-08-31 · 权威全局架构文档
 关系：本文档描述**整个系统**（既有输入核心 + 缓冲工作台）。`WORKBENCH-DESIGN.md` 是工作台的产品方案与决策记录；`ARCHITECTURE.md` 是 P1 时代的交接文档（已滞后，仅存档）。三者冲突时以本文档为准。
 
 代码规模：约 31000 行（Swift + 一层 C++ librime 桥）。单进程、后台 agent（`LSUIElement`）。
@@ -13,11 +13,11 @@
 
 ## 0.0 当前状态覆盖（2026-08-26）
 
-本节是当前实现的权威摘要；页首 2026-08-30 最新覆盖优先于本节。后文保留的 Marine Chrome、My Prompt、Remarkable、toolbarless/弹层/专用右侧拖动条、永久展开工具栏、旧几何、target 角色图标、常驻刷新按钮以及“开启 Buffer 即持续接管所有焦点”的描述是历史实现。
+本节是当前实现的权威摘要；页首 2026-08-31 最新覆盖优先于本节。后文保留的 Marine Chrome、My Prompt、Remarkable、toolbarless/弹层/专用右侧拖动条、可折叠工具栏、44/78 折叠高度、回传框右侧复制、旧几何、target 角色图标、常驻刷新按钮以及“开启 Buffer 即持续接管所有焦点”的描述是历史实现。
 
 - **三种状态分离**：工作台是否可见、是否仍有未投递内容、输入事件当前走“直输”还是“缓冲”分别存储和转换。显示工作台不会隐式开始捕获，切回直输也不会删除 Buffer 内容。
 - **逻辑输入面与焦点绑定**：Buffer 正文是 nonactivating `NSPanel` 内的块级逻辑输入面，不建立会夺走宿主 first responder 的原生文本编辑器。缓冲路由必须绑定当前精确、可信、非 secure 的外部 `FocusToken`；焦点切换后默认回到直输，旧 token 的 Return、方向键、删除键和普通字符都不能影响新输入框。用户重新点击逻辑输入面时，才对当前 token 开启捕获并设置块间插入位置；再次点击外部应用时，即使仍是同一个输入框，也会先结算 Buffer 组字再自动回到直输，不需要额外的 switcher。
-- **折叠正文与可切换工具栏**：Buffer 初始只显示紧凑正文；唯一前置输入/插件图标切换 33pt 工具栏与 1pt divider。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭。其空白 chrome/status/spacing/spacer 可拖窗，所有控件仍可首击；正文与窗口背景不可拖，右侧 24pt 专用拖动条已删除。工具栏状态仅进程内存在，隐藏或保护时折叠。任务 generation 作废、配置变更重启、上下文重验等内部生命周期刷新仍由状态机触发。target rail 不显示角色图标。
+- **常显工具栏与回传框左侧复制**：Buffer 始终显示 33pt 工具栏与 1pt divider；前置输入/插件图标不再切换工具栏。普通/source-only/target-only 为 78pt，live source+target 为 112pt。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭。其空白 chrome/status/spacing/spacer 可拖窗，所有控件仍可首击；正文与窗口背景不可拖，右侧 24pt 专用拖动条已删除。工具栏常显不写偏好，隐藏或保护时也不收起。完整新鲜的生成结果在回传框左侧、结果文字之前显示复制按钮。任务 generation 作废、配置变更重启、上下文重验等内部生命周期刷新仍由状态机触发。target rail 不显示角色图标。
 - **按内容决定轨道**：派生插件在输入为空且没有真实结果或显式状态时只显示一条轨道；存在实际 source/result/status 时，才扩成双轨或把 source 轨交换为 result 轨。占位文本本身不能制造空白第二行。
 - **最后一块投递后的可选收尾**：设置“最后一块上屏后关闭工作台”默认开启并覆盖 `Default` 与所有 Buffer 插件。只有精确的最后一个待投递 block 经 `Delivery.insert` 成功、对应 source 已原子消费、期间没有新内容或 generation 漂移、同一 owner/工作台会话仍有效且原目标仍存活时，才执行 close-and-pause。设置关闭、部分成功、失败、迟到 generation、新内容、目标/token 丢失或会话切换都保持打开。
 - **Clipboard History 是同级独立窗口与持久化子系统**：`⌘⇧P` 打开屏幕底部的 nonactivating 窗口，不显示或改变 Buffer。收录开启且 secure input、锁屏、睡眠、会话失活均不存在时，同一 RIMES 进程在后台读取 pasteboard，将文本、链接、图片、文件、颜色与未知类型的原始 representation 持久写入 `~/Library/Application Support/RIMES/clipboard/clipboard.sqlite`；保护期间不读，恢复只更新 `changeCount` baseline，不补抓。原始负载惰性读取，不写正文日志或仓库；拒绝 confidential/transient 标记。横向卡片支持全库元数据与图片类别别名搜索、左右选择、Return / `⌘1`–`⌘9` 直接激活、`⌘C` 复制原始内容、Delete 持久删除；图片记录和可解码的图片文件异步加载有界缩略图，卡片显示真实来源 App 图标。完整文本走 exact-token 插入；图片/RTF/HTML/文件等先无损恢复 pasteboard，再以带内部标签、定向精确宿主 PID 的 `Command+V` 完成粘贴。该事件桥只在显式激活时按需请求 Post Event 权限，并在 token/client/PID 前后失配时 fail closed；标签事件绕过 RIMES 自身 Buffer 粘贴路由但不改变普通用户快捷键。Paste 导入是只读、幂等、可审计的本地迁移路径；历史、原始负载与预览仅在本机，不进仓库、不做云端或跨设备同步。

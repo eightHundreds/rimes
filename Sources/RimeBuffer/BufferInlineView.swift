@@ -660,6 +660,7 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
     var onDerivedTargetStep: ((Int) -> Void)?
     var onCaptureRequested: ((Int) -> Void)?
     var onToolbarToggleRequested: (() -> Void)?
+    var generatedResultCopyControl: NSView?
 
     static let standardPreferredHeight: CGFloat = 34
     static let translationPreferredHeight: CGFloat = 68
@@ -953,13 +954,10 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
             y: view.bounds.midY
         )
         var requestedToggleCount = 0
-        var toolbarExpanded = false
         view.onToolbarToggleRequested = {
             requestedToggleCount += 1
-            toolbarExpanded.toggle()
         }
         view.inputOptionsButton.performClick(nil)
-        let expandedAfterFirstClick = toolbarExpanded
         view.inputOptionsButton.performClick(nil)
         let containsButton = view.inputOptionsContains(pointInSelf: buttonPoint)
         let excludesButton = !view.shouldAttemptLogicalRailClick(at: buttonPoint)
@@ -967,9 +965,7 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
         let standardPassed = containsButton
             && excludesButton
             && acceptsRail
-            && expandedAfterFirstClick
-            && !toolbarExpanded
-            && requestedToggleCount == 2
+            && requestedToggleCount == 0
 
         let outputID = UUID()
         _ = view.renderTranslationForPreview(
@@ -1015,7 +1011,7 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
         let passed = standardPassed && sourceChipAccepted && targetChipExcluded
         if !passed {
             print(
-                "FAILED: buffer toolbar-toggle interaction probe",
+                "FAILED: buffer input-icon interaction probe",
                 "buttonRect=\(buttonRect)",
                 "contains=\(containsButton)",
                 "excluded=\(excludesButton)",
@@ -1023,6 +1019,58 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
                 "toggles=\(requestedToggleCount)",
                 "source=\(sourceChipAccepted)",
                 "target=\(targetChipExcluded)"
+            )
+        }
+        return passed
+    }
+
+    static func runGeneratedResultCopyPlacementProbe() -> Bool {
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 80))
+        let view = BufferInlineView(
+            frame: NSRect(x: 8, y: 8, width: 504, height: 64)
+        )
+        host.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 8),
+            view.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -8),
+            view.topAnchor.constraint(equalTo: host.topAnchor, constant: 8),
+            view.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -8),
+        ])
+        let copy = FirstMouseButton(title: "", target: nil, action: nil)
+        copy.isHidden = false
+        view.generatedResultCopyControl = copy
+        host.layoutSubtreeIfNeeded()
+        _ = view.renderTranslationForPreview(
+            TranslationRailSnapshot(
+                sourceText: "原文",
+                outputBlocks: [
+                    TranslationOutputBlock(id: UUID(), text: "translated result"),
+                ],
+                phase: .ready
+            )
+        )
+        host.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        guard let rail = view.translationTargetRails.values.first else {
+            print("FAILED: generated-result copy placement missing target rail")
+            return false
+        }
+        let arranged = rail.row.arrangedSubviews
+        guard let copyIndex = arranged.firstIndex(where: { $0 === copy }) else {
+            print("FAILED: generated-result copy missing from target rail", arranged)
+            return false
+        }
+        let chipIndex = arranged.firstIndex { $0 is TranslationRailChipView }
+        let leading = copyIndex == 0
+            || (arranged.first === view.inputOptionsButton && copyIndex == 1)
+        let beforeText = chipIndex.map { copyIndex < $0 } ?? true
+        let passed = leading && beforeText && !copy.isHidden
+        if !passed {
+            print(
+                "FAILED: generated-result copy must lead the return rail",
+                "copyIndex=\(copyIndex)",
+                "chipIndex=\(String(describing: chipIndex))",
+                "arranged=\(arranged)"
             )
         }
         return passed
@@ -1049,11 +1097,11 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
         configureIconButton(
             inputOptionsButton,
             symbolName: "keyboard",
-            toolTip: "展开 Buffer 工具栏"
+            toolTip: BufferPluginMenuCatalog.defaultTitle
         )
-        inputOptionsButton.target = self
-        inputOptionsButton.action = #selector(toolbarToggleTapped)
-        inputOptionsButton.setAccessibilityLabel("展开 Buffer 工具栏")
+        inputOptionsButton.target = nil
+        inputOptionsButton.action = nil
+        inputOptionsButton.setAccessibilityLabel(BufferPluginMenuCatalog.defaultTitle)
 
         emptyLabel.font = .systemFont(ofSize: 12)
         emptyLabel.lineBreakMode = .byTruncatingTail
@@ -1150,25 +1198,16 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
             weight: .semibold
         )
         inputOptionsButton.image?.isTemplate = true
-        updateToolbarToggleDescription()
+        inputOptionsButton.toolTip = inputOptionsTitle
+        inputOptionsButton.setAccessibilityLabel(inputOptionsTitle)
         inputOptionsButton.isEnabled = enabled
         inputOptionsButton.refreshInteractionAppearance()
     }
 
     func setToolbarExpanded(_ expanded: Bool) {
         toolbarExpanded = expanded
-        updateToolbarToggleDescription()
-    }
-
-    private func updateToolbarToggleDescription() {
-        let verb = toolbarExpanded ? "收起" : "展开"
-        inputOptionsButton.toolTip = "\(inputOptionsTitle) · 点击\(verb)工具栏"
-        inputOptionsButton.setAccessibilityLabel("\(inputOptionsTitle) · \(verb)工具栏")
-    }
-
-    @objc private func toolbarToggleTapped() {
-        guard !contentShielded, inputOptionsButton.isEnabled else { return }
-        onToolbarToggleRequested?()
+        inputOptionsButton.toolTip = inputOptionsTitle
+        inputOptionsButton.setAccessibilityLabel(inputOptionsTitle)
     }
 
     @objc private func logicalInputClicked(_ recognizer: NSClickGestureRecognizer) {
@@ -1229,9 +1268,10 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
     }
 
     private func interactiveDescendantContains(pointInSelf point: NSPoint) -> Bool {
-        guard let superview else {
-            return inputOptionsContains(pointInSelf: point)
+        if inputOptionsContains(pointInSelf: point) {
+            return true
         }
+        guard let superview else { return false }
         let pointForHitTest = convert(point, to: superview)
         var candidate = hitTest(pointForHitTest)
         while let view = candidate, view !== self {
@@ -1765,6 +1805,11 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
             if rowIndex == 0, !renderedShowsSourceRail {
                 targetViews.append(inputOptionsButton)
             }
+            if rowIndex == 0,
+               let copyControl = generatedResultCopyControl,
+               !copyControl.isHidden {
+                targetViews.append(copyControl)
+            }
             if alternativeCount > 1 {
                 targetViews.append(translationPagerView)
             }
@@ -2235,6 +2280,10 @@ final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
 
 func runBufferInlineToolbarToggleInteractionProbe() -> Bool {
     BufferInlineView.runToolbarToggleInteractionProbe()
+}
+
+func runBufferInlineGeneratedResultCopyPlacementProbe() -> Bool {
+    BufferInlineView.runGeneratedResultCopyPlacementProbe()
 }
 
 /// A button that works on the first click inside a never-key panel.

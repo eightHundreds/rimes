@@ -140,8 +140,6 @@ function InputMethodSettingsHarness() {
 }
 
 function openBufferToolbar() {
-  const trigger = screen.getByRole("button", { name: /Buffer 工具栏/ });
-  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
   return screen.getByRole("toolbar", { name: "Buffer 工具栏" });
 }
 
@@ -492,25 +490,18 @@ describe("Connector progressive disclosure", () => {
 });
 
 describe("Buffer generation and delivery", () => {
-  it("starts compact, toggles the restored toolbar from the input icon, and has no right drag strip", () => {
+  it("keeps the toolbar permanently visible and places result copy on the leading target rail", () => {
     const view = render(
       <BufferSurface mode="normal" sourceText="source" />,
     );
     const surface = screen.getByRole("region", { name: "缓冲工作台" });
-    expect(surface.getAttribute("data-base-height")).toBe("44");
-    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
-    expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
-    expect(screen.queryByRole("separator", { name: "拖动 Buffer 窗口" })).toBeNull();
-    expect(view.container.querySelector(".buffer-track__role")).toBeNull();
-
-    const trigger = screen.getByRole("button", { name: "展开 Buffer 工具栏" });
-    fireEvent.click(trigger);
+    expect(surface.getAttribute("data-base-height")).toBe("78");
     const toolbar = screen.getByRole("toolbar", { name: "Buffer 工具栏" });
     expect(toolbar.getAttribute("data-native-window-drag-region")).toBe("true");
-    expect(surface.getAttribute("data-base-height")).toBe("78");
-    fireEvent.click(screen.getByRole("button", { name: "收起 Buffer 工具栏" }));
-    expect(screen.queryByRole("toolbar", { name: "Buffer 工具栏" })).toBeNull();
-    expect(surface.getAttribute("data-base-height")).toBe("44");
+    expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /展开 Buffer 工具栏|收起 Buffer 工具栏/ })).toBeNull();
+    expect(screen.queryByRole("separator", { name: "拖动 Buffer 窗口" })).toBeNull();
+    expect(view.container.querySelector(".buffer-track__role")).toBeNull();
 
     view.rerender(
       <BufferSurface
@@ -520,11 +511,13 @@ describe("Buffer generation and delivery", () => {
         targets={["你好", "你好呀"]}
       />,
     );
-    expect(surface.getAttribute("data-base-height")).toBe("78");
+    expect(surface.getAttribute("data-base-height")).toBe("112");
     expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
     expect(view.container.querySelector(".buffer-track--target .buffer-track__role")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "展开 Buffer 工具栏" }));
-    expect(surface.getAttribute("data-base-height")).toBe("112");
+    const targetRail = view.container.querySelector(".buffer-track--target");
+    const copyButton = screen.getByRole("button", { name: "复制当前结果并关闭 Buffer" });
+    expect(targetRail?.firstElementChild?.classList.contains("buffer-track__copy")).toBe(true);
+    expect(targetRail?.contains(copyButton)).toBe(true);
   });
 
   it("opens plugin selection and each plugin configuration from the input icon", () => {
@@ -637,7 +630,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
-    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
+    expect(screen.getByRole("toolbar", { name: "Buffer 工具栏" })).toBeTruthy();
     expect(view.container.querySelector(".buffer-track__status")).toBeNull();
     const sendButton = screen.getByRole("button", { name: "发送" });
     expect(sendButton.classList.contains("buffer-workbench__primary-action")).toBe(true);
@@ -672,7 +665,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
-    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
+    expect(screen.getByRole("toolbar", { name: "Buffer 工具栏" })).toBeTruthy();
     expect(view.container.querySelector(".buffer-track__loading")?.textContent)
       .toBe("插件正在生成");
 
@@ -684,7 +677,7 @@ describe("Buffer generation and delivery", () => {
         translationProvider="ai"
       />,
     );
-    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
+    expect(screen.getByRole("toolbar", { name: "Buffer 工具栏" })).toBeTruthy();
     expect(view.container.querySelector(".buffer-track__loading")?.textContent)
       .toBe("正在通过 AI 通道翻译");
 
