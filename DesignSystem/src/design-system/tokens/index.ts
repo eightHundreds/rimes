@@ -4,9 +4,31 @@ import source from "./themes.json";
 export type ThemeID = keyof typeof source.themes;
 export type ThemeTokens = (typeof source.themes)[ThemeID];
 export type MetricTokens = typeof source.metrics;
+export type ThemeFamilyID = keyof typeof source.themeFamilies;
+export type ThemeFamily = Omit<
+  (typeof source.themeFamilies)[ThemeFamilyID],
+  "colorways"
+> & {
+  colorways: readonly ThemeID[];
+};
 
 export const themes = source.themes;
 export const metrics = source.metrics;
+export const themeFamilies = source.themeFamilies as Record<ThemeFamilyID, ThemeFamily>;
+export const themeFamilyOrder = Object.keys(source.themeFamilies) as ThemeFamilyID[];
+
+export function themeFamilyFor(themeID: ThemeID): ThemeFamilyID {
+  return themeFamilyOrder.find((familyID) => (
+    themeFamilies[familyID].colorways.includes(themeID)
+  )) ?? "classic";
+}
+
+export function themeOptionLabel(themeID: ThemeID): string {
+  const family = themeFamilyFor(themeID);
+  return family === "classic"
+    ? `${themeFamilies[family].title} · ${themes[themeID].title}`
+    : themeFamilies[family].title;
+}
 
 export function themeCSSVariables(
   theme: ThemeTokens,
@@ -16,6 +38,9 @@ export function themeCSSVariables(
   const value = { ...theme, ...overrides };
   const sizes = { ...metrics, ...metricOverrides };
   return {
+    "--r-brand-red": value.brandRed,
+    "--r-brand-yellow": value.brandYellow,
+    "--r-brand-green": value.brandGreen,
     "--r-accent": value.accent,
     "--r-accent-foreground": value.accentForeground,
     "--r-accent-text": value.accentText,

@@ -6,6 +6,51 @@ import AppKit
 /// user's system accent leaking into RIMES settings.
 class RimeFixedAccentPopUpButton: NSPopUpButton {
     private static let indicatorWidth: CGFloat = 22
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
+
+    var pointingHandTrackingOptions: NSTrackingArea.Options {
+        [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
+    }
+
+    override var isEnabled: Bool {
+        didSet {
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isEnabled
+            )
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self,
+            options: pointingHandTrackingOptions
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)

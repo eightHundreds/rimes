@@ -33,7 +33,6 @@ EXPECTED_IDS = [
     "builtin.ai-text",
     "builtin.apple-translation",
     "builtin.stream-input",
-    "builtin.capsule",
 ]
 DEFAULT_INSTALLED_IDS = set(EXPECTED_IDS)
 DEFAULT_ENABLED_IDS = set(EXPECTED_IDS)

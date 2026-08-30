@@ -44,6 +44,71 @@ private final class StreamInputSmokeProvider: AITextProvider {
     }
 }
 
+private final class StreamInputSmokeInferenceEngine:
+    StreamInputInferenceEngine {
+    struct Pending {
+        let request: StreamInputInferenceRequest
+        let onEvent: (AITextProviderEvent) -> Void
+        let completion: (
+            Result<[AITextProviderBlock], AITextProviderError>
+        ) -> Void
+        let task: StreamInputSmokeTask
+        let invokedOnMainThread: Bool
+    }
+
+    let displayName = "Smoke Local"
+    var availability: AITextProviderAvailability = .ready
+    private(set) var prepareCount = 0
+    private(set) var resetCount = 0
+    private(set) var pending: [Pending] = []
+
+    func prepare() { prepareCount += 1 }
+    func reset() { resetCount += 1 }
+
+    @discardableResult
+    func infer(
+        _ request: StreamInputInferenceRequest,
+        onEvent: @escaping (AITextProviderEvent) -> Void,
+        completion: @escaping (
+            Result<[AITextProviderBlock], AITextProviderError>
+        ) -> Void
+    ) -> any AITextCancellable {
+        let task = StreamInputSmokeTask()
+        pending.append(Pending(
+            request: request,
+            onEvent: onEvent,
+            completion: completion,
+            task: task,
+            invokedOnMainThread: Thread.isMainThread
+        ))
+        return task
+    }
+}
+
+private final class StreamInputSmokeImmediateEngine:
+    StreamInputInferenceEngine {
+    let displayName = "Smoke Immediate"
+    let availability: AITextProviderAvailability = .ready
+    let results: [Result<[AITextProviderBlock], AITextProviderError>]
+
+    init(_ results: [Result<[AITextProviderBlock], AITextProviderError>]) {
+        self.results = results
+    }
+
+    @discardableResult
+    func infer(
+        _ request: StreamInputInferenceRequest,
+        onEvent: @escaping (AITextProviderEvent) -> Void,
+        completion: @escaping (
+            Result<[AITextProviderBlock], AITextProviderError>
+        ) -> Void
+    ) -> any AITextCancellable {
+        let task = StreamInputSmokeTask()
+        results.forEach(completion)
+        return task
+    }
+}
+
 private final class StreamInputSmokeRuntimeBox {
     var bufferEnabled = true
     var pluginSelected = true
@@ -65,6 +130,101 @@ func runStreamInputPluginSmokeTest() -> Bool {
     func fail(_ message: String) -> Bool {
         print("FAILED: stream input \(message)")
         return false
+    }
+
+    guard RimeOctagramStreamInputEngine.rimeClauses(
+        rawInput: "qing ni hao",
+        automaticSyllableSpaceOffsets: [4]
+    ) == ["qing'ni", "hao"],
+    RimeOctagramStreamInputEngine.rimeClauses(
+        rawInput: "nihao",
+        automaticSyllableSpaceOffsets: []
+    ) == ["nihao"],
+    RimeOctagramStreamInputEngine.rimeClauses(
+        rawInput: "qing ni ",
+        automaticSyllableSpaceOffsets: [4, 7]
+    ) == ["qing'ni"],
+    RimeOctagramStreamInputEngine.rimeClauses(
+        rawInput: "NiHao",
+        automaticSyllableSpaceOffsets: []
+    ) == nil else {
+        return fail("local engine hard/soft boundary normalization")
+    }
+    let localCombined = RimeOctagramStreamInputEngine.combine(
+        [["我", "窝"], ["知道", "之道"]],
+        maximumCount: 3
+    )
+    guard localCombined.count == 3,
+          localCombined.first == "我，知道",
+          Set(localCombined).count == localCombined.count else {
+        return fail("local engine bounded alternative beam")
+    }
+    guard RimeOctagramStreamInputEngine.usableCandidate("你好像") == "你好像",
+          RimeOctagramStreamInputEngine.usableCandidate("  修复一个问题  ")
+            == "修复一个问题",
+          RimeOctagramStreamInputEngine.usableCandidate("你好x") == nil,
+          RimeOctagramStreamInputEngine.usableCandidate("你好abc") == nil else {
+        return fail("local engine must decline unconverted ASCII tails")
+    }
+
+    // A module may decline synchronously. The returned root task must still
+    // own the fallback task instead of accidentally overwriting it when the
+    // first module returns after invoking its completion callback.
+    do {
+        let fallback = StreamInputSmokeInferenceEngine()
+        let modular = StreamInputModularInferenceEngine(modules: [
+            StreamInputSmokeImmediateEngine([
+                .failure(.invalidResult),
+                .failure(.failed),
+            ]),
+            fallback,
+        ])
+        let request = StreamInputInferenceRequest(
+            requestID: UUID(),
+            sourceText: "nihao",
+            automaticSyllableSpaceOffsets: [],
+            settings: StreamInputPluginSettings(
+                connectorKind: .openAICompatible,
+                candidateCount: 5,
+                responsePace: .fast
+            ),
+            enforcingMinimumAfterRetry: false,
+            excludedGuesses: []
+        )
+        let task = modular.infer(request, onEvent: { _ in }) { _ in }
+        guard fallback.pending.count == 1,
+              fallback.pending[0].invokedOnMainThread else {
+            return fail("synchronous modular fallback must start exactly once")
+        }
+        task.cancel()
+        guard fallback.pending[0].task.isCancelled else {
+            return fail("root cancellation must retain fallback ownership")
+        }
+    }
+
+    // Merely registering/enabling the built-in must not contend with ordinary
+    // Rime startup. Preparation begins only when Stream Input is selected and
+    // Buffer capture is actually enabled.
+    do {
+        let runtime = StreamInputSmokeRuntimeBox()
+        runtime.pluginSelected = false
+        let inference = StreamInputSmokeInferenceEngine()
+        let workspace = StreamInputWorkspace(
+            provider: StreamInputSmokeProvider(),
+            inferenceEngine: inference,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        guard inference.prepareCount == 0 else {
+            return fail("unselected local engine must remain cold")
+        }
+        runtime.pluginSelected = true
+        workspace.bufferStateDidChangeForTesting()
+        guard inference.prepareCount == 1 else {
+            return fail("selected local engine must prepare exactly once")
+        }
+        workspace.stop()
     }
 
     let letter = StreamInputCaptureRules.letter(
@@ -526,6 +686,44 @@ func runStreamInputPluginSmokeTest() -> Bool {
     guard longHints.isEmpty,
           StreamInputPinyinHints.compactHints(for: "FanGan").isEmpty else {
         return fail("bounded pinyin boundary hint omission")
+    }
+
+    // A non-AI module must enter the exact same revision/focus/result lease as
+    // the historical provider. It gains no direct delivery capability.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let inference = StreamInputSmokeInferenceEngine()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            inferenceEngine: inference,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+        for letter in "nihao" {
+            guard workspace.capture(letter: letter, focusToken: focus) else {
+                return fail("modular local engine capture")
+            }
+        }
+        guard workspace.settleForReturn(focusToken: focus),
+              inference.prepareCount == 1,
+              inference.pending.count == 1,
+              inference.pending[0].request.sourceText == "nihao",
+              provider.pending.isEmpty else {
+            return fail("modular local engine request routing")
+        }
+        inference.pending[0].completion(.success([
+            AITextProviderBlock(index: 0, text: "你好", title: nil),
+            AITextProviderBlock(index: 1, text: "拟好", title: nil),
+        ]))
+        guard workspace.phase == .ready,
+              workspace.deliveryPendingBlocks.map(\.text) == ["你好"] else {
+            return fail("modular local engine result lease")
+        }
     }
 
     let providerPolicyRoot = FileManager.default.temporaryDirectory

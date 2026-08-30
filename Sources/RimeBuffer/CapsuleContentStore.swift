@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 
 enum CapsuleEntryKind: String, Codable, CaseIterable {
@@ -60,6 +61,7 @@ enum CapsuleContentStoreError: LocalizedError, Equatable {
     case invalidRequest(String)
     case malformedDocument(String)
     case recordNotFound
+    case revisionConflict
     case fileOperation(String)
 
     var errorDescription: String? {
@@ -72,6 +74,8 @@ enum CapsuleContentStoreError: LocalizedError, Equatable {
             return "Capsule Markdown 格式无效：\(path)"
         case .recordNotFound:
             return "未找到 Capsule 条目"
+        case .revisionConflict:
+            return "Capsule 条目已被其他窗口更新"
         case let .fileOperation(message):
             return "Capsule 本地文件操作失败：\(message)"
         }
@@ -181,7 +185,8 @@ final class CapsuleContentStore {
     }
 
     @discardableResult
-    func put(_ request: CapsuleContentWriteRequest) throws
+    func put(_ request: CapsuleContentWriteRequest,
+             expectedRevision: String? = nil) throws
         -> CapsuleContentSummary {
         let normalized = try Self.validate(request)
         return try withStoreLock {
@@ -189,7 +194,8 @@ final class CapsuleContentStore {
             try seedDefaultsWithoutLockIfNeeded()
             return try writeRecordWithoutLock(
                 normalized,
-                requiresExistingID: normalized.id != nil
+                requiresExistingID: normalized.id != nil,
+                expectedRevision: expectedRevision
             )
         }
     }
@@ -210,7 +216,7 @@ final class CapsuleContentStore {
         }
     }
 
-    func remove(id: UUID) throws {
+    func remove(id: UUID, expectedRevision: String? = nil) throws {
         try withStoreLock {
             let url = entryURL(id: id)
             guard fileManager.fileExists(atPath: url.path) else {
@@ -220,6 +226,11 @@ final class CapsuleContentStore {
                 url,
                 maximumBytes: Self.maximumDocumentBytes
             )
+            if let expectedRevision {
+                guard try fileRevisionWithoutLock(url) == expectedRevision else {
+                    throw CapsuleContentStoreError.revisionConflict
+                }
+            }
             do {
                 try fileManager.removeItem(at: url)
             } catch {
@@ -228,6 +239,24 @@ final class CapsuleContentStore {
                 )
             }
         }
+    }
+
+    private func fileRevisionWithoutLock(_ url: URL) throws -> String {
+        try requireSafeRegularFile(
+            url,
+            maximumBytes: Self.maximumDocumentBytes
+        )
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw CapsuleContentStoreError.fileOperation(
+                error.localizedDescription
+            )
+        }
+        return SHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
     }
 
     private func seedDefaultsWithoutLockIfNeeded() throws {
@@ -255,19 +284,26 @@ final class CapsuleContentStore {
 
     private func writeRecordWithoutLock(
         _ request: CapsuleContentWriteRequest,
-        requiresExistingID: Bool
+        requiresExistingID: Bool,
+        expectedRevision: String? = nil
     ) throws -> CapsuleContentSummary {
         let normalized = try Self.validate(request)
-        let existing = try recordsWithoutLock()
         let id = normalized.id ?? UUID()
-        if requiresExistingID,
-           !existing.contains(where: { $0.summary.id == id }) {
-            throw CapsuleContentStoreError.recordNotFound
-        }
-        if !requiresExistingID,
-           !existing.contains(where: { $0.summary.id == id }),
-           existing.count >= Self.maximumRecordCount {
-            throw CapsuleContentStoreError.invalidRequest("记录数量超过上限")
+        if requiresExistingID {
+            let destination = entryURL(id: id)
+            guard fileManager.fileExists(atPath: destination.path) else {
+                throw CapsuleContentStoreError.recordNotFound
+            }
+            try requireSafeRegularFile(
+                destination,
+                maximumBytes: Self.maximumDocumentBytes
+            )
+        } else {
+            let existing = try recordsWithoutLock()
+            if !existing.contains(where: { $0.summary.id == id }),
+               existing.count >= Self.maximumRecordCount {
+                throw CapsuleContentStoreError.invalidRequest("记录数量超过上限")
+            }
         }
         let updatedAt = now()
         let document = Self.markdownDocument(
@@ -282,6 +318,12 @@ final class CapsuleContentStore {
             throw CapsuleContentStoreError.invalidRequest("Markdown 超过大小上限")
         }
         let destination = entryURL(id: id)
+        if let expectedRevision {
+            guard try fileRevisionWithoutLock(destination)
+                    == expectedRevision else {
+                throw CapsuleContentStoreError.revisionConflict
+            }
+        }
         try writePrivateFileWithoutLock(data, to: destination)
         return CapsuleContentSummary(
             id: id,

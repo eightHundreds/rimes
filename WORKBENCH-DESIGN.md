@@ -3,19 +3,23 @@
 版本：v0.3 决策更新 · 2026-07-19
 状态：长期路线图；缓冲窗口部分已实现
 
+> **2026-08-30 Buffer UI、结果复制与主题最新覆盖（优先于本文全部旧工作台方案）**：Buffer 初始为单行紧凑态。普通/source-only/target-only 折叠为 44pt，实时 source+target 折叠为 78pt；点击正文唯一的前置输入/插件图标，切换恢复的 33pt 顶部工具栏与 1pt divider，对应展开高度为 78/112pt。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭；空白 chrome、状态、间距和弹性留白是拖窗区，控件保持首击交互。右侧专用 24pt 拖动条已删除。展开态只属于当前进程/会话，不持久化，并在隐藏或 secure/session protection 时折叠。alternative 数量与独立候选浮窗均不增高；target rail 不显示角色图标。完整且新鲜的非 `BufferModel` 生成结果提供复制按钮，纯 `Command+C` 等价：冻结并重新验证同一 source/workspace/generation/有序 block IDs 与文本，按 block 顺序无分隔写入系统剪贴板，再安全关闭/暂停 Buffer。复制不调用 `prepare`、`consume`、`BufferDeliveryCoordinator` 或 `Delivery.insert`，不提交、修改或消费 source；普通 Buffer 原文、空/未完成、protected 或 stale/drifted 结果 fail closed/按既有规则透传。墨竹、翡翠、静谧是 **Classic** 家族配色；**Rasta** 是独立完整的红黄绿语义主题。本文后续 toolbarless、非持久弹层、专用右侧拖动区、常显工具栏、旧高度、target 角色图标、旧主题分类或通过 Delivery 复制等冲突描述均为历史记录，由本条覆盖。
+
 > **2026-07-19 缓冲插件决策（覆盖本文旧 Processor/MarineBridge 描述）**：外部缓冲插件由通用 HTTP Action Plugin 宿主从 `~/Library/RimeBuffer/plugins/*/manifest.json` 动态加载；Marine 是首个实现。苹果本地翻译不伪装成 HTTP 插件，而是内置 `.bufferAction`，但与 Marine 在同一缓冲插件列表和唯一 owner 下互斥。用户调用外部动作时冻结 request/context/focus，匹配结果直接进缓冲，失效结果进收件箱，两者都不自动上屏。旧 `MarineBridge` 源码暂留但已从 focus 主路径解除。
 上游输入：七张早期视觉探索稿（已退役）+ 产品负责人 2026-07-16 口头需求收敛
 关系：本文档记录工作台路线与历史裁决；`ARCHITECTURE.md` 是 P1 时代交接文档。运行时事实与本文冲突时以 `SYSTEM-ARCHITECTURE.md` 为准。
 
+> **2026-08-30 核心模块边界（当前，覆盖旧「窗口 / Clip / Mailbox」归属）**：Buffer、Clipboard History、Mailbox 与 Capsule 是同一 RIMES 进程内的四个同级核心模块，各自拥有独立窗口、快捷键和生命周期；Buffer、Clipboard、Mailbox、Capsule 各自成为顶层设置页。Capsule 不再属于 Buffer 插件目录、派生 workspace、Return 投递或并击按键路径；Mailbox 的查看、备注与 AI 续问不依赖 Buffer，只有用户明确选择“加入 Buffer”时才经过可选桥接；Clipboard History 也不进入 BufferModel 或 Buffer 几何。本文后续把 Clipboard、Mailbox 或 Capsule 归入 Buffer/共享「窗口」的描述均为历史路线。
+
 > **2026-08-26 连接器覆盖决策（当前）**：连接器只保留「AI 模型 / 本地网关」；隔空传字的设置入口、启动服务、配对传输、文本镜像与接收投递均已下架。本文后续关于 `RemoteTypingService`、`.remotePeer` 回镜、配对 Mac 与隔空传字页面的内容只用于追溯旧方案，不代表当前产品能力。
 
-> **2026-08-26 Mailbox 覆盖决策（当前）**：「缓冲区」设置改名为「窗口」，分为 Buffer / Clip / Mailbox。Mailbox 是可通过 `⌘⇧M` 独立打开或关闭的本地持久化双栏会话窗口，并复用在设置页；左侧会话统一为单行，右侧使用固定时间/来源/提示符/正文列的全宽等宽 CLI transcript，固定底栏只保留无边框 prompt + 单行输入，Return 提交，不使用聊天气泡或发送按钮。AI 工具栏把内容格式（Plain / Markdown / JSON）与目的地（原地 / Mailbox）作为两个独立维度；任一 Mailbox 组合都会在主按钮或 Return 后关闭 Buffer、由独立协调器后台完成。三种格式的安全正文快照都可在进程内以稳定的纯文本临时行流式显示，但不写入会话、不参与续问、不标未读也不通知；只有完整且通过格式校验的终态才按所选格式原子写入本地会话、标未读并通知。MCP/HTTP/SSE/SSH/插件等单向来源只能添加本地备注，不显示为“真正回复”；待决内容仍需明确“加入 Buffer”或“拒绝”。本文后续关于嵌入工作台传入轨、旧收件箱和 Buffer 内 Mailbox 的描述均为历史路线。
+> **2026-08-30 Mailbox / AI 生成边界（当前）**：Mailbox 是可通过 `⌘⇧M` 独立打开或关闭的本地持久化双栏会话窗口，并复用在设置页；左侧会话统一为单行，右侧使用固定列的全宽等宽 CLI transcript，底栏以 Return 提交原生新对话、AI 续问或本地备注。Buffer 的 AI 生成下拉框只保留 Plain / Markdown / JSON 三种原地格式，不再存在 Mailbox 目的地，也不能创建 Mailbox 会话或消费 Buffer 源块。旧「原地 / Mailbox」组合、关闭 Buffer 后后台转发及临时 preview 路线已退役；本文后续相关描述只是历史记录。MCP/HTTP/SSE/SSH/插件等单向来源仍只能添加本地备注，待决内容需明确“加入 Buffer”或“拒绝”。
 
 > **2026-08-22 输入方案与并击扩展覆盖决策（当前）**：核心输入法设置只保留「输入方案 / 词库」，五个普通方案是雾凇全拼、自然码双拼、小鹤双拼、五笔 86 与英文。原「键入模式」页已删除；`my_combo`、飞耀并击 / 互击模式、组键间隔、课程、练习和进度统一归入默认关闭的「并击」扩展。意识流在扩展开启时继续把飞耀批次映射为连续全拼，关闭时回到逐字连续全拼。
 
 > 2026-07-17 早期决策（已被下一条覆盖）：缓冲区从候选 panel 拆成独立工作台，曾采用内嵌候选投影、全文预览与发送后留块方案。
 >
-> **2026-07-28 工作台工具栏覆盖决策（当前）**：顶部功能栏永久展开；主条只保留缓冲轨与右侧主操作，不再显示左侧拖拽手柄或展开/收起按钮。功能栏空白、间距与弹性留白可拖动窗口，按钮、下拉框、状态控件和正文轨保持原有交互且不能拖窗。普通工作台固定为 78pt，1/2/3 个 target rows 固定为 112/143/174pt；旧折叠偏好静默忽略，仅 frame 与 pin 继续持久化，候选位置改为按当前逻辑 caret 实时计算。本文后续所有 44pt 折叠、drag handle、disclosure 和展开态持久化描述均为历史方案。
+> **2026-07-28 工作台工具栏覆盖决策（历史，已被页首 2026-08-30 决策覆盖）**：顶部功能栏永久展开；主条只保留缓冲轨与右侧主操作，不再显示左侧拖拽手柄或展开/收起按钮。功能栏空白、间距与弹性留白可拖动窗口，按钮、下拉框、状态控件和正文轨保持原有交互且不能拖窗。普通工作台固定为 78pt，1/2/3 个 target rows 固定为 112/143/174pt；旧折叠偏好静默忽略，仅 frame 与 pin 继续持久化，候选位置改为按当前逻辑 caret 实时计算。本条仅保留工具栏路线的决策历史，不代表当前 UI。
 >
 > **2026-08-21 Rime 组字与候选呈现覆盖决策（当前）**：直输时由宿主文本控件呈现 marked text；Buffer 捕获同一精确 `FocusToken` 时，`BufferInlineView` 在逻辑插入 caret 处内联投影 preedit。Rime 候选始终由同一个独立 `nonactivatingPanel`（`CandidateWindow`）悬浮呈现，只在宿主 caret 与 Buffer 逻辑 caret 之间切换 anchor，不迁入或贴靠工作台，也不占工作台高度。候选显示、点击与重定位继续通过 exact-focus、secure input、active Space 与 WindowServer 可见性门禁；任一门禁失配都先清除 inline preedit 与候选明文，再 fail closed 隐藏。本文后续若仍描述候选区内嵌、贴靠工作台外沿或候选几何参与工作台高度，均视为历史方案。
 
@@ -23,7 +27,7 @@
 >
 > **2026-07-22 简化工作台覆盖决策（被 2026-07-28 工具栏决策及 2026-08-21 候选呈现决策部分覆盖）**：刷新/重置始终保留缓冲正文：对外部插件取消过时任务并重新探测上下文，对内置派生工作区保留源文并重启 generation。工作台不再提供块编辑器或面板内缓冲开关；底层缓冲启停、pin 和移屏仍从设置或输入法菜单进入。手动遮蔽、历史/恢复、清空/撤销已移除。Buffer 只在逻辑 caret 处内联呈现 Rime preedit，常规 `CandidateWindow` 继续作为唯一候选选择面板；意识流 target rows 不是 Rime 候选。普通/Shift+Return 与 Backspace 保持宿主隔离，Return 轻按逐块、长按批量，纸飞机每次只发送下一块。单独且小于 500 ms 的 Shift 轻点才切换中英；与字母/标点组合或长按后保持按下前模式。成功发送的 block 立即从 live buffer 消失且不保留明文历史，失败和未发送 block 原位保留。本文后续若仍描述“Rime 候选投影 / 全文预览 / 已发送对号留块”，均视为历史方案。
 
-> **2026-07-19 本地翻译覆盖决策（UI 部分由 2026-07-28 覆盖）**：苹果翻译已作为只出现在缓冲插件列表的内置 `.bufferAction` 落地，与 Marine 共用唯一 owner。源文复用 `BufferModel`，在上方连续轨合并显示且不分 block；译文位于下方独立 `AppleTranslationWorkspace` 分块轨，两轨分别横向滚动。当前翻译态固定为 112pt，顶部功能栏常显并提供空白拖动，发送按钮对齐下方目标语言行。仅完成且 generation 匹配的译文可由统一投递协调器手动发送。框架保持 macOS 13 最低版本，macOS 15+ 通过工作台内的 SwiftUI `translationTask` 弱链接桥接本地语言模型。本文后续将 Translation 标记为“计划”或描述无头 initializer 的内容均已被此决策覆盖。
+> **2026-07-19 本地翻译覆盖决策（UI 几何由页首 2026-08-30 契约修订）**：苹果翻译已作为只出现在缓冲插件列表的内置 `.bufferAction` 落地，与 Marine 共用唯一 owner。源文复用 `BufferModel`，在上方连续轨合并显示且不分 block；译文位于下方独立 `AppleTranslationWorkspace` 分块轨，两轨分别横向滚动。当前翻译态折叠为 78pt，前置输入/插件图标展开 33pt 工具栏 + 1pt divider 后为 112pt，target 不显示角色图标。仅完成且 generation 匹配的译文可由统一投递协调器手动发送。框架保持 macOS 13 最低版本，macOS 15+ 通过工作台内的 SwiftUI `translationTask` 弱链接桥接本地语言模型。
 >
 > **2026-07-23 AI 插件/连接器覆盖决策（当前）**：内置 `.bufferAction` 已收敛为唯一「AI 生成」插件；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是“连接器 › AI 模型”中的三个独立可切换模型源。当外部 owner 的整个动作面只有一个 prepared presentation 时，它与内置 AI 共用主生成控件，展开层不再放独立“生成”按钮；主条右侧控件以 AI 图标/转圈/纸飞机表达不可请求、可请求、生成中和可投递。Return 与它共用同一状态：无结果时请求 AI，ready 后的新一次轻按逐块发送、长按全部发送。Marine 仍以 `presentationId` 合并直评/回复并按 `status.actionId` 选择真实动作；若还存在任意第二个 presentation，则全部保留为显式按钮而不让 Return 猜测。内置生成冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新；只有目标块全部成功发送后才消费上方对应 source blocks。两轨角色使用图标，不再显示“原/答”文字。
 
@@ -35,7 +39,7 @@
 >
 > **2026-08-21 自动收尾覆盖决策（当前）**：设置“最后一块上屏后关闭工作台”默认开启，并统一作用于 `Default` 与所有 Buffer 插件。它不是“发送按钮一按就关”：只有精确最后一个 block 成功进入同一实时目标、source 已原子消费、没有 generation/new-content 漂移且 owner/工作台会话仍相同时，才关闭并暂停。设置关闭、部分失败、目标丢失、迟到结果或会话切换均保持工作台打开，避免掩盖未发送内容。
 >
-> **2026-08-21 Clipboard、Esc 与状态承载覆盖决策（当前）**：Clipboard History 仍是默认关闭的可选 rail。用户显式 off→on 且共享工作台在同一操作后真实可见、无保护时，可以捕获一次当下合格纯文本；隐藏/保护期间不读，普通显隐与锁屏/睡眠/会话恢复只建立 baseline，绝不回填期间内容。无论通过 `Command+Shift+B` 还是 `Command+Shift+P` 显示工作台，未修饰 `Esc` 都关闭并暂停可见外壳；Clipboard-only 关闭不能提交、取消或改写宿主 composition。AI/插件同一条活动状态只在正文 rail 或工具栏显示一次：正文已经承载时工具栏留空，正文不承载时工具栏才兜底。
+> **2026-08-30 Clipboard、Esc 与状态承载覆盖决策（当前）**：`Command+Shift+P` 打开屏幕底部的独立 nonactivating Clipboard History 窗口，不显示或启停 Buffer。收录开启且 secure input、锁屏、睡眠、会话失活均不存在时，同一输入法进程在后台记录系统 pasteboard；保护期间不读，恢复只建立 baseline，不补录期间内容。文本、链接、图片、文件、颜色和未知类型的原始 representation 持久保存在本机私有 SQLite 中，不进仓库，不做云端或跨设备同步。横向卡片时间流借鉴 Paste 的交互：直接输入搜索，图片类别别名也能找到图片；图片记录与可解码的图片文件异步请求有界缩略图，卡片显示真实来源 App 图标。左右选择后，Return / `Command+1`–`Command+9` 对文本做 exact-token 上屏；富内容先恢复原始 pasteboard，再向同一 token 的精确宿主 PID 发送带内部标签的 `Command+V`，完成直接粘贴且绕过 RIMES 自己的 Buffer 粘贴路由。显式激活按需请求 Post Event 权限；权限或 token/client/PID 失配时 fail closed，不向新焦点误贴。`Command+C` 只复制原始内容，Delete 删除；`Esc` 有搜索时先清搜索，否则关闭 Clipboard 自己，始终不触碰宿主 composition。AI/插件同一条活动状态只显示一次：正文 target/status rail 已承载时工具栏不重复，否则由展开工具栏状态区后备。
 
 ---
 
@@ -56,7 +60,7 @@
 
 | 砍掉 | 理由 |
 |---|---|
-| 后台/隐式剪贴板捕获 | 仍明确不做；只有可见且无保护的显式 Clipboard History 能轮询，off→on 可捕获一次当下内容，普通恢复不补抓；Ctrl/Cmd+V 仍是另一条单次 source 编辑路径 |
+| 后台/隐式剪贴板捕获 | 收录开启且无保护时由同一 RIMES 进程后台捕获并持久化原始类型；不启动第二守护进程、不读 confidential/transient 内容、不跨设备同步。Ctrl/Cmd+V 仍是 Buffer source 的另一条单次编辑路径 |
 | AirDrop 投递目标 | 不在需求清单里；延后 |
 | Turn/Artifact 完整版本模型（revision/derivedFrom/分叉） | 探索稿里最贵的部分；v1 用「结果块」轻量替代，版本化留给需求被验证之后 |
 | 投递撤回（revoke） | 依赖版本模型与协议大改；延后 |
@@ -69,7 +73,7 @@
 
 ### 1.1 独立缓冲工作台（缓冲模式主交互面）
 
-下图保留外部来源与缓冲内容的路线关系，并按当前呈现契约把 Rime 输入拆开：顶部功能栏常显，普通运行时固定为 78pt，派生模式按 1–3 个 target rows 使用 112/143/174pt。焦点锚定布局向远离输入框的一侧增高，手动或无目标布局保持底边向上增高；preedit 在 Buffer 逻辑 caret 内联，Rime 候选由独立浮窗跟随该 caret，传入轨仍由独立收件箱承载。
+下图保留外部来源与缓冲内容的路线关系，并按当前呈现契约把 Rime 输入拆开：工作台初始只显示单行正文；普通/source-only/target-only 为 44pt，live source+target 为 78pt。前置输入/插件图标切换 33pt 工具栏和 1pt divider，展开后为 78/112pt。焦点锚定布局向远离输入框的一侧增高，手动或无目标布局保持底边向上增高；preedit 在 Buffer 逻辑 caret 内联，Rime 候选由独立浮窗跟随该 caret，传入轨仍由独立收件箱承载。
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -83,7 +87,9 @@
                 └────────────────────────────────┘
 ```
 
-实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。顶部功能栏常显，内容是状态 → 带小图标的缓冲插件选择器与当前动作 → 弹性空白 → 刷新/重置 → 关闭；空白、间距与弹性留白通过 `performDrag` 移动窗口，所有 `NSControl` 保持首击。主条只保留 `BufferInlineView` → 右侧主操作。普通布局固定 78pt；苹果翻译、AI 生成与单候选意识流固定为 112pt 的 source + target 布局；意识流出现 2/3 个候选时增加 1/2 条 target row，高度为 143/174pt。设置页可独立开启多个缓冲插件；选择器只枚举已开启集合，以 `Default` 表示无插件，并直接切换唯一 owner。刷新/重置不清除缓冲正文，只重置当前插件的请求、失败与 generation。切换 owner/target row 数时，焦点锚定布局保持靠输入框的一边并向外增减，手动或无目标布局保持底边。`BufferInlineView` 在当前逻辑 caret 处内联投影 Rime preedit；`CandidateWindow` 独占候选状态，以独立浮窗跟随该 caret，既不加入工作台视图层级，也不改变 78/112/143/174pt 几何。`Command+Shift+B` 通过全局 Carbon hot key 调用 `toggleVisibility()`：关闭时显示并恢复捕获，打开时复用普通关闭语义，收束当前组字、保留内容并暂停捕获。窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 持久化并在多屏变化后校正。意识流互斥解释在 target rows 内呈现。发送对齐最下方 target 行。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。当前工作台初始为紧凑正文：普通/source-only/target-only 为 44pt，实时 source+target 为 78pt；一个稳定 target viewport 以 pager 承载 1–5 个互斥 alternative，不因数量增高。正文只有可点击的前置输入/插件图标与右侧主操作；该图标切换 33pt 工具栏和 1pt divider，展开后为 78/112pt。工具栏承载 `Default + 已启用插件` 选择、当前插件配置、返回编辑、状态与关闭；展开态不持久化，隐藏或 secure/session protection 时折叠。target rail 不显示角色图标。`BufferInlineView` 在当前逻辑 caret 处内联投影 Rime preedit；`CandidateWindow` 独占候选状态，以独立浮窗跟随该 caret，不加入工作台视图层级或改变当前折叠/展开几何。完整且新鲜的非 `BufferModel` 生成结果显示复制按钮，纯 `Command+C` 与之共用冻结/写前重验事务，写系统剪贴板后安全关闭；复制不经过 Delivery，也不修改或消费 source。`Command+Shift+B` 通过全局 Carbon hot key 调用 `toggleVisibility()`：隐藏态显示并恢复捕获，显示态复用普通安全关闭语义。窗口仍可调整宽度、固定到所有桌面/全屏空间，frame 持久化并在多屏变化后校正。
+
+当前不保留右侧专用拖动区。只有展开工具栏的空白 chrome、状态、间距和弹性留白是拖动命中区，hover 为 open-hand、按下为 closed-hand；正文轨与窗口背景不可拖。前置输入/插件图标、下拉、配置、复制、发送和关闭等交互控件在祖先手势识别前被排除，并在 nonactivating panel 中主动设置 pointing-hand。
 
 各层职责：
 
@@ -221,7 +227,7 @@ struct AITextGeneration {
 | FocusCoordinator | 新（已实现） | `InputFocusCoordinator.swift` | FocusToken、client 租约、前台与对象身份校验 |
 | BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、成功块无历史消费、失败后缀保留 |
 | DeliveryRouter | 后续 | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、远端 ACK、持久账本 |
-| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 常显工具栏空白拖动；普通78pt；1–3 target rows为112/143/174pt；source全选、多行target、插件动作/刷新/关闭/多屏/安全遮蔽 |
+| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` + `BufferGeneratedResultCopy.swift` | 初始44/78pt；前置图标切换33+1pt工具栏至78/112pt；工具栏空白拖动、无右侧专用拖动条；target 无角色图标；1–5 alternative 单 target 分页；生成结果复制/Cmd+C；source 全选、多屏与安全遮蔽 |
 | 候选状态机 | 改（已实现） | `CandidateWindow.swift` | 同一个独立 nonactivating panel 按输入 route 锚定宿主 caret 或 Buffer 逻辑 caret；不占工作台布局 |
 | 设置窗 | 新 IA 已实现 | `SettingsWindow.swift` + `SettingsRouting.swift` | 左侧一级导航、右侧横向子页、动态内置扩展页；含真实插件管理 |
 
@@ -433,7 +439,7 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
 | 3 | 处理器时机 | 入缓冲区侧跑，不在投递路径（§3.2 规则 3） |
 | 4 | AI 谁来调 | 输入法内置（需求 5 推翻此前"外包给本地智能体"的建议） |
 | 5 | 钥匙串 | 0600 文件，Dev ID 后迁移（§4.1/§5.3） |
-| 6 | 剪贴板捕获 | 自动/隐式捕获仍砍；显式精确 Ctrl/Cmd+V 已实现，且 secure input 下不读取（§0.1） |
+| 6 | 剪贴板捕获 | 同一 RIMES 进程在收录开启且无保护时后台捕获，原始类型持久化于本机私有库。显式精确 Ctrl/Cmd+V 仍是 Buffer source 的另一条单次编辑路径，secure input 下两者均不读取（§0.1） |
 | 7 | 安全字段/切换重置 | M0 先行 |
 | 8 | 块编辑分叉 | 工作台不提供块编辑器，也不做无边界自由编辑与自动 diff/reconcile |
 | 9 | 候选窗/维护页去向 | 保留，归「输入法」组（§8） |
@@ -441,7 +447,7 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
 | 11 | 无条件镜像 | v1 保持既有隔空传字设置；自身窗口永不镜像，`.remotePeer` 来源永不回镜（§6.3） |
 | 12 | Return 轻按/长按发送 | 已实现；无未决组字时 keyDown 建立隔离，轻按发下一块、按住约 1.2 秒发全部。有未决 Rime/并击或未 ready raw 时本次只收束/强制生成；ready 意识流在 keyDown 确认候选后使用同一次手势发送（§1.1） |
 | 13 | 清空按钮 | 2026-07-18 覆盖裁决：移除按钮、清空与撤销功能；只保留不可恢复的自动安全清理 |
-| 14 | 紧凑面板两轨还是三轨 | 三层仍是历史路线目标；当前顶部功能栏常显，普通模式为 78pt，派生模式为 source + 1–3 target rows 的 112/143/174pt 动态高度。Rime preedit 在 Buffer 逻辑 caret 内联，候选由独立浮窗跟随且不计入上述高度；传入轨仍待嵌入 |
+| 14 | 紧凑面板两轨还是三轨 | 三层仍是历史路线目标；当前正文初始单行，普通/source-only/target-only 为44pt、live source+target为78pt，前置图标展开33+1pt工具栏后分别为78/112pt。1–5 alternatives 共用单一 target viewport；Rime preedit 在 Buffer 逻辑 caret 内联，候选由独立浮窗跟随且不计入高度；传入轨仍待嵌入 |
 | 15 | 「远端」语义 | 本方案中远端=配对设备（出入站同一对端）；「远端算力」概念废弃，算力即处理器 |
 | 16 | 分期 | §9 |
 | 17 | 路线图还是草稿 | 草稿；本文档为收敛后的路线图 |
@@ -474,7 +480,7 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
   - ⏸ **传入轨 UI**：M2 网关前置条件已经满足；当前仍使用 `InboundToast` + `InboundTrayWindow`，嵌入独立工作台的传入轨尚未实现。配对设备继续直通不入轨；Action Plugin 的有效结果进入 buffer，失效或迟到结果进入收件箱。
   - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
 - **M2 网关+MCP** — ✅ 主干已实现：`LocalGateway`、MCP tools、`InboundBus`、token 与收件箱可用；传入轨嵌入工作台仍后续。
-- **稳定缓冲窗口** — ✅ 2026-07-28：FocusToken、Return 轻按逐块/长按全部、纸飞机逐块发送、Return/Backspace 宿主隔离、常显且空白可拖的顶部功能栏、普通78pt与1–3 target rows的112/143/174pt动态高度、状态/插件动作/刷新/关闭契约、派生多行控件对齐、Buffer caret 内联 preedit 与独立悬浮候选窗、普通/插件/意识流 source 全选粘贴、成功块无历史消费、多屏/常显与 secure-input 保护（包括不读剪贴板）已实现；待重新安装后的真实宿主输入交互验收。
+- **稳定缓冲窗口** — ✅ 2026-08-30：FocusToken、Return 轻按逐块/长按全部、纸飞机逐块发送、Return/Backspace 宿主隔离、44/78pt 初始折叠正文、前置输入/插件图标切换 33pt 工具栏 + 1pt divider 至 78/112pt、工具栏空白拖动且无右侧专用拖动条、展开态隐藏/保护重置、target 无角色图标、完成且新鲜结果的复制按钮与纯 `Command+C` 安全复制关闭、Buffer caret 内联 preedit 与独立悬浮候选窗、普通/插件/意识流 source 全选粘贴、成功块无历史消费、多屏/常显与 secure-input 保护（包括不读剪贴板）已实现；复制不经过 Delivery 且不消费 source。待重新安装后的真实宿主输入交互验收。
 - **AI 生成插件 + 三连接器 + 工作台快捷入口** — ✅ 2026-07-20：唯一「AI 生成」插件、Codex CLI/Claude Code CLI/OpenAI 兼容 API 三连接器、source/target 双轨、工作台插件选择器、`Command+Shift+B` 全局打开/关闭、OpenAI 0600 配置与 owner 切换后 Marine 权限保留已落地；待安装后的真 CLI/API 和快捷键验收。
 
 ### 12.3 下一步真实工作量

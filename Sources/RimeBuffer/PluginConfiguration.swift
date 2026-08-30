@@ -1148,13 +1148,21 @@ final class PluginConfigurationViewController: NSViewController,
     private let model: PluginConfigurationModel
     private var controls: [String: FieldControl] = [:]
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
-    private let saveButton = NSButton(title: "保存", target: nil, action: nil)
-    private let resetButton = NSButton(
+    private let saveButton = RimePointingHandButton(
+        title: "保存",
+        target: nil,
+        action: nil
+    )
+    private let resetButton = RimePointingHandButton(
         title: "恢复默认值…",
         target: nil,
         action: nil
     )
-    private let doneButton = NSButton(title: "完成", target: nil, action: nil)
+    private let doneButton = RimePointingHandButton(
+        title: "完成",
+        target: nil,
+        action: nil
+    )
     var onDismiss: (() -> Void)?
 
     init(model: PluginConfigurationModel) {

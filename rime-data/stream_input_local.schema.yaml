@@ -1,0 +1,47 @@
+# Rime schema
+# encoding: utf-8
+
+# Product-internal, inference-only schema. It is deployed explicitly by the
+# bridge and deliberately omitted from default.yaml/schema_list so it never
+# appears in the user's F4 menu.
+schema:
+  schema_id: stream_input_local
+  name: RIMES 意识流本地引擎
+  version: "1.0"
+  author:
+    - RIMES
+  description: 精简全拼整句解码，供意识流输入的独立本地会话使用
+
+engine:
+  processors:
+    - speller
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - abc_segmentor
+    - fallback_segmentor
+  translators:
+    - script_translator
+  filters:
+    - uniquifier
+
+menu:
+  page_size: 5
+
+speller:
+  __include: rime_ice.schema:/speller
+
+translator:
+  dictionary: rime_ice
+  prism: stream_input_local
+  enable_sentence: true
+  enable_completion: false
+  enable_user_dict: false
+  initial_quality: 1.2
+
+# This schema is selected only after the host verifies that the reviewed model
+# is present. Missing local data therefore declines to the next inference
+# module instead of silently running a lower-quality decoder.
+__patch:
+  - grammar:/hans

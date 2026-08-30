@@ -21,19 +21,19 @@ final class StatisticsSettingsViewController: NSViewController {
 
     private let storageWarningBox = NSBox()
     private let storageWarningLabel = NSTextField(wrappingLabelWithString: "")
-    private let repairStorageButton = NSButton()
+    private let repairStorageButton = RimePointingHandButton()
 
     private let dailyDatePicker = NSDatePicker()
     private let dailySummaryLabel = NSTextField(labelWithString: "")
     private let dailyTopKeyLabel = NSTextField(labelWithString: "")
     private let dailyHeatmap = KeyboardHeatmapView()
-    private let clearDailyButton = NSButton()
+    private let clearDailyButton = RimePointingHandButton()
 
     private let historySummaryLabel = NSTextField(wrappingLabelWithString: "")
     private let historyHeatmap = YearHistoryHeatmapView()
     private let historyScrollView = NSScrollView()
     private let historyDocumentView = StatisticsHistoryDocumentView()
-    private let clearHistoryButton = NSButton()
+    private let clearHistoryButton = RimePointingHandButton()
     private let historyDetailStack = NSStackView()
     private let historyDetailTitleLabel = NSTextField(labelWithString: "")
     private let historyDaySummaryLabel = NSTextField(labelWithString: "")

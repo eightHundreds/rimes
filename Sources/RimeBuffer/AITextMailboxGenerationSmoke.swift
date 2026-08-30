@@ -216,6 +216,44 @@ private final class AITextMailboxSmokeStore: AITextMailboxPersisting {
         return id
     }
 
+    func addAIThread(
+        source: MailboxSource,
+        format: AITextContentFormat,
+        userBody: String = "first question",
+        assistantBody: String = "first answer"
+    ) -> UUID {
+        let id = UUID()
+        let now = Date()
+        threads.append(MailboxThread(
+            id: id,
+            sequence: nextSequence,
+            title: "AI conversation",
+            source: source,
+            messages: [
+                MailboxMessage(
+                    role: .user,
+                    format: .plain,
+                    author: "你",
+                    body: userBody,
+                    createdAt: now
+                ),
+                MailboxMessage(
+                    role: .inbound,
+                    format: format,
+                    author: source.displayName,
+                    body: assistantBody,
+                    createdAt: now
+                ),
+            ],
+            generation: nil,
+            unread: false,
+            createdAt: now,
+            updatedAt: now
+        ))
+        nextSequence += 1
+        return id
+    }
+
     private func nextHandle() -> MailboxGenerationHandle {
         let handle = MailboxGenerationHandle(
             threadID: UUID(),
@@ -240,7 +278,9 @@ private enum AITextMailboxGenerationSmoke {
         Thread.isMainThread
             && promptPlanning()
             && preferencesRoundTrip()
+            && inlineOutputMenuOnly()
             && inlineSelectionSnapshotAndRouting()
+            && directConversationStart()
             && mailboxJSONValidation()
             && mailboxCapacityAdmission()
             && backgroundTerminalLifecycle()
@@ -311,24 +351,96 @@ private enum AITextMailboxGenerationSmoke {
             connectorKind: .openAICompatible,
             modelID: "model-frozen",
             mode: .summarize,
-            destination: .mailbox,
+            destination: .inline,
             format: .markdown
         ) else {
             return false
         }
 
-        let legacySuite = "RimeBuffer.AITextMailboxLegacyPreferencesSmoke.\(UUID().uuidString)"
-        guard let legacyDefaults = UserDefaults(suiteName: legacySuite) else {
-            return false
+        // Retired preference migration is a persisted, idempotent matrix. Only
+        // a valid v2 format paired with destination=mailbox is preserved;
+        // missing/corrupt v2 data and v1-only Mailbox values become Plain.
+        let cases: [(String?, String?, String?, AITextContentFormat)] = [
+            (nil, nil, AITextGenerationOutput.mailbox.rawValue, .plain),
+            (nil, AITextContentFormat.json.rawValue,
+             AITextGenerationOutput.mailbox.rawValue, .plain),
+            (AITextGenerationDestination.mailbox.rawValue, nil,
+             AITextGenerationOutput.markdown.rawValue, .plain),
+            (AITextGenerationDestination.mailbox.rawValue, "corrupt-format",
+             AITextGenerationOutput.json.rawValue, .plain),
+            (AITextGenerationDestination.mailbox.rawValue,
+             AITextContentFormat.plain.rawValue,
+             AITextGenerationOutput.mailbox.rawValue, .plain),
+            (AITextGenerationDestination.mailbox.rawValue,
+             AITextContentFormat.markdown.rawValue,
+             AITextGenerationOutput.plain.rawValue, .markdown),
+            (AITextGenerationDestination.mailbox.rawValue,
+             AITextContentFormat.json.rawValue,
+             "corrupt-output", .json),
+            ("corrupt-destination", AITextContentFormat.markdown.rawValue,
+             AITextGenerationOutput.mailbox.rawValue, .plain),
+            (AITextGenerationDestination.inline.rawValue,
+             AITextContentFormat.json.rawValue,
+             AITextGenerationOutput.mailbox.rawValue, .plain),
+        ]
+        return cases.allSatisfy {
+            migratedPreferenceCase(
+                destinationRaw: $0.0,
+                formatRaw: $0.1,
+                outputRaw: $0.2,
+                expectedFormat: $0.3
+            )
         }
-        defer { legacyDefaults.removePersistentDomain(forName: legacySuite) }
-        legacyDefaults.set(
-            AITextGenerationOutput.mailbox.rawValue,
-            forKey: "plugins.ai-text.generation.output.v1"
-        )
-        let migrated = AITextGenerationPreferenceStore(defaults: legacyDefaults)
-        return migrated.destination == .mailbox
-            && migrated.format == .plain
+    }
+
+    private static func migratedPreferenceCase(
+        destinationRaw: String?,
+        formatRaw: String?,
+        outputRaw: String?,
+        expectedFormat: AITextContentFormat
+    ) -> Bool {
+        let suite = "RimeBuffer.AITextMailboxMigrationSmoke.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return false }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let destinationKey = "plugins.ai-text.generation.destination.v2"
+        let formatKey = "plugins.ai-text.generation.format.v2"
+        let outputKey = "plugins.ai-text.generation.output.v1"
+        if let destinationRaw { defaults.set(destinationRaw, forKey: destinationKey) }
+        if let formatRaw { defaults.set(formatRaw, forKey: formatKey) }
+        if let outputRaw { defaults.set(outputRaw, forKey: outputKey) }
+
+        var notificationCount = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .aiTextGenerationPreferencesDidChange,
+            object: nil,
+            queue: nil
+        ) { _ in
+            notificationCount += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let first = AITextGenerationPreferenceStore(defaults: defaults)
+        let firstDomain = defaults.persistentDomain(forName: suite)
+        let second = AITextGenerationPreferenceStore(defaults: defaults)
+        let secondDomain = defaults.persistentDomain(forName: suite)
+        return first.destination == .inline
+            && first.format == expectedFormat
+            && first.output.rawValue == expectedFormat.rawValue
+            && second.destination == .inline
+            && second.format == expectedFormat
+            && second.output.rawValue == expectedFormat.rawValue
+            && defaults.string(forKey: destinationKey)
+                == AITextGenerationDestination.inline.rawValue
+            && defaults.string(forKey: formatKey) == expectedFormat.rawValue
+            && defaults.string(forKey: outputKey) == expectedFormat.rawValue
+            && NSDictionary(dictionary: firstDomain ?? [:]).isEqual(
+                to: secondDomain ?? [:]
+            )
+            && notificationCount == 0
+    }
+
+    private static func inlineOutputMenuOnly() -> Bool {
+        runAITextOutputPopupMenuProbe()
     }
 
     private static func inlineSelectionSnapshotAndRouting() -> Bool {
@@ -392,6 +504,18 @@ private enum AITextMailboxGenerationSmoke {
         }
         workspace.reset()
 
+        let retiredDestinationSelection = AITextGenerationSelection(
+            connectorKind: .codexCLI,
+            modelID: nil,
+            mode: .ask,
+            destination: .mailbox,
+            format: .markdown
+        )
+        guard retiredDestinationSelection.destination == .inline,
+              retiredDestinationSelection.format == .markdown else {
+            return false
+        }
+
         selection = AITextGenerationSelection(
             connectorKind: .codexCLI,
             modelID: nil,
@@ -443,60 +567,153 @@ private enum AITextMailboxGenerationSmoke {
             mode: .ask,
             output: .mailbox
         )
-        guard !workspace.generate(), provider.requests.count == 3 else {
+        guard selection.destination == .inline,
+              selection.format == .plain else {
             return false
         }
-
-        let expectedHandle = MailboxGenerationHandle(
-            threadID: UUID(),
-            generationID: UUID(),
-            sequence: 7
-        )
-        var routedPlan: AITextGenerationPlan?
         let result = AITextGenerationCommandRouter.request(
-            controls: workspace,
-            dependencies: .init(
-                sourceModel: source,
-                selectionResolver: { _ in selection },
-                startMailbox: {
-                    routedPlan = $0
-                    return expectedHandle
-                }
-            )
+            controls: workspace
         )
-        guard result == .mailboxStarted(expectedHandle),
-              routedPlan?.selection == selection,
-              routedPlan?.sourceText == "inline-source",
-              routedPlan?.preparedPrompt.contains("USER_PAYLOAD_JSON:") == true,
-              provider.requests.count == 3 else {
+        guard result == .inlineStarted,
+              provider.requests.count == 4,
+              provider.requests[3].preparedPrompt?.contains(
+                "The block text must be directly readable plain content."
+              ) == true else {
             return false
         }
         return true
     }
 
+    private static func directConversationStart() -> Bool {
+        let source = BufferModel()
+        source.stageExternal("buffer-must-remain", origin: .rime)
+        let provider = AITextMailboxSmokeProvider(kind: .openAICompatible)
+        let store = AITextMailboxSmokeStore()
+        var resolvedKinds: [AITextProviderKind] = []
+        let coordinator = AITextMailboxGenerationCoordinator(
+            dependencies: .init(
+                store: store,
+                providerResolver: { kind in
+                    resolvedKinds.append(kind)
+                    return kind == provider.kind ? provider : nil
+                }
+            )
+        )
+
+        var startResult: Result<MailboxGenerationHandle, Error>?
+        coordinator.startMailboxConversation(
+            selection: MailboxNewConversationSelection(
+                connectorKind: .openAICompatible,
+                modelID: "  direct-model  "
+            ),
+            body: "  first direct question  "
+        ) {
+            startResult = $0
+        }
+        guard let startResult else { return false }
+        let handle: MailboxGenerationHandle
+        switch startResult {
+        case let .success(value):
+            handle = value
+        case .failure:
+            return false
+        }
+
+        guard let expectedPrompt = try? AITextRequestPlanner.initialPrompt(
+            sourceText: "first direct question",
+            mode: .ask,
+            format: .plain
+        ),
+              resolvedKinds == [.openAICompatible],
+              coordinator.activeJobCount == 1,
+              provider.requests.count == 1,
+              let request = provider.requests.first,
+              request == AITextProviderRequest(
+                requestID: request.requestID,
+                sourceText: "first direct question",
+                preparedPrompt: expectedPrompt,
+                modelID: "direct-model"
+              ),
+              let thread = store.thread(id: handle.threadID),
+              thread.source == .openAICompatible(model: "direct-model"),
+              thread.messages.count == 1,
+              let firstMessage = thread.messages.first,
+              firstMessage.role == .user,
+              firstMessage.kind == .content,
+              firstMessage.format == .plain,
+              firstMessage.author == "你",
+              firstMessage.body == "first direct question",
+              thread.generation?.id == handle.generationID,
+              thread.generation?.expectedFormat == .plain,
+              source.stagedText == "buffer-must-remain" else {
+            return false
+        }
+
+        provider.finish(.success([
+            AITextProviderBlock(index: 0, text: "direct answer", title: nil),
+        ]), request: 0)
+        guard coordinator.activeJobCount == 0,
+              store.completedResponses[handle.generationID] == "direct answer",
+              store.completedFormats[handle.generationID] == .plain,
+              source.stagedText == "buffer-must-remain" else {
+            return false
+        }
+
+        let admittedThreadCount = store.threads.count
+        let admittedRequestCount = provider.requests.count
+        let selection = MailboxNewConversationSelection(
+            connectorKind: .openAICompatible,
+            modelID: "direct-model"
+        )
+        var emptyError: AITextMailboxGenerationError?
+        coordinator.startMailboxConversation(
+            selection: selection,
+            body: " \n\t "
+        ) { result in
+            if case let .failure(error) = result {
+                emptyError = error as? AITextMailboxGenerationError
+            }
+        }
+        var oversizedError: AITextMailboxGenerationError?
+        coordinator.startMailboxConversation(
+            selection: selection,
+            body: String(
+                repeating: "a",
+                count: AITextRuntimeLimits.maximumSourceBytes + 1
+            )
+        ) { result in
+            if case let .failure(error) = result {
+                oversizedError = error as? AITextMailboxGenerationError
+            }
+        }
+        return store.threads.count == admittedThreadCount
+            && provider.requests.count == admittedRequestCount
+            && resolvedKinds == [.openAICompatible]
+            && emptyError == .invalidMessage
+            && oversizedError == .invalidMessage
+            && source.stagedText == "buffer-must-remain"
+    }
+
     private static func mailboxJSONValidation() -> Bool {
         let source = BufferModel()
-        source.stageExternal("json-source", origin: .rime)
+        source.stageExternal("buffer-must-remain", origin: .rime)
         let provider = AITextMailboxSmokeProvider()
         let store = AITextMailboxSmokeStore()
         let coordinator = AITextMailboxGenerationCoordinator(
-            sourceModel: source,
             dependencies: .init(
                 store: store,
                 providerResolver: { _ in provider }
             )
         )
-        let selection = AITextGenerationSelection(
-            connectorKind: .codexCLI,
-            modelID: nil,
-            mode: .ask,
-            destination: .mailbox,
-            format: .json
+        let firstThreadID = store.addAIThread(
+            source: .codexCLI(),
+            format: .json,
+            assistantBody: "{\"first\":true}"
         )
-        guard let firstPlan = try? AITextGenerationPlan.capture(
-            sourceModel: source,
-            selection: selection
-        ), let first = try? coordinator.start(firstPlan),
+        guard case let .generationStarted(first) = try? coordinator.submitComposer(
+            threadID: firstThreadID,
+            body: "json-source"
+        ),
               provider.requests.first?.preparedPrompt?.contains(
                 "Put one complete valid JSON value"
               ) == true else {
@@ -517,7 +734,7 @@ private enum AITextMailboxGenerationSmoke {
         ]), request: 0)
         guard store.completedResponses[first.generationID] == nil,
               store.failedMessages[first.generationID] != nil,
-              source.stagedText == "json-source" else {
+              source.stagedText == "buffer-must-remain" else {
             return false
         }
 
@@ -537,10 +754,15 @@ private enum AITextMailboxGenerationSmoke {
             return false
         }
 
-        guard let secondPlan = try? AITextGenerationPlan.capture(
-            sourceModel: source,
-            selection: selection
-        ), let second = try? coordinator.start(secondPlan) else {
+        let secondThreadID = store.addAIThread(
+            source: .codexCLI(),
+            format: .json,
+            assistantBody: "{\"seed\":true}"
+        )
+        guard case let .generationStarted(second) = try? coordinator.submitComposer(
+            threadID: secondThreadID,
+            body: "second json"
+        ) else {
             return false
         }
         provider.finish(.success([
@@ -551,18 +773,15 @@ private enum AITextMailboxGenerationSmoke {
             return false
         }
 
-        source.stageExternal("markdown-source", origin: .rime)
-        let markdownSelection = AITextGenerationSelection(
-            connectorKind: .codexCLI,
-            modelID: nil,
-            mode: .ask,
-            destination: .mailbox,
-            format: .markdown
+        let markdownThreadID = store.addAIThread(
+            source: .codexCLI(),
+            format: .markdown,
+            assistantBody: "# Seed"
         )
-        guard let thirdPlan = try? AITextGenerationPlan.capture(
-            sourceModel: source,
-            selection: markdownSelection
-        ), let third = try? coordinator.start(thirdPlan) else {
+        guard case let .generationStarted(third) = try? coordinator.submitComposer(
+            threadID: markdownThreadID,
+            body: "markdown-source"
+        ) else {
             return false
         }
         provider.emit(.blockSnapshot(AITextProviderBlock(
@@ -583,7 +802,7 @@ private enum AITextMailboxGenerationSmoke {
             && store.completedFormats[third.generationID] == .markdown
             && store.previewResponses[third.generationID] == nil
             && store.completedFormats[second.generationID] == .json
-            && source.stagedText.isEmpty
+            && source.stagedText == "buffer-must-remain"
     }
 
     /// Integration boundary: coordinator admission must fail before launching
@@ -612,10 +831,8 @@ private enum AITextMailboxGenerationSmoke {
             )
             _ = try store.completeGeneration(initial, response: "second")
 
-            let source = BufferModel()
             let provider = AITextMailboxSmokeProvider()
             let coordinator = AITextMailboxGenerationCoordinator(
-                sourceModel: source,
                 dependencies: .init(
                     store: store,
                     providerResolver: { _ in provider }
@@ -652,7 +869,6 @@ private enum AITextMailboxGenerationSmoke {
         let store = AITextMailboxSmokeStore()
         var notices: [AITextMailboxGenerationNotice] = []
         let coordinator = AITextMailboxGenerationCoordinator(
-            sourceModel: source,
             dependencies: .init(
                 store: store,
                 providerResolver: { kind in
@@ -661,33 +877,25 @@ private enum AITextMailboxGenerationSmoke {
                 notice: { notices.append($0) }
             )
         )
-        let selection = AITextGenerationSelection(
-            connectorKind: .codexCLI,
-            modelID: "model-frozen",
-            mode: .polish,
-            destination: .mailbox,
-            format: .plain
-        )
-        let plan: AITextGenerationPlan
+        let first: MailboxGenerationHandle
         do {
-            plan = try AITextGenerationPlan.capture(
-                sourceModel: source,
-                selection: selection
+            first = try coordinator.startConversation(
+                connectorKind: .codexCLI,
+                modelID: "model-frozen",
+                prompt: "source"
             )
         } catch {
             return false
         }
-        let first: MailboxGenerationHandle
-        do {
-            first = try coordinator.start(plan)
-        } catch {
-            return false
-        }
-        guard coordinator.activeJobCount == 1,
+        guard let expectedPrompt = try? AITextRequestPlanner.initialPrompt(
+            sourceText: "source",
+            mode: .ask,
+            format: .plain
+        ), coordinator.activeJobCount == 1,
               provider.requests.count == 1,
-              provider.requests[0].requestID == plan.requestID,
               provider.requests[0].modelID == "model-frozen",
-              provider.requests[0].preparedPrompt == plan.preparedPrompt else {
+              provider.requests[0].sourceText == "source",
+              provider.requests[0].preparedPrompt == expectedPrompt else {
             return false
         }
 
@@ -739,7 +947,7 @@ private enum AITextMailboxGenerationSmoke {
               store.completedFormats[first.generationID] == .plain,
               store.completionCounts[first.generationID] == 1,
               store.previewResponses[first.generationID] == nil,
-              source.stagedText.isEmpty,
+              source.stagedText == "source",
               notices == [.completed(
                 threadID: first.threadID,
                 sequence: first.sequence,
@@ -748,19 +956,13 @@ private enum AITextMailboxGenerationSmoke {
             return false
         }
 
-        source.stageExternal("retry source", origin: .rime)
-        let failedPlan: AITextGenerationPlan
-        do {
-            failedPlan = try AITextGenerationPlan.capture(
-                sourceModel: source,
-                selection: selection
-            )
-        } catch {
-            return false
-        }
         let failed: MailboxGenerationHandle
         do {
-            failed = try coordinator.start(failedPlan)
+            failed = try coordinator.startConversation(
+                connectorKind: .codexCLI,
+                modelID: "model-frozen",
+                prompt: "retry source"
+            )
         } catch {
             return false
         }
@@ -782,7 +984,7 @@ private enum AITextMailboxGenerationSmoke {
         )), request: 1)
         guard store.failedMessages[failed.generationID]
                 == AITextProviderError.failed.userFacingMessage,
-              source.stagedText == "retry source",
+              source.stagedText == "source",
               store.previewResponses[failed.generationID] == nil,
               store.completedResponses[failed.generationID] == nil,
               notices.filter({

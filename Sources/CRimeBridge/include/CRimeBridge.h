@@ -62,6 +62,8 @@ bool BBRimeStart(const char* sharedDataDir,
                  const char* logDir,
                  const char* frameworksDir);
 bool BBRimeIsHealthy(void);
+// True only when the optional Octagram module was registered in this runtime.
+bool BBRimeHasOctagram(void);
 
 uint64_t BBRimeCreateSession(void);
 void BBRimeDestroySession(uint64_t session);
@@ -75,6 +77,19 @@ bool BBRimeGetOption(uint64_t session, const char* option);
 void BBRimeSetOption(uint64_t session, const char* option, bool value);
 bool BBRimeSelectSchema(uint64_t session, const char* schemaId);
 bool BBRimeDeploy(void);
+
+// Atomically replace a private session's raw input, highlight each current-page
+// choice, copy its complete commit preview into caller-owned fixed-stride
+// storage, then clear the composition. This is intended for background,
+// read-only inference: unlike BBRimeGetContext, no bridge-owned string pointer
+// escapes the global mutex and no untranslated tail is silently discarded.
+// Returns the copied candidate count, 0 for no candidates, or -1 when the
+// required librime API/session is unavailable.
+int BBRimeDecodeCandidateTexts(uint64_t session,
+                               const char* input,
+                               char* textBuffer,
+                               uint64_t candidateStride,
+                               int maxCount);
 
 // Read a double from a DEPLOYED config (e.g. configId="squirrel",
 // key="chord_duration"). Returns false when missing/engine down.

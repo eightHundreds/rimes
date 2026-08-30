@@ -27,6 +27,9 @@ enum SettingsCoreRoute: String, CaseIterable, Codable {
     case inputMethod = "core.input-method"
     case appearance = "core.appearance"
     case buffer = "core.buffer"
+    case clipboard = "core.clipboard"
+    case mailbox = "core.mailbox"
+    case capsule = "core.capsule"
     case connectors = "core.connectors"
     case plugins = "core.plugins"
     case maintenance = "core.maintenance"
@@ -37,7 +40,10 @@ enum SettingsCoreRoute: String, CaseIterable, Codable {
         switch self {
         case .inputMethod: return "输入法"
         case .appearance: return "外观"
-        case .buffer: return "窗口"
+        case .buffer: return "Buffer"
+        case .clipboard: return "Clipboard"
+        case .mailbox: return "Mailbox"
+        case .capsule: return "Capsule"
         case .connectors: return "连接器"
         case .plugins: return "插件"
         case .maintenance: return "维护"
@@ -49,6 +55,9 @@ enum SettingsCoreRoute: String, CaseIterable, Codable {
         case .inputMethod: return "keyboard"
         case .appearance: return "paintpalette"
         case .buffer: return "square.grid.2x2"
+        case .clipboard: return "clipboard"
+        case .mailbox: return "tray.full"
+        case .capsule: return "archivebox"
         case .connectors: return "link"
         case .plugins: return "puzzlepiece.extension"
         case .maintenance: return "wrench.and.screwdriver"
@@ -84,11 +93,13 @@ enum CoreSettingsSubpages {
         case .appearance:
             values = [("theme", "主题"), ("size", "尺寸")]
         case .buffer:
-            values = [
-                ("buffer", "Buffer"),
-                ("clip", "Clip"),
-                ("mailbox", "Mailbox"),
-            ]
+            values = [("buffer", "Buffer")]
+        case .clipboard:
+            values = [("clipboard", "Clipboard History")]
+        case .mailbox:
+            values = [("mailbox", "Mailbox")]
+        case .capsule:
+            values = [("capsule", "Capsule")]
         case .connectors:
             values = [
                 ("ai-model", "AI 模型"),
@@ -463,7 +474,17 @@ func runSettingsRoutingSmokeTest() -> Bool {
 
         guard catalog.coreRoutes.map(\.id) == SettingsCoreRoute.allCases.map(\.id),
               catalog.coreRoutes.map(\.title)
-                == ["输入法", "外观", "窗口", "连接器", "插件", "维护"],
+                == [
+                    "输入法",
+                    "外观",
+                    "Buffer",
+                    "Clipboard",
+                    "Mailbox",
+                    "Capsule",
+                    "连接器",
+                    "插件",
+                    "维护",
+                ],
               catalog.extensionRoutes.map(\.id.rawValue)
                 == ["extension.statistics", "extension.feiyao-learning"],
               catalog.sections.map(\.id) == [.core, .extensions],
@@ -490,8 +511,18 @@ func runSettingsRoutingSmokeTest() -> Bool {
               catalog.route(for: SettingsCoreRoute.buffer.id)?.subpages.map(\.id)
                 == [
                     SettingsSubpageID(rawValue: "buffer"),
-                    SettingsSubpageID(rawValue: "clip"),
+                ],
+              catalog.route(for: SettingsCoreRoute.clipboard.id)?.subpages.map(\.id)
+                == [
+                    SettingsSubpageID(rawValue: "clipboard"),
+                ],
+              catalog.route(for: SettingsCoreRoute.mailbox.id)?.subpages.map(\.id)
+                == [
                     SettingsSubpageID(rawValue: "mailbox"),
+                ],
+              catalog.route(for: SettingsCoreRoute.capsule.id)?.subpages.map(\.id)
+                == [
+                    SettingsSubpageID(rawValue: "capsule"),
                 ],
               catalog.route(for: SettingsCoreRoute.connectors.id)?.subpages.map(\.id)
                 == [

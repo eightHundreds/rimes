@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,10 +16,16 @@ import {
   type PluginRecord,
 } from "../src/design-system/data";
 import {
+  themeCSSVariables,
+  themeFamilies,
+  themes,
+} from "../src/design-system/tokens";
+import {
   BufferSurface,
   bufferInputContextKey,
 } from "../src/surfaces/BufferSurface";
 import { CandidateSurface } from "../src/surfaces/CandidateSurface";
+import { ClipboardSurface } from "../src/surfaces/ClipboardSurface";
 import { ExtensionsSurface } from "../src/surfaces/ExtensionsSurface";
 import { SettingsSurface } from "../src/surfaces/SettingsSurface";
 
@@ -79,6 +86,33 @@ function BufferSettingsHarness() {
   );
 }
 
+function ClipboardSettingsHarness() {
+  const [plugins, setPlugins] = useState<PluginRecord[]>(
+    () => initialPlugins.map((plugin) => ({ ...plugin })),
+  );
+  return (
+    <SettingsSurface
+      initialRouteID="core.clipboard"
+      plugins={plugins}
+      setPlugins={setPlugins}
+    />
+  );
+}
+
+function ThemeSettingsHarness({ onThemeChange }: { onThemeChange?: (theme: keyof typeof themes) => void }) {
+  const [plugins, setPlugins] = useState<PluginRecord[]>(
+    () => initialPlugins.map((plugin) => ({ ...plugin })),
+  );
+  return (
+    <SettingsSurface
+      initialRouteID="core.appearance"
+      onThemeChange={onThemeChange}
+      plugins={plugins}
+      setPlugins={setPlugins}
+    />
+  );
+}
+
 function ConnectorSettingsHarness() {
   const [plugins, setPlugins] = useState<PluginRecord[]>(
     () => initialPlugins.map((plugin) => ({ ...plugin })),
@@ -103,6 +137,12 @@ function InputMethodSettingsHarness() {
       setPlugins={setPlugins}
     />
   );
+}
+
+function openBufferToolbar() {
+  const trigger = screen.getByRole("button", { name: /Buffer 工具栏/ });
+  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
+  return screen.getByRole("toolbar", { name: "Buffer 工具栏" });
 }
 
 function ChordSettingsHarness() {
@@ -234,7 +274,8 @@ describe("Current Buffer plugin catalog", () => {
         defaultSourceText="source"
       />,
     );
-    const modeSelect = screen.getByRole("combobox", { name: "工作台插件" });
+    const popover = openBufferToolbar();
+    const modeSelect = within(popover).getByRole("combobox", { name: "工作台插件" });
     expect(within(modeSelect).getAllByRole("option").map((option) => option.textContent)).toEqual([
       "Default",
       "AI 生成",
@@ -244,23 +285,174 @@ describe("Current Buffer plugin catalog", () => {
   });
 });
 
+describe("Theme architecture", () => {
+  it("keeps the three existing colorways under Classic and adds a complete Rasta theme", () => {
+    expect(themeFamilies.classic.colorways).toEqual(["night", "day", "quiet"]);
+    expect(themeFamilies.rasta.colorways).toEqual(["rasta"]);
+    expect(Object.keys(themes)).toEqual(["night", "day", "quiet", "rasta"]);
+    expect(Object.keys(themes.rasta)).toEqual(Object.keys(themes.night));
+
+    const variables = themeCSSVariables(themes.rasta) as Record<string, string>;
+    expect([
+      variables["--r-brand-red"],
+      variables["--r-brand-yellow"],
+      variables["--r-brand-green"],
+    ]).toEqual(["#E95043", "#F2C94C", "#39C96B"]);
+  });
+
+  it("presents themes as families and applies the Rasta colorway", () => {
+    const onThemeChange = vi.fn();
+    const view = render(<ThemeSettingsHarness onThemeChange={onThemeChange} />);
+
+    expect(screen.getByText("经典")).toBeTruthy();
+    expect(view.container.querySelectorAll(".theme-family")).toHaveLength(2);
+    expect(view.container.querySelectorAll(".theme-choice")).toHaveLength(4);
+    const rasta = screen.getByRole("button", { name: /^拉斯塔/ });
+    expect(rasta.querySelectorAll(".theme-choice__palette i")).toHaveLength(3);
+    fireEvent.click(rasta);
+    expect(onThemeChange).toHaveBeenCalledWith("rasta");
+    expect(rasta.getAttribute("aria-pressed")).toBe("true");
+  });
+});
+
 describe("Buffer settings mirror", () => {
-  it("defaults terminal delivery close on and clipboard history off", () => {
+  it("keeps Buffer settings independent from Clipboard History", () => {
     render(<BufferSettingsHarness />);
 
     const closeAfterDelivery = screen.getByRole("switch", {
       name: "最后一块上屏后关闭工作台",
     });
-    const clipboardHistory = screen.getByRole("switch", {
-      name: "启用剪贴板历史",
-    });
     expect(closeAfterDelivery.getAttribute("aria-checked")).toBe("true");
-    expect(clipboardHistory.getAttribute("aria-checked")).toBe("false");
-
     fireEvent.click(closeAfterDelivery);
-    fireEvent.click(clipboardHistory);
     expect(closeAfterDelivery.getAttribute("aria-checked")).toBe("false");
-    expect(clipboardHistory.getAttribute("aria-checked")).toBe("true");
+    expect(within(screen.getByRole("group", { name: "Buffer子页面" }))
+      .getAllByRole("button").map((button) => button.textContent)).toEqual(["Buffer"]);
+    expect(screen.queryByRole("switch", { name: "收录剪贴板历史" })).toBeNull();
+  });
+});
+
+describe("Clipboard settings mirror", () => {
+  it("presents Clipboard as a standalone, local-only persistent module", () => {
+    render(<ClipboardSettingsHarness />);
+
+    expect(screen.getByText(/Clipboard 与 Buffer、Mailbox、Capsule 同级/)).toBeTruthy();
+    expect(screen.getByText(/⌘⇧P 打开 nonactivating 窗口/)).toBeTruthy();
+    expect(screen.getByText(/后台收录文本、链接、图片、文件与颜色/))
+      .toBeTruthy();
+    expect(screen.getByText(/图片卡片显示异步缩略图和来源 App 图标/))
+      .toBeTruthy();
+
+    const capture = screen.getByRole("switch", { name: "收录剪贴板历史" });
+    expect(capture.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(capture);
+    expect(capture.getAttribute("aria-checked")).toBe("false");
+  });
+});
+
+describe("Standalone Clipboard History", () => {
+  const items = [
+    { id: "one", text: "first note", sourceApplication: "Notes", capturedAt: "NOW" },
+    { id: "two", text: "build command", sourceApplication: "Terminal", capturedAt: "2M" },
+    { id: "three", text: "third link", sourceApplication: "Safari", capturedAt: "8M" },
+  ] as const;
+
+  it("renders image thumbnails and the corresponding source application icon", () => {
+    const imageItems = [{
+      id: "image",
+      text: "screenshot.png",
+      kind: "image" as const,
+      previewImageURL: "/fixtures/screenshot.png",
+      sourceApplication: "RIMES",
+      sourceApplicationIconURL: "/fixtures/rimes-app.png",
+      capturedAt: "NOW",
+    }];
+    render(<ClipboardSurface initialItems={imageItems} showControls={false} />);
+
+    const card = screen.getByRole("option", { name: /图片预览 · screenshot\.png/ });
+    expect(within(card).getByRole("img", { name: "screenshot.png" })
+      .getAttribute("src")).toBe("/fixtures/screenshot.png");
+    expect(card.querySelector(".clipboard-history-card__source img")
+      ?.getAttribute("src")).toBe("/fixtures/rimes-app.png");
+
+    for (const key of "图片") {
+      fireEvent.keyDown(screen.getByRole("region", { name: "Clipboard History" }), { key });
+    }
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  it("searches directly, clears search with Escape, then closes on the next Escape", () => {
+    render(<ClipboardSurface initialItems={items} showControls={false} />);
+    const window = screen.getByRole("region", { name: "Clipboard History" });
+
+    for (const key of "term") fireEvent.keyDown(window, { key });
+    expect(screen.getByRole("search", { name: "搜索剪贴板历史；直接输入" }).textContent)
+      .toContain("term");
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(screen.getByText("build command")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getAllByRole("option")).toHaveLength(3);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("region", { name: "Clipboard History" })).toBeNull();
+    expect(screen.getByRole("button", { name: "重新打开" })).toBeTruthy();
+  });
+
+  it("supports arrows, exact-target insertion, command quick insert, copy, and delete", () => {
+    const onActivate = vi.fn();
+    const onItemsChange = vi.fn();
+    render(
+      <ClipboardSurface
+        initialItems={items}
+        onActivate={onActivate}
+        onItemsChange={onItemsChange}
+        showControls={false}
+      />,
+    );
+    const window = screen.getByRole("region", { name: "Clipboard History" });
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(onActivate).toHaveBeenLastCalledWith(items[1], "target");
+
+    fireEvent.keyDown(window, { key: "c", metaKey: true });
+    expect(onActivate).toHaveBeenLastCalledWith(items[1], "pasteboard");
+
+    fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect(onActivate).toHaveBeenLastCalledWith(items[0], "target");
+
+    fireEvent.keyDown(window, { key: "Delete" });
+    expect(onItemsChange).toHaveBeenLastCalledWith(expect.not.arrayContaining([
+      expect.objectContaining({ id: "one" }),
+    ]));
+  });
+
+  it("scrubs protected content while leaving copy available when only the target is missing", () => {
+    const protectedView = render(
+      <ClipboardSurface
+        initialItems={items}
+        initialProtection="secure-input"
+        showControls={false}
+      />,
+    );
+    expect(screen.getByText("安全输入期间已隐藏历史")).toBeTruthy();
+    expect(screen.queryByText("first note")).toBeNull();
+    protectedView.unmount();
+
+    const onActivate = vi.fn();
+    render(
+      <ClipboardSurface
+        initialItems={items}
+        initialTargetAvailable={false}
+        onActivate={onActivate}
+        showControls={false}
+      />,
+    );
+    const window = screen.getByRole("region", { name: "Clipboard History" });
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(onActivate).not.toHaveBeenCalled();
+    expect(screen.getByText("当前没有可验证的输入目标")).toBeTruthy();
+    fireEvent.keyDown(window, { key: "c", metaKey: true });
+    expect(onActivate).toHaveBeenCalledWith(items[0], "pasteboard");
   });
 });
 
@@ -300,6 +492,125 @@ describe("Connector progressive disclosure", () => {
 });
 
 describe("Buffer generation and delivery", () => {
+  it("starts compact, toggles the restored toolbar from the input icon, and has no right drag strip", () => {
+    const view = render(
+      <BufferSurface mode="normal" sourceText="source" />,
+    );
+    const surface = screen.getByRole("region", { name: "缓冲工作台" });
+    expect(surface.getAttribute("data-base-height")).toBe("44");
+    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
+    expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
+    expect(screen.queryByRole("separator", { name: "拖动 Buffer 窗口" })).toBeNull();
+    expect(view.container.querySelector(".buffer-track__role")).toBeNull();
+
+    const trigger = screen.getByRole("button", { name: "展开 Buffer 工具栏" });
+    fireEvent.click(trigger);
+    const toolbar = screen.getByRole("toolbar", { name: "Buffer 工具栏" });
+    expect(toolbar.getAttribute("data-native-window-drag-region")).toBe("true");
+    expect(surface.getAttribute("data-base-height")).toBe("78");
+    fireEvent.click(screen.getByRole("button", { name: "收起 Buffer 工具栏" }));
+    expect(screen.queryByRole("toolbar", { name: "Buffer 工具栏" })).toBeNull();
+    expect(surface.getAttribute("data-base-height")).toBe("44");
+
+    view.rerender(
+      <BufferSurface
+        mode="stream"
+        phase="ready"
+        sourceText="ni hao"
+        targets={["你好", "你好呀"]}
+      />,
+    );
+    expect(surface.getAttribute("data-base-height")).toBe("78");
+    expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
+    expect(view.container.querySelector(".buffer-track--target .buffer-track__role")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "展开 Buffer 工具栏" }));
+    expect(surface.getAttribute("data-base-height")).toBe("112");
+  });
+
+  it("opens plugin selection and each plugin configuration from the input icon", () => {
+    const onConfigurationChange = vi.fn();
+    const onOpenPluginSettings = vi.fn();
+    const view = render(
+      <BufferSurface
+        defaultMode="normal"
+        defaultSourceText="source"
+        onOpenPluginSettings={onOpenPluginSettings}
+        onPluginConfigurationChange={onConfigurationChange}
+      />,
+    );
+    const popover = openBufferToolbar();
+    const modeSelect = within(popover).getByRole("combobox", { name: "工作台插件" });
+
+    fireEvent.change(modeSelect, { target: { value: "ai" } });
+    expect(screen.getByRole("region", { name: "缓冲工作台" }).getAttribute("data-mode"))
+      .toBe("ai");
+    fireEvent.change(within(popover).getByRole("combobox", { name: "AI 生成连接器" }), {
+      target: { value: "claude" },
+    });
+    expect(onConfigurationChange).toHaveBeenLastCalledWith({
+      mode: "ai",
+      connector: "claude",
+    });
+    fireEvent.click(within(popover).getByRole("button", { name: "在设置中打开完整配置" }));
+    expect(onOpenPluginSettings).toHaveBeenCalledWith("builtin.ai-text");
+
+    fireEvent.change(modeSelect, { target: { value: "translation" } });
+    fireEvent.change(within(popover).getByRole("combobox", { name: "翻译通道" }), {
+      target: { value: "ai" },
+    });
+    expect(onConfigurationChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      mode: "translation",
+      provider: "ai",
+    }));
+
+    fireEvent.change(modeSelect, { target: { value: "stream" } });
+    fireEvent.change(within(popover).getByRole("combobox", { name: "意识流候选数量" }), {
+      target: { value: "3" },
+    });
+    fireEvent.change(within(popover).getByRole("combobox", { name: "意识流响应节奏" }), {
+      target: { value: "fast" },
+    });
+    expect(onConfigurationChange).toHaveBeenLastCalledWith({
+      mode: "stream",
+      candidateCount: 3,
+      latency: "fast",
+    });
+    expect(view.container.querySelectorAll(".buffer-input-control__trigger")).toHaveLength(1);
+  });
+
+  it("copies the selected generated result locally and closes Buffer", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      const onClose = vi.fn();
+      render(
+        <BufferSurface
+          defaultMode="ai"
+          defaultPhase="ready"
+          defaultSourceText="source must stay local"
+          defaultTargets={["first generated result", "selected generated result"]}
+          onClose={onClose}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "下一条候选" }));
+      fireEvent.click(screen.getByRole("button", { name: "复制当前结果并关闭 Buffer" }));
+
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("selected generated result"));
+      expect(writeText).not.toHaveBeenCalledWith("source must stay local");
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+    }
+  });
+
   it("removes the empty-source hint while every Buffer input mode is focused", () => {
     for (const mode of ["normal", "ai", "translation", "stream"] as const) {
       const view = render(
@@ -326,7 +637,8 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
-    expect(view.container.querySelector(".buffer-toolbar__status")).toBeNull();
+    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
+    expect(view.container.querySelector(".buffer-track__status")).toBeNull();
     const sendButton = screen.getByRole("button", { name: "发送" });
     expect(sendButton.classList.contains("buffer-workbench__primary-action")).toBe(true);
     expect(sendButton.textContent).toBe("");
@@ -341,7 +653,7 @@ describe("Buffer generation and delivery", () => {
         phase="loading"
       />,
     );
-    const status = view.container.querySelector(".buffer-toolbar__status");
+    const status = view.container.querySelector(".buffer-track__status");
     expect(status?.textContent).toBe("正在发送");
     const busyButton = screen.getByRole("button", { name: "发送中…" });
     expect(busyButton.textContent).toBe("");
@@ -360,7 +672,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
-    expect(view.container.querySelector(".buffer-toolbar__status")).toBeNull();
+    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
     expect(view.container.querySelector(".buffer-track__loading")?.textContent)
       .toBe("插件正在生成");
 
@@ -372,7 +684,7 @@ describe("Buffer generation and delivery", () => {
         translationProvider="ai"
       />,
     );
-    expect(view.container.querySelector(".buffer-toolbar__status")).toBeNull();
+    expect(view.container.querySelector(".buffer-toolbar")).toBeNull();
     expect(view.container.querySelector(".buffer-track__loading")?.textContent)
       .toBe("正在通过 AI 通道翻译");
 
@@ -385,7 +697,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
     expect(view.container.querySelector(".buffer-track__loading")).toBeNull();
-    expect(view.container.querySelector(".buffer-toolbar__status")?.textContent)
+    expect(view.container.querySelector(".buffer-track__status")?.textContent)
       .toBe("正在通过 AI 通道翻译");
   });
 
@@ -646,6 +958,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
+    openBufferToolbar();
     fireEvent.click(screen.getByRole("button", { name: "交换源语言和目标语言" }));
     expect(onLanguageChange).toHaveBeenCalledWith("zh-Hans", "en");
     expect((screen.getByRole("combobox", { name: "源语言" }) as HTMLSelectElement).value)
@@ -728,6 +1041,7 @@ describe("Buffer generation and delivery", () => {
     }
 
     render(<RetryFailureHarness />);
+    openBufferToolbar();
     fireEvent.click(screen.getByRole("button", { name: "重新生成" }));
     expect(screen.getAllByText("处理失败")).toHaveLength(1);
     expect(screen.getByText(
@@ -880,6 +1194,7 @@ describe("Buffer generation and delivery", () => {
         targets={["prior result"]}
       />,
     );
+    openBufferToolbar();
     fireEvent.click(screen.getByRole("button", { name: "重新生成" }));
     const retryRequest = onGenerate.mock.calls[1]?.[2];
     expect(retryRequest.requestID).not.toBe(firstRequest.requestID);
@@ -1030,6 +1345,7 @@ describe("Buffer generation and delivery", () => {
       />,
     );
 
+    openBufferToolbar();
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect((screen.getByRole("combobox", { name: "工作台插件" }) as HTMLSelectElement).disabled)
       .toBe(true);
@@ -1093,16 +1409,19 @@ describe("Buffer generation and delivery", () => {
 });
 
 describe("External source inbox", () => {
-  it("keeps exactly three menu destinations and supports inbox review", async () => {
+  it("keeps the four peer modules at the menu root and supports inbox review", async () => {
     render(<PluginHarness />);
     const menu = screen.getByRole("menu", { name: "RIMES 输入法菜单" });
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "设置…",
-      "外部来源收件箱…2",
+      "Buffer…⌘⇧B",
+      "Clipboard History…⌘⇧P",
+      "Mailbox…2 · ⌘⇧M",
+      "Capsule…⌘⇧C",
       "维护…",
     ]);
 
-    fireEvent.click(within(menu).getByRole("menuitem", { name: /外部来源收件箱/ }));
+    fireEvent.click(within(menu).getByRole("menuitem", { name: /打开 Mailbox/ }));
     const dialog = screen.getByRole("dialog", { name: "外部来源收件箱" });
     expect(within(dialog).getByText("2 项待审")).toBeTruthy();
 
@@ -1167,6 +1486,12 @@ describe("External source inbox", () => {
 });
 
 describe("Design lab configuration integration", () => {
+  const openBufferSurface = () => {
+    fireEvent.click(within(screen.getByRole("navigation", {
+      name: "设计场景",
+    })).getByRole("button", { name: /^Buffer/ }));
+  };
+
   it("carries saved translation settings into the Buffer surface", () => {
     window.history.replaceState(null, "", "/?surface=extensions&theme=night");
     render(<App />);
@@ -1183,8 +1508,9 @@ describe("Design lab configuration integration", () => {
       name: "关闭插件设置",
     }));
 
-    fireEvent.click(screen.getByRole("button", { name: /^Buffer/ }));
-    fireEvent.change(screen.getByRole("combobox", { name: "工作台插件" }), {
+    openBufferSurface();
+    const popover = openBufferToolbar();
+    fireEvent.change(within(popover).getByRole("combobox", { name: "工作台插件" }), {
       target: { value: "translation" },
     });
 
@@ -1199,12 +1525,12 @@ describe("Design lab configuration integration", () => {
     window.history.replaceState(null, "", "/?surface=extensions&theme=night");
     render(<App />);
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /外部来源收件箱/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /打开 Mailbox/ }));
     const dialog = screen.getByRole("dialog", { name: "外部来源收件箱" });
     fireEvent.click(within(dialog).getByRole("button", {
       name: "接受 本地配对来源 内容并加入 Buffer",
     }));
-    fireEvent.click(screen.getByRole("button", { name: /^Buffer/ }));
+    openBufferSurface();
     const firstDraft = (screen.getByRole("textbox", { name: "缓冲正文" }) as HTMLInputElement).value;
     expect(firstDraft).toContain("请把这段缓冲内容整理为一段清晰的产品说明。");
     expect(firstDraft).toContain("[本地配对来源] 把这段配对传入的文字加入 Buffer");
@@ -1217,7 +1543,7 @@ describe("Design lab configuration integration", () => {
     fireEvent.click(within(persistentDialog).getByRole("button", {
       name: "接受 配对设备 · iPhone 内容并加入 Buffer",
     }));
-    fireEvent.click(screen.getByRole("button", { name: /^Buffer/ }));
+    openBufferSurface();
     const secondDraft = (screen.getByRole("textbox", { name: "缓冲正文" }) as HTMLInputElement).value;
     expect(secondDraft).toContain("[本地配对来源]");
     expect(secondDraft).toContain("[配对设备 · iPhone]");
@@ -1228,8 +1554,9 @@ describe("Design lab configuration integration", () => {
     render(<App />);
     const editor = screen.getByRole("textbox", { name: "缓冲正文" });
     fireEvent.change(editor, { target: { value: "保留这段草稿" } });
+    openBufferToolbar();
     fireEvent.click(screen.getByRole("button", { name: "关闭并暂停缓冲（保留内容）" }));
-    fireEvent.click(screen.getByRole("button", { name: /^Buffer/ }));
+    openBufferSurface();
     expect((screen.getByRole("textbox", { name: "缓冲正文" }) as HTMLInputElement).value)
       .toBe("保留这段草稿");
   });

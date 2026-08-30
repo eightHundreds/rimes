@@ -23,36 +23,21 @@ enum AITextGenerationMode: String, CaseIterable, Codable, Equatable {
 }
 
 /// Legacy compact-selector values retained for preference migration and source
-/// compatibility. New code must keep destination and content format separate:
-/// Mailbox is a destination, not a fourth document format.
-enum AITextGenerationOutput: String, CaseIterable, Codable, Equatable {
+/// compatibility. Mailbox is no longer an AI Generation destination; reading
+/// the retired value preserves the current format and migrates generation back
+/// to the inline workspace.
+enum AITextGenerationOutput: String, Codable, Equatable {
     case plain
     case markdown
     case json
     case mailbox
-
-    var displayName: String {
-        switch self {
-        case .plain: return "Plain"
-        case .markdown: return "Markdown"
-        case .json: return "JSON"
-        case .mailbox: return "Mailbox"
-        }
-    }
-
-    var isMailbox: Bool { self == .mailbox }
 }
 
-enum AITextGenerationDestination: String, CaseIterable, Codable, Equatable {
+/// Retained only to decode and canonicalize the retired v2 destination key.
+/// Runtime generation always resolves to `.inline`.
+enum AITextGenerationDestination: String, Codable, Equatable {
     case inline
     case mailbox
-
-    var displayName: String {
-        switch self {
-        case .inline: return "原地"
-        case .mailbox: return "Mailbox"
-        }
-    }
 }
 
 enum AITextContentFormat: String, CaseIterable, Codable, Equatable {
@@ -102,12 +87,16 @@ struct AITextGenerationSelection: Equatable {
         self.connectorKind = connectorKind
         self.modelID = modelID
         self.mode = mode
-        self.destination = destination
+        // Keep the parameter for source compatibility with saved v2 callers,
+        // but never let it recreate the retired Buffer -> Mailbox route.
+        _ = destination
+        self.destination = .inline
         self.format = format
     }
 
-    /// Source-compatible bridge for callers and persisted values created
-    /// before Mailbox gained independent Plain/Markdown/JSON support.
+    /// Source-compatible bridge for callers and persisted values created before
+    /// Mailbox became an independent conversation window. The retired Mailbox
+    /// output now means inline Plain rather than reviving the old routing path.
     init(connectorKind: AITextProviderKind,
          modelID: String?,
          mode: AITextGenerationMode,
@@ -116,13 +105,13 @@ struct AITextGenerationSelection: Equatable {
             connectorKind: connectorKind,
             modelID: modelID,
             mode: mode,
-            destination: output.isMailbox ? .mailbox : .inline,
+            destination: .inline,
             format: AITextContentFormat(legacyOutput: output)
         )
     }
 
     var output: AITextGenerationOutput {
-        destination == .mailbox ? .mailbox : format.legacyInlineOutput
+        format.legacyInlineOutput
     }
 }
 
@@ -345,6 +334,7 @@ final class AITextGenerationPreferenceStore {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        migrateRetiredMailboxPreference()
     }
 
     var mode: AITextGenerationMode {
@@ -361,12 +351,12 @@ final class AITextGenerationPreferenceStore {
 
     var output: AITextGenerationOutput {
         get {
-            destination == .mailbox ? .mailbox : format.legacyInlineOutput
+            format.legacyInlineOutput
         }
         set {
             switch newValue {
             case .mailbox:
-                set(destination: .mailbox, format: format)
+                set(destination: .inline, format: format)
             case .plain, .markdown, .json:
                 set(
                     destination: .inline,
@@ -377,13 +367,7 @@ final class AITextGenerationPreferenceStore {
     }
 
     var destination: AITextGenerationDestination {
-        if let raw = defaults.string(forKey: Key.destination),
-           let value = AITextGenerationDestination(rawValue: raw) {
-            return value
-        }
-        return defaults.string(forKey: Key.output) == AITextGenerationOutput.mailbox.rawValue
-            ? .mailbox
-            : .inline
+        .inline
     }
 
     var format: AITextContentFormat {
@@ -398,20 +382,48 @@ final class AITextGenerationPreferenceStore {
 
     func set(destination: AITextGenerationDestination,
              format: AITextContentFormat) {
-        guard destination != self.destination || format != self.format else {
+        let storedDestination = defaults.string(forKey: Key.destination)
+        let storedFormat = defaults.string(forKey: Key.format)
+        let storedOutput = defaults.string(forKey: Key.output)
+        guard storedDestination != AITextGenerationDestination.inline.rawValue
+                || storedFormat != format.rawValue
+                || storedOutput != format.legacyInlineOutput.rawValue else {
             return
         }
-        defaults.set(destination.rawValue, forKey: Key.destination)
+        // `destination` remains in the signature as a source-compatible bridge
+        // for callers compiled against v2. Every value, including the retired
+        // Mailbox case, is now normalized to the inline workspace.
+        _ = destination
+        defaults.set(AITextGenerationDestination.inline.rawValue,
+                     forKey: Key.destination)
         defaults.set(format.rawValue, forKey: Key.format)
-        // Keep the v1 value coherent so older binaries have a safe downgrade:
-        // Mailbox remains Mailbox, while inline retains its selected format.
-        defaults.set(
-            destination == .mailbox
-                ? AITextGenerationOutput.mailbox.rawValue
-                : format.legacyInlineOutput.rawValue,
-            forKey: Key.output
-        )
+        defaults.set(format.legacyInlineOutput.rawValue, forKey: Key.output)
         notifyChange()
+    }
+
+    /// Canonicalize retired destination preferences without posting a change
+    /// notification during startup. Only a syntactically valid v2 format that
+    /// accompanied the retired v2 Mailbox destination is preserved. A legacy,
+    /// missing, or corrupt combination fails closed to inline Plain instead of
+    /// letting an unrelated v1 value reinterpret the retired destination.
+    private func migrateRetiredMailboxPreference() {
+        let storedDestination = defaults.string(forKey: Key.destination)
+        let storedOutput = defaults.string(forKey: Key.output)
+        let retiredV2Mailbox = storedDestination
+            == AITextGenerationDestination.mailbox.rawValue
+        guard retiredV2Mailbox
+                || storedOutput == AITextGenerationOutput.mailbox.rawValue else {
+            return
+        }
+        let preservedFormat: AITextContentFormat = retiredV2Mailbox
+            ? defaults.string(forKey: Key.format)
+                .flatMap(AITextContentFormat.init(rawValue:)) ?? .plain
+            : .plain
+        defaults.set(AITextGenerationDestination.inline.rawValue,
+                     forKey: Key.destination)
+        defaults.set(preservedFormat.rawValue, forKey: Key.format)
+        defaults.set(preservedFormat.legacyInlineOutput.rawValue,
+                     forKey: Key.output)
     }
 
     func modelID(for connectorKind: AITextProviderKind) -> String? {

@@ -1,72 +1,147 @@
 import Cocoa
+import Carbon.HIToolbox
 
-/// Geometry shared with the React `ClipboardSurface`. Keeping the rail values
-/// explicit makes later workbench integration independent from AppKit's
-/// control-size defaults.
-enum ClipboardRailMetrics {
-    static let railHeight: CGFloat = 40
-    static let railInset: CGFloat = 5
-    static let cardHeight: CGFloat = 20
-    static let cardSpacing: CGFloat = 3
-    static let cardHorizontalInset: CGFloat = 4
-    static let cardCornerRadius: CGFloat = 5
-    static let maximumCardWidth: CGFloat = 220
-    static let previewCharacterLimit = 160
+/// Geometry for the standalone, bottom-anchored Clipboard History timeline.
+enum ClipboardHistoryWindowMetrics {
+    static let preferredWidth: CGFloat = 940
+    static let preferredHeight: CGFloat = 224
+    static let minimumWidth: CGFloat = 620
+    static let horizontalInset: CGFloat = 14
+    static let verticalInset: CGFloat = 12
+    static let cardWidth: CGFloat = 206
+    static let cardHeight: CGFloat = 126
+    static let cardSpacing: CGFloat = 8
+    static let cornerRadius: CGFloat = 14
+    static let previewCharacterLimit = 280
     static let accessibilityCharacterLimit = 512
+    static let previewMaximumPixelSize = 512
+    /// Keep the AppKit hierarchy bounded even when the durable store contains
+    /// thousands of historical entries. Search still evaluates every loaded
+    /// metadata row before this presentation cap is applied.
+    static let maximumRenderedCards = 200
 }
 
-/// Small deterministic projection used by the standalone Clipboard smoke.
-/// It intentionally contains geometry and state only, never clipboard text.
-struct ClipboardRailViewSnapshot: Equatable {
-    let railHeight: CGFloat
+enum ClipboardHistorySearchRules {
+    static func filter(_ items: [ClipboardHistoryItem], query: String)
+        -> [ClipboardHistoryItem] {
+        let terms = query.split(whereSeparator: \Character.isWhitespace).map(String.init)
+        guard !terms.isEmpty else { return items }
+        return items.filter { item in
+            terms.allSatisfy { term in
+                (item.searchText ?? item.canonicalText ?? item.displayText ?? "")
+                    .localizedCaseInsensitiveContains(term)
+                    || (item.sourceApplicationName?
+                        .localizedCaseInsensitiveContains(term) ?? false)
+                    || (item.sourceApplicationBundleIdentifier?
+                        .localizedCaseInsensitiveContains(term) ?? false)
+                    || item.kind.rawValue.localizedCaseInsensitiveContains(term)
+                    || item.kind.searchAliases.localizedCaseInsensitiveContains(term)
+            }
+        }
+    }
+}
+
+enum ClipboardHistoryScrollRules {
+    static func horizontalDelta(
+        deltaX: CGFloat,
+        deltaY: CGFloat,
+        precise: Bool,
+        shiftHeld: Bool
+    ) -> CGFloat {
+        let raw = abs(deltaX) > 0.01 ? deltaX : deltaY
+        guard abs(raw) > 0.01 else { return 0 }
+        let scale: CGFloat
+        if shiftHeld {
+            scale = precise ? 2.5 : 48
+        } else if abs(deltaX) > 0.01 {
+            scale = 1
+        } else {
+            scale = precise ? 1.35 : 32
+        }
+        let scaled = raw * scale
+        let maximumStep: CGFloat = precise ? 180 : 240
+        return min(maximumStep, max(-maximumStep, scaled))
+    }
+}
+
+struct ClipboardHistoryPaneSnapshot: Equatable {
     let cardCount: Int
-    let cardHeight: CGFloat
-    let widestCardWidth: CGFloat
+    let selectedCardCount: Int
+    let renderedThumbnailCount: Int
     let selectedCardBorderWidth: CGFloat?
-    let isActive: Bool
-    let isProtected: Bool
+    let queryCharacterCount: Int
     let stateIsVisible: Bool
+    let contentIsProtected: Bool
+    let cardWidth: CGFloat
+    let cardHeight: CGFloat
 }
 
-/// Compact, keyboard-addressable native counterpart of React's
-/// `ClipboardSurface` rail. This view only asks the model for its already
-/// privacy-gated projection and never reads or writes NSPasteboard itself.
+/// Paste-inspired visual timeline. Its owner never becomes key, so search is a
+/// logical query fed by the active IMK controller. This view never touches the
+/// pasteboard or an IMK client.
 @MainActor
-final class ClipboardRailView: NSView {
-    /// Return `true` only after the item was accepted by Buffer. Failed or
-    /// missing callbacks leave history order unchanged.
-    var onAddToBuffer: ((ClipboardHistoryItem) -> Bool)?
+final class ClipboardHistoryPaneView: NSView {
+    var onActivate: (([ClipboardHistoryItem]) -> Bool)?
+    var onCopy: (([ClipboardHistoryItem]) -> Bool)?
+    var onClose: (() -> Void)?
 
     private let model: ClipboardHistoryModel
-    private let scrollView = ClipboardHorizontalScrollView()
-    private let cardDocumentView = ClipboardCardDocumentView()
+    private let titleLabel = NSTextField(labelWithString: "Clipboard History")
+    private let countLabel = NSTextField(labelWithString: "")
+    private let searchShell = NSView()
+    private let searchIcon = NSImageView()
+    private let searchLabel = NSTextField(labelWithString: "")
+    private let clearButton = ClipboardFirstMouseButton(title: "清空", target: nil, action: nil)
+    private let closeButton = ClipboardFirstMouseButton(title: "", target: nil, action: nil)
+    private let scrollView = ClipboardHistoryHorizontalScrollView()
+    private let cardDocumentView = ClipboardHistoryCardDocumentView()
     private let stateContainer = NSView()
     private let stateIcon = NSImageView()
     private let stateLabel = NSTextField(labelWithString: "")
-    private var cardButtons: [UUID: ClipboardCardButton] = [:]
+    private let hintLabel = NSTextField(labelWithString: "")
+    private var cardButtons: [UUID: ClipboardHistoryCardButton] = [:]
     private var modelObserver: UUID?
     private var appearanceObserver: NSObjectProtocol?
-
-    private(set) var isRailActive = false
+    private var viewportObserver: NSObjectProtocol?
+    private var clearConfirmationGeneration: UInt64 = 0
+    private var clearConfirmationArmed = false
+    private var selectionAnchorID: UUID?
+    private var visibleItemByID: [UUID: ClipboardHistoryItem] = [:]
+    private let thumbnailCache: NSCache<NSUUID, NSImage> = {
+        let cache = NSCache<NSUUID, NSImage>()
+        cache.countLimit = 96
+        cache.totalCostLimit = 48 * 1_024 * 1_024
+        return cache
+    }()
+    private let sourceIconCache = NSCache<NSString, NSImage>()
+    private lazy var fallbackSourceIcon = RimeUI.symbol(
+        "app.fill",
+        pointSize: 14,
+        weight: .regular
+    )
+    private var requestedThumbnailIDs = Set<UUID>()
+    private var requestedSourceIconBundleIDs = Set<String>()
+    private var assetGeneration: UInt64 = 0
+    private(set) var query = ""
+    private(set) var composingText = ""
 
     init(model: ClipboardHistoryModel) {
         self.model = model
         super.init(frame: NSRect(
             x: 0,
             y: 0,
-            width: 320,
-            height: ClipboardRailMetrics.railHeight
+            width: ClipboardHistoryWindowMetrics.preferredWidth,
+            height: ClipboardHistoryWindowMetrics.preferredHeight
         ))
         configureView()
-        modelObserver = model.addObserver { [weak self] in
-            self?.reloadFromModel()
-        }
+        modelObserver = model.addObserver { [weak self] in self?.reloadFromModel() }
         appearanceObserver = NotificationCenter.default.addObserver(
             forName: .rimeAppearanceDidChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.applyAppearance()
                 self?.reloadFromModel()
             }
         }
@@ -76,189 +151,313 @@ final class ClipboardRailView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     deinit {
-        if let modelObserver {
-            let observedModel = model
-            Task { @MainActor in
-                observedModel.removeObserver(modelObserver)
-            }
-        }
         if let appearanceObserver {
             NotificationCenter.default.removeObserver(appearanceObserver)
         }
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: ClipboardRailMetrics.railHeight)
-    }
-
-    override var acceptsFirstResponder: Bool {
-        model.isStarted
-            && model.captureState.workbenchVisible
-            && model.captureState.railEnabled
-            && !model.isContentShielded
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func layout() {
-        super.layout()
-        let inset = ClipboardRailMetrics.railInset
-        let cardY = floor((bounds.height - ClipboardRailMetrics.cardHeight) / 2)
-        scrollView.frame = NSRect(
-            x: inset,
-            y: cardY,
-            width: max(0, bounds.width - inset * 2),
-            height: ClipboardRailMetrics.cardHeight
-        )
-        stateContainer.frame = bounds.insetBy(dx: inset, dy: inset)
-        cardDocumentView.layoutCards(viewportWidth: scrollView.contentSize.width)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard acceptsFirstResponder else {
-            super.mouseDown(with: event)
-            return
-        }
-        _ = window?.makeFirstResponder(self)
-        setActive(true)
-    }
-
-    override func keyDown(with event: NSEvent) {
-        guard !handleKeyEvent(event) else { return }
-        super.keyDown(with: event)
-    }
-
-    /// The workbench may route keys here even when its nonactivating panel
-    /// cannot become key. Returns whether the event belongs to the rail.
-    @discardableResult
-    func handleKeyEvent(_ event: NSEvent) -> Bool {
-        guard acceptsFirstResponder else { return false }
-        let disallowed: NSEvent.ModifierFlags = [.command, .control, .option]
-        guard event.modifierFlags.intersection(disallowed).isEmpty else { return false }
-
-        switch event.keyCode {
-        case 123: // left arrow
-            setActive(true)
-            _ = model.moveSelection(delta: -1)
-            scrollSelectedIntoView()
-            return true
-        case 124: // right arrow
-            setActive(true)
-            _ = model.moveSelection(delta: 1)
-            scrollSelectedIntoView()
-            return true
-        case 36, 76: // Return / keypad Enter
-            _ = activateSelectedItem()
-            return true
-        case 51, 117: // Backspace / forward Delete
-            _ = deleteSelectedItem()
-            return true
-        default:
-            return false
+        if let viewportObserver {
+            NotificationCenter.default.removeObserver(viewportObserver)
         }
     }
 
-    /// Visual keyboard ownership is separate from capture eligibility. The
-    /// protected and disabled states always win over the requested active state.
-    func setActive(_ active: Bool) {
-        guard isRailActive != active else { return }
-        isRailActive = active
+    override var isFlipped: Bool { true }
+
+    func resetSearch() {
+        selectionAnchorID = model.selectedID
+        guard !query.isEmpty || !composingText.isEmpty else { return }
+        query = ""
+        composingText = ""
         reloadFromModel()
     }
 
-    /// Convenience forwarding API for the future Buffer workbench owner.
-    func start() {
-        model.start()
+    func scrubForProtection() {
+        query = ""
+        composingText = ""
+        selectionAnchorID = nil
+        clearThumbnailState()
+        removeAllCards()
+        reloadFromModel()
     }
 
-    func stop() {
-        model.stop()
-    }
-
-    func update(workbenchVisible: Bool,
-                railEnabled: Bool,
-                protection: ClipboardHistoryProtection) {
-        model.update(
-            workbenchVisible: workbenchVisible,
-            railEnabled: railEnabled,
-            protection: protection
-        )
-    }
-
+    /// Commits text produced by the existing Rime session into the logical
+    /// search field. Physical alphabet keys never append here directly.
     @discardableResult
-    func activateSelectedItem() -> Bool {
-        guard acceptsFirstResponder,
-              let item = model.selectedItem,
-              let onAddToBuffer,
-              onAddToBuffer(item) else {
-            return false
+    func appendSearchText(_ text: String) -> Bool {
+        guard !text.isEmpty,
+              !text.contains("\0"),
+              text.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+                      || CharacterSet.whitespacesAndNewlines.contains($0)
+              }) else { return false }
+        composingText = ""
+        query.append(contentsOf: text)
+        reloadFromModel()
+        return true
+    }
+
+    func updateComposingText(_ text: String) {
+        guard text != composingText else { return }
+        composingText = text
+        reloadFromModel()
+    }
+
+    /// CandidateWindow needs a screen-space caret even though the search box
+    /// is a non-editable logical surface inside a nonactivating panel.
+    func searchCaretRectOnScreen() -> NSRect? {
+        layoutSubtreeIfNeeded()
+        guard let window else { return nil }
+        let rendered = query + composingText
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: searchLabel.font ?? NSFont.systemFont(ofSize: 12),
+        ]
+        let renderedWidth = ceil((rendered as NSString).size(withAttributes: attributes).width)
+        let labelRect = searchLabel.convert(searchLabel.bounds, to: nil)
+        let x = min(labelRect.maxX, labelRect.minX + max(1, renderedWidth))
+        return window.convertToScreen(NSRect(
+            x: x,
+            y: labelRect.minY,
+            width: 1,
+            height: max(1, labelRect.height)
+        ))
+    }
+
+    /// Called before Rime or Buffer sees the event. Returns true only for a
+    /// command owned by the visible Clip surface.
+    @discardableResult
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let intentModifiers = modifiers.intersection([.command, .control, .option, .shift])
+        let commandOnly = intentModifiers == [.command]
+
+        if commandOnly, event.keyCode == UInt16(kVK_ANSI_F) { return true }
+        if commandOnly, event.keyCode == UInt16(kVK_ANSI_C) {
+            _ = copySelectedItems()
+            return true
         }
-        return model.promote(id: item.id)
+        if commandOnly,
+           let index = Self.commandDigitIndex(keyCode: event.keyCode) {
+            _ = activateVisibleItem(at: index)
+            return true
+        }
+
+        let hasCommandLikeModifier = !intentModifiers
+            .intersection([.command, .control, .option]).isEmpty
+        if hasCommandLikeModifier { return false }
+
+        switch event.keyCode {
+        case UInt16(kVK_Escape):
+            if query.isEmpty && composingText.isEmpty { onClose?() } else { resetSearch() }
+            return true
+        case UInt16(kVK_LeftArrow):
+            moveFilteredSelection(
+                delta: -1,
+                extending: intentModifiers == [.shift]
+            )
+            return true
+        case UInt16(kVK_RightArrow):
+            moveFilteredSelection(
+                delta: 1,
+                extending: intentModifiers == [.shift]
+            )
+            return true
+        case UInt16(kVK_UpArrow) where intentModifiers == [.shift]:
+            moveFilteredSelection(delta: -1, extending: true)
+            return true
+        case UInt16(kVK_DownArrow) where intentModifiers == [.shift]:
+            moveFilteredSelection(delta: 1, extending: true)
+            return true
+        case UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter):
+            _ = activateSelectedItems()
+            return true
+        case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete):
+            if model.selectedIDs.count > 1
+                    || (query.isEmpty && composingText.isEmpty) {
+                _ = deleteSelectedItems()
+            } else if !query.isEmpty {
+                query.removeLast()
+                reloadFromModel()
+            } else {
+                composingText = ""
+                reloadFromModel()
+            }
+            return true
+        default:
+            break
+        }
+
+        // Printable input must continue through the current Rime session. Its
+        // committed text returns through `appendSearchText`, which gives this
+        // logical field Chinese composition without focusing an AppKit editor
+        // or leaking raw Pinyin into the host.
+        return false
     }
 
-    /// Entry point for a future shelf Delete button; keyboard deletion routes
-    /// through the same protected-state check in the model.
     @discardableResult
-    func deleteSelectedItem() -> Bool {
-        model.deleteSelected()
+    func activateSelectedItems() -> Bool {
+        let items = selectedFilteredItems
+        guard !items.isEmpty,
+              let onActivate,
+              onActivate(items) else { return false }
+        // The controller promotes only after exact-focus delivery or lossless
+        // pasteboard restoration succeeds. Async activation must not advertise
+        // a recency update before the requested item was actually used.
+        return true
     }
 
-    /// Force a visual refresh after the parent changes workbench chrome or its
-    /// own active-section state.
+    @discardableResult
+    func copySelectedItems() -> Bool {
+        let items = selectedFilteredItems
+        guard !items.isEmpty, let onCopy else { return false }
+        return onCopy(items)
+    }
+
+    @discardableResult
+    func deleteSelectedItems() -> Bool {
+        let items = selectedFilteredItems
+        guard !items.isEmpty else { return false }
+        selectionAnchorID = nil
+        return model.delete(ids: items.map(\.id))
+    }
+
     func reloadFromModel() {
         let protectedContent = model.isContentShielded
-        let captureEnabled = model.isStarted
-            && model.captureState.workbenchVisible
-            && model.captureState.railEnabled
-        let active = isRailActive && captureEnabled && !protectedContent
-
-        applyRailAppearance(active: active, protectedContent: protectedContent)
-
-        guard captureEnabled, !protectedContent else {
+        if protectedContent { clearThumbnailState() }
+        applyAppearance()
+        updateSearchPresentation()
+        guard model.captureState.captureEnabled,
+              model.captureState.windowVisible,
+              !protectedContent else {
             removeAllCards()
-            showState(message: stateMessage(), protectedContent: protectedContent, active: false)
+            showState(message: stateMessage(), protectedContent: protectedContent)
+            updateCount(visibleCount: 0)
             return
         }
 
-        let visibleItems = model.visibleItems
+        let matches = matchingItems
+        let visibleItems = Array(matches.prefix(
+            ClipboardHistoryWindowMetrics.maximumRenderedCards
+        ))
+        updateCount(visibleCount: matches.count)
         guard !visibleItems.isEmpty else {
             removeAllCards()
-            showState(message: "剪贴板历史为空", protectedContent: false, active: active)
+            showState(
+                message: query.isEmpty ? "尚无剪贴板记录" : "没有匹配的记录",
+                protectedContent: false
+            )
             return
         }
 
+        let visibleIDs = Set(visibleItems.map(\.id))
+        let visibleSelectedIDs = model.selectedIDs.intersection(visibleIDs)
+        let focusedIDIsVisible = model.selectedID.map(visibleIDs.contains) ?? false
+        if visibleSelectedIDs.isEmpty {
+            _ = model.select(id: visibleItems[0].id)
+            selectionAnchorID = visibleItems[0].id
+        } else if visibleSelectedIDs != model.selectedIDs || !focusedIDIsVisible {
+            let orderedSelection = visibleItems.filter {
+                visibleSelectedIDs.contains($0.id)
+            }.map(\.id)
+            _ = model.select(
+                ids: orderedSelection,
+                focusedID: orderedSelection.first
+            )
+        }
         stateContainer.isHidden = true
         scrollView.isHidden = false
-        reconcileCards(items: visibleItems, active: active)
+        reconcileCards(items: visibleItems)
         needsLayout = true
         layoutSubtreeIfNeeded()
         scrollSelectedIntoView()
+        requestAssetsForVisibleCards()
     }
 
-    func snapshotForSmoke() -> ClipboardRailViewSnapshot {
+    func snapshotForSmoke() -> ClipboardHistoryPaneSnapshot {
         let buttons = cardDocumentView.cards
         let selectedBorder = buttons.first(where: { $0.itemID == model.selectedID })?
             .renderedBorderWidth
-        return ClipboardRailViewSnapshot(
-            railHeight: ClipboardRailMetrics.railHeight,
+        return ClipboardHistoryPaneSnapshot(
             cardCount: buttons.count,
-            cardHeight: buttons.first?.frame.height ?? ClipboardRailMetrics.cardHeight,
-            widestCardWidth: buttons.map(\.frame.width).max() ?? 0,
+            selectedCardCount: buttons.filter(\.isRenderedSelected).count,
+            renderedThumbnailCount: buttons.filter(\.isThumbnailRendered).count,
             selectedCardBorderWidth: selectedBorder,
-            isActive: isRailActive && acceptsFirstResponder,
-            isProtected: model.isContentShielded,
-            stateIsVisible: !stateContainer.isHidden
+            queryCharacterCount: query.count,
+            stateIsVisible: !stateContainer.isHidden,
+            contentIsProtected: model.isContentShielded,
+            cardWidth: buttons.first?.frame.width ?? ClipboardHistoryWindowMetrics.cardWidth,
+            cardHeight: buttons.first?.frame.height ?? ClipboardHistoryWindowMetrics.cardHeight
         )
+    }
+
+    private var matchingItems: [ClipboardHistoryItem] {
+        ClipboardHistorySearchRules.filter(model.visibleItems, query: query)
+    }
+
+    private var filteredItems: [ClipboardHistoryItem] {
+        Array(matchingItems.prefix(ClipboardHistoryWindowMetrics.maximumRenderedCards))
+    }
+
+    private var selectedFilteredItems: [ClipboardHistoryItem] {
+        let items = filteredItems
+        let selected = items.filter { model.selectedIDs.contains($0.id) }
+        if !selected.isEmpty { return selected }
+        return items.first.map { [$0] } ?? []
     }
 
     private func configureView() {
         wantsLayer = true
-        layer?.cornerRadius = 0
-        layer?.borderWidth = 1
-        layer?.masksToBounds = true
         setAccessibilityElement(true)
-        setAccessibilityRole(.list)
-        setAccessibilityLabel("剪贴板历史卡片")
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Clipboard History")
+
+        titleLabel.font = .monospacedSystemFont(ofSize: 15, weight: .bold)
+        countLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        countLabel.alignment = .right
+
+        searchShell.wantsLayer = true
+        searchShell.layer?.cornerRadius = 8
+        searchShell.translatesAutoresizingMaskIntoConstraints = false
+        searchIcon.image = RimeUI.symbol("magnifyingglass", pointSize: 12, weight: .semibold)
+        searchIcon.image?.isTemplate = true
+        searchIcon.translatesAutoresizingMaskIntoConstraints = false
+        searchLabel.font = .systemFont(ofSize: 12)
+        searchLabel.lineBreakMode = .byTruncatingTail
+        searchLabel.translatesAutoresizingMaskIntoConstraints = false
+        searchShell.addSubview(searchIcon)
+        searchShell.addSubview(searchLabel)
+        NSLayoutConstraint.activate([
+            searchShell.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
+            searchShell.heightAnchor.constraint(equalToConstant: 28),
+            searchIcon.leadingAnchor.constraint(equalTo: searchShell.leadingAnchor, constant: 9),
+            searchIcon.centerYAnchor.constraint(equalTo: searchShell.centerYAnchor),
+            searchIcon.widthAnchor.constraint(equalToConstant: 14),
+            searchIcon.heightAnchor.constraint(equalToConstant: 14),
+            searchLabel.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 7),
+            searchLabel.trailingAnchor.constraint(equalTo: searchShell.trailingAnchor, constant: -9),
+            searchLabel.centerYAnchor.constraint(equalTo: searchShell.centerYAnchor),
+        ])
+
+        clearButton.target = self
+        clearButton.action = #selector(clearPressed)
+        clearButton.bezelStyle = .rounded
+        clearButton.controlSize = .small
+        clearButton.setAccessibilityLabel("清空全部本地剪贴板历史")
+        closeButton.image = RimeUI.symbol("xmark", pointSize: 11, weight: .bold)
+        closeButton.image?.isTemplate = true
+        closeButton.imagePosition = .imageOnly
+        closeButton.isBordered = false
+        closeButton.target = self
+        closeButton.action = #selector(closePressed)
+        closeButton.setAccessibilityLabel("关闭 Clipboard History")
+
+        let headerSpacer = NSView()
+        let header = NSStackView(views: [
+            titleLabel, countLabel, headerSpacer, searchShell, clearButton, closeButton,
+        ])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 9
+        header.translatesAutoresizingMaskIntoConstraints = false
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        headerSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         scrollView.drawsBackground = false
         scrollView.hasHorizontalScroller = false
@@ -267,75 +466,198 @@ final class ClipboardRailView: NSView {
         scrollView.horizontalScrollElasticity = .automatic
         scrollView.verticalScrollElasticity = .none
         scrollView.documentView = cardDocumentView
-        addSubview(scrollView)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        viewportObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.requestAssetsForVisibleCards() }
+        }
 
         stateIcon.imageScaling = .scaleProportionallyDown
         stateIcon.translatesAutoresizingMaskIntoConstraints = false
-        stateIcon.setContentHuggingPriority(.required, for: .horizontal)
-        stateLabel.font = .systemFont(ofSize: 10)
-        stateLabel.lineBreakMode = .byTruncatingTail
-        stateLabel.maximumNumberOfLines = 1
+        stateLabel.font = .systemFont(ofSize: 12, weight: .medium)
         stateLabel.translatesAutoresizingMaskIntoConstraints = false
-
         let stateStack = NSStackView(views: [stateIcon, stateLabel])
         stateStack.orientation = .horizontal
         stateStack.alignment = .centerY
-        stateStack.spacing = 6
+        stateStack.spacing = 8
         stateStack.translatesAutoresizingMaskIntoConstraints = false
         stateContainer.addSubview(stateStack)
+        stateContainer.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             stateStack.centerXAnchor.constraint(equalTo: stateContainer.centerXAnchor),
             stateStack.centerYAnchor.constraint(equalTo: stateContainer.centerYAnchor),
-            stateStack.leadingAnchor.constraint(greaterThanOrEqualTo: stateContainer.leadingAnchor),
-            stateStack.trailingAnchor.constraint(lessThanOrEqualTo: stateContainer.trailingAnchor),
-            stateIcon.widthAnchor.constraint(equalToConstant: 14),
-            stateIcon.heightAnchor.constraint(equalToConstant: 14),
+            stateIcon.widthAnchor.constraint(equalToConstant: 16),
+            stateIcon.heightAnchor.constraint(equalToConstant: 16),
         ])
+
+        hintLabel.font = .monospacedSystemFont(ofSize: 9, weight: .medium)
+        hintLabel.stringValue = "TYPE TO SEARCH   ← → SELECT   ⇧←→ / ⌘CLICK MULTI   ↩ INSERT   ⌘C COPY   DELETE REMOVE   ESC CLOSE"
+        hintLabel.lineBreakMode = .byTruncatingTail
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(header)
+        addSubview(scrollView)
         addSubview(stateContainer)
+        addSubview(hintLabel)
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: ClipboardHistoryWindowMetrics.horizontalInset),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -ClipboardHistoryWindowMetrics.horizontalInset),
+            header.topAnchor.constraint(equalTo: topAnchor, constant: ClipboardHistoryWindowMetrics.verticalInset),
+            header.heightAnchor.constraint(equalToConstant: 30),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: ClipboardHistoryWindowMetrics.horizontalInset),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -ClipboardHistoryWindowMetrics.horizontalInset),
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 9),
+            scrollView.heightAnchor.constraint(equalToConstant: ClipboardHistoryWindowMetrics.cardHeight),
+            stateContainer.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            stateContainer.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            stateContainer.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            stateContainer.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+            hintLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            hintLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            hintLabel.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 8),
+            hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8),
+        ])
     }
 
-    private func reconcileCards(items: [ClipboardHistoryItem], active: Bool) {
+    private func updateSearchPresentation() {
+        if query.isEmpty && composingText.isEmpty {
+            searchLabel.stringValue = "直接输入以搜索"
+            searchLabel.textColor = RimeUI.textMuted
+            searchShell.setAccessibilityLabel("搜索剪贴板历史；直接输入")
+        } else {
+            let rendered = NSMutableAttributedString(
+                string: query,
+                attributes: [
+                    .foregroundColor: RimeUI.textPrimary,
+                    .font: searchLabel.font ?? NSFont.systemFont(ofSize: 12),
+                ]
+            )
+            if !composingText.isEmpty {
+                rendered.append(NSAttributedString(
+                    string: composingText,
+                    attributes: [
+                        .foregroundColor: RimeUI.accentTextColor,
+                        .font: searchLabel.font ?? NSFont.systemFont(ofSize: 12),
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    ]
+                ))
+            }
+            searchLabel.attributedStringValue = rendered
+            searchShell.setAccessibilityLabel("剪贴板历史搜索")
+        }
+    }
+
+    private func updateCount(visibleCount: Int) {
+        countLabel.stringValue = query.isEmpty
+            ? "\(model.itemCount) ITEMS"
+            : "\(visibleCount) / \(model.itemCount)"
+    }
+
+    private func reconcileCards(items: [ClipboardHistoryItem]) {
         let validIDs = Set(items.map(\.id))
-        let staleIDs = cardButtons.keys.filter { !validIDs.contains($0) }
-        for id in staleIDs {
+        visibleItemByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        for id in cardButtons.keys.filter({ !validIDs.contains($0) }) {
             cardButtons.removeValue(forKey: id)?.removeFromSuperview()
         }
-
-        let orderedButtons = items.map { item -> ClipboardCardButton in
-            let button: ClipboardCardButton
-            if let existing = cardButtons[item.id] {
-                button = existing
-            } else {
-                button = ClipboardCardButton(itemID: item.id)
-                button.target = self
-                button.action = #selector(cardPressed(_:))
-                cardButtons[item.id] = button
-            }
+        let ordered = items.enumerated().map { index, item -> ClipboardHistoryCardButton in
+            let button = cardButtons[item.id] ?? ClipboardHistoryCardButton(itemID: item.id)
+            button.target = self
+            button.action = #selector(cardPressed(_:))
+            cardButtons[item.id] = button
             button.update(
-                text: item.text,
-                selected: item.id == model.selectedID,
-                railActive: active
+                item: item,
+                quickIndex: index < 9 ? index + 1 : nil,
+                sourceIcon: item.sourceApplicationBundleIdentifier.flatMap {
+                    sourceIconCache.object(forKey: $0 as NSString)
+                } ?? fallbackSourceIcon,
+                thumbnail: thumbnailCache.object(forKey: item.id as NSUUID),
+                selected: model.selectedIDs.contains(item.id),
+                focused: item.id == model.selectedID
             )
             return button
         }
-        cardDocumentView.setCards(orderedButtons, viewportWidth: scrollView.contentSize.width)
+        cardDocumentView.setCards(ordered, viewportWidth: scrollView.contentSize.width)
     }
 
     private func removeAllCards() {
         cardButtons.values.forEach { $0.removeFromSuperview() }
         cardButtons.removeAll(keepingCapacity: false)
+        visibleItemByID.removeAll(keepingCapacity: false)
         cardDocumentView.setCards([], viewportWidth: scrollView.contentSize.width)
         scrollView.isHidden = true
     }
 
-    @objc private func cardPressed(_ sender: ClipboardCardButton) {
-        guard acceptsFirstResponder else { return }
-        _ = window?.makeFirstResponder(self)
-        setActive(true)
-        guard model.select(id: sender.itemID) else { return }
-        if NSApp.currentEvent?.clickCount ?? 1 >= 2 {
-            _ = activateSelectedItem()
+    private func showState(message: String, protectedContent: Bool) {
+        stateLabel.stringValue = message
+        stateLabel.textColor = protectedContent
+            ? ClipboardHistoryPalette.warningText
+            : RimeUI.textMuted
+        stateIcon.image = RimeUI.symbol(
+            protectedContent ? "lock.fill" : "clipboard",
+            pointSize: 15,
+            weight: .bold
+        )
+        stateIcon.image?.isTemplate = true
+        stateIcon.contentTintColor = stateLabel.textColor
+        stateContainer.isHidden = false
+        scrollView.isHidden = true
+        setAccessibilityHelp(message)
+    }
+
+    private func stateMessage() -> String {
+        let protection = model.activeProtection
+        if protection.contains(.secureInput) { return "安全输入期间已隐藏历史" }
+        if protection.contains(.screenLocked) { return "屏幕锁定期间已隐藏历史" }
+        if protection.contains(.sessionInactive) { return "当前会话已保护" }
+        if !model.captureState.captureEnabled { return "剪贴板历史收录已关闭" }
+        if !model.captureState.windowVisible { return "Clipboard History 已收起" }
+        if !model.isStarted { return "剪贴板历史尚未启动" }
+        return "尚无剪贴板记录"
+    }
+
+    private func moveFilteredSelection(delta: Int, extending: Bool) {
+        let items = filteredItems
+        guard !items.isEmpty else { return }
+        let current = model.selectedID.flatMap { id in
+            items.firstIndex(where: { $0.id == id })
+        } ?? 0
+        let next = min(max(0, current + delta), items.count - 1)
+        let nextID = items[next].id
+        if extending {
+            let anchorID: UUID
+            if let selectionAnchorID,
+               model.selectedIDs.contains(selectionAnchorID),
+               items.contains(where: { $0.id == selectionAnchorID }) {
+                anchorID = selectionAnchorID
+            } else {
+                anchorID = items[current].id
+                selectionAnchorID = anchorID
+            }
+            let anchor = items.firstIndex(where: { $0.id == anchorID }) ?? current
+            let range = min(anchor, next)...max(anchor, next)
+            _ = model.select(
+                ids: range.map { items[$0].id },
+                focusedID: nextID
+            )
+        } else {
+            selectionAnchorID = nextID
+            _ = model.select(id: nextID)
         }
+        scrollSelectedIntoView()
+    }
+
+    @discardableResult
+    private func activateVisibleItem(at index: Int) -> Bool {
+        let items = filteredItems
+        guard items.indices.contains(index), model.select(id: items[index].id) else {
+            return false
+        }
+        selectionAnchorID = items[index].id
+        return activateSelectedItems()
     }
 
     private func scrollSelectedIntoView() {
@@ -344,186 +666,288 @@ final class ClipboardRailView: NSView {
               !scrollView.isHidden else { return }
         let visible = scrollView.documentVisibleRect
         let targetX: CGFloat
-        if card.frame.width >= visible.width || card.frame.minX < visible.minX {
+        if card.frame.minX < visible.minX {
             targetX = card.frame.minX
         } else if card.frame.maxX > visible.maxX {
             targetX = card.frame.maxX - visible.width
-        } else {
-            return
-        }
-
+        } else { return }
         let maximumX = max(0, cardDocumentView.frame.width - visible.width)
-        let target = NSPoint(
-            x: min(max(0, targetX), maximumX),
-            y: scrollView.contentView.bounds.origin.y
-        )
+        let target = NSPoint(x: min(max(0, targetX), maximumX), y: 0)
         if window == nil || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             scrollView.contentView.scroll(to: target)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             return
         }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
+            context.duration = 0.1
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             scrollView.contentView.animator().setBoundsOrigin(target)
         }
     }
 
-    private func stateMessage() -> String {
-        let protection = model.activeProtection
-        if protection.contains(.secureInput) {
-            return "安全输入期间剪贴板历史已遮蔽"
-        }
-        if protection.contains(.screenLocked) {
-            return "屏幕锁定期间剪贴板历史已遮蔽"
-        }
-        if protection.contains(.sessionInactive) {
-            return "会话受保护，剪贴板历史已遮蔽"
-        }
-        if !model.captureState.railEnabled {
-            return "剪贴板历史已关闭"
-        }
-        if !model.captureState.workbenchVisible {
-            return "工作台隐藏时不会读取剪贴板"
-        }
-        if !model.isStarted {
-            return "剪贴板历史尚未启动"
-        }
-        return "剪贴板历史为空"
-    }
-
-    private func showState(message: String,
-                           protectedContent: Bool,
-                           active: Bool) {
-        stateLabel.stringValue = message
-        let color: NSColor
-        let iconName: String
-        if protectedContent {
-            color = ClipboardRailPalette.warningText
-            iconName = "lock.fill"
-        } else if active {
-            color = RimeUI.accentTextColor
-            iconName = "clipboard"
-        } else {
-            color = RimeUI.textMuted
-            iconName = "clipboard"
-        }
-        stateLabel.textColor = color
-        stateIcon.image = RimeUI.symbol(iconName, pointSize: 14, weight: .bold)
-        stateIcon.image?.isTemplate = true
-        stateIcon.contentTintColor = color
-        stateContainer.isHidden = false
-        scrollView.isHidden = true
-        setAccessibilityHelp(message)
-    }
-
-    private func applyRailAppearance(active: Bool, protectedContent: Bool) {
+    private func applyAppearance() {
         appearance = RimeUI.appKitAppearance
-        if protectedContent {
-            layer?.backgroundColor = RimeUI.surface2.cgColor
-            layer?.borderColor = RimeUI.borderStrong.cgColor
-        } else if active {
-            layer?.backgroundColor = ClipboardRailPalette.bufferTargetRail.cgColor
-            layer?.borderColor = RimeUI.accentTextColor.cgColor
-        } else if model.isStarted
-                    && model.captureState.workbenchVisible
-                    && model.captureState.railEnabled {
-            layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
-            layer?.borderColor = RimeUI.borderStrong.cgColor
-        } else {
-            layer?.backgroundColor = RimeUI.surface2.cgColor
-            layer?.borderColor = RimeUI.borderStrong.cgColor
+        layer?.backgroundColor = RimeUI.workbenchChrome.cgColor
+        searchShell.layer?.backgroundColor = RimeUI.surface2.cgColor
+        searchShell.layer?.borderColor = RimeUI.borderStrong.cgColor
+        searchShell.layer?.borderWidth = 1
+        titleLabel.textColor = RimeUI.textPrimary
+        countLabel.textColor = RimeUI.textMuted
+        searchIcon.contentTintColor = RimeUI.textMuted
+        hintLabel.textColor = RimeUI.textMuted
+        clearButton.contentTintColor = RimeUI.textSecondary
+        closeButton.contentTintColor = RimeUI.textSecondary
+        cardButtons.values.forEach { $0.refreshAppearance() }
+    }
+
+    private func requestAssetsForVisibleCards() {
+        guard !scrollView.isHidden, !model.isContentShielded else { return }
+        let prefetch = scrollView.documentVisibleRect.insetBy(
+            dx: -ClipboardHistoryWindowMetrics.cardWidth,
+            dy: 0
+        )
+        for card in cardDocumentView.cards where card.frame.intersects(prefetch) {
+            guard let item = visibleItemByID[card.itemID] else { continue }
+            requestSourceIconIfNeeded(for: item)
+            requestThumbnailIfNeeded(for: item)
         }
-        layer?.borderWidth = 1
+    }
+
+    private func requestThumbnailIfNeeded(for item: ClipboardHistoryItem) {
+        guard item.kind.allowsImageThumbnail,
+              thumbnailCache.object(forKey: item.id as NSUUID) == nil,
+              requestedThumbnailIDs.insert(item.id).inserted else { return }
+        let generation = assetGeneration
+        model.loadImageThumbnail(
+            id: item.id,
+            maximumPixelSize: ClipboardHistoryWindowMetrics.previewMaximumPixelSize
+        ) { [weak self] image in
+            guard let self else { return }
+            self.requestedThumbnailIDs.remove(item.id)
+            guard generation == self.assetGeneration,
+                  !self.model.isContentShielded,
+                  let image else { return }
+            let rendered = NSImage(
+                cgImage: image,
+                size: NSSize(width: image.width, height: image.height)
+            )
+            self.thumbnailCache.setObject(
+                rendered,
+                forKey: item.id as NSUUID,
+                cost: max(1, image.bytesPerRow * image.height)
+            )
+            self.cardButtons[item.id]?.setThumbnail(rendered)
+        }
+    }
+
+    private func requestSourceIconIfNeeded(for item: ClipboardHistoryItem) {
+        guard let bundleIdentifier = item.sourceApplicationBundleIdentifier,
+              !bundleIdentifier.isEmpty,
+              sourceIconCache.object(forKey: bundleIdentifier as NSString) == nil,
+              requestedSourceIconBundleIDs.insert(bundleIdentifier).inserted else {
+            return
+        }
+        model.loadSourceApplicationIcon(
+            bundleIdentifier: bundleIdentifier
+        ) { [weak self] data in
+            guard let self else { return }
+            self.requestedSourceIconBundleIDs.remove(bundleIdentifier)
+            let image = data.flatMap { NSImage(data: $0) }
+                ?? self.workspaceIcon(bundleIdentifier: bundleIdentifier)
+                ?? self.fallbackSourceIcon
+            guard let image else { return }
+            let cached = (image.copy() as? NSImage) ?? image
+            cached.size = NSSize(width: 16, height: 16)
+            self.sourceIconCache.setObject(
+                cached,
+                forKey: bundleIdentifier as NSString
+            )
+            for (id, visibleItem) in self.visibleItemByID
+                where visibleItem.sourceApplicationBundleIdentifier
+                    == bundleIdentifier {
+                self.cardButtons[id]?.setSourceIcon(cached)
+            }
+        }
+    }
+
+    private func workspaceIcon(bundleIdentifier: String) -> NSImage? {
+        guard let applicationURL = NSWorkspace.shared.urlForApplication(
+            withBundleIdentifier: bundleIdentifier
+        ) else { return nil }
+        return NSWorkspace.shared.icon(forFile: applicationURL.path)
+    }
+
+    private func clearThumbnailState() {
+        assetGeneration &+= 1
+        thumbnailCache.removeAllObjects()
+        requestedThumbnailIDs.removeAll(keepingCapacity: false)
+    }
+
+    @discardableResult
+    func handleCardInteraction(
+        itemID: UUID,
+        modifiers rawModifiers: NSEvent.ModifierFlags,
+        clickCount: Int
+    ) -> Bool {
+        let modifiers = rawModifiers
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option, .shift])
+        if clickCount >= 2 {
+            guard model.select(id: itemID) else { return false }
+            selectionAnchorID = itemID
+            return activateSelectedItems()
+        }
+        if modifiers == [.command] {
+            guard model.toggleSelection(id: itemID) else { return false }
+            selectionAnchorID = itemID
+        } else if modifiers == [.shift],
+                  let anchorID = selectionAnchorID,
+                  model.selectedIDs.contains(anchorID),
+                  let anchor = filteredItems.firstIndex(where: {
+                      $0.id == anchorID
+                  }),
+                  let clicked = filteredItems.firstIndex(where: {
+                      $0.id == itemID
+                  }) {
+            let range = min(anchor, clicked)...max(anchor, clicked)
+            _ = model.select(
+                ids: range.map { filteredItems[$0].id },
+                focusedID: itemID
+            )
+        } else {
+            guard model.select(id: itemID) else { return false }
+            selectionAnchorID = itemID
+        }
+        return true
+    }
+
+    @objc private func cardPressed(_ sender: ClipboardHistoryCardButton) {
+        _ = handleCardInteraction(
+            itemID: sender.itemID,
+            modifiers: NSApp.currentEvent?.modifierFlags ?? [],
+            clickCount: NSApp.currentEvent?.clickCount ?? 1
+        )
+    }
+
+    @objc private func clearPressed() {
+        guard model.activeProtection.isEmpty else { return }
+        guard clearConfirmationArmed else {
+            clearConfirmationArmed = true
+            clearConfirmationGeneration &+= 1
+            let generation = clearConfirmationGeneration
+            clearButton.title = "再次点击清空"
+            clearButton.setAccessibilityHelp("再次点击将删除全部本地历史")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                guard let self,
+                      self.clearConfirmationGeneration == generation else {
+                    return
+                }
+                self.resetClearConfirmation()
+            }
+            return
+        }
+        resetClearConfirmation()
+        model.clear()
+    }
+
+    private func resetClearConfirmation() {
+        clearConfirmationGeneration &+= 1
+        clearConfirmationArmed = false
+        clearButton.title = "清空"
+        clearButton.setAccessibilityHelp("需要连续确认两次")
+    }
+
+    @objc private func closePressed() { onClose?() }
+
+    private static func commandDigitIndex(keyCode: UInt16) -> Int? {
+        [
+            UInt16(kVK_ANSI_1), UInt16(kVK_ANSI_2), UInt16(kVK_ANSI_3),
+            UInt16(kVK_ANSI_4), UInt16(kVK_ANSI_5), UInt16(kVK_ANSI_6),
+            UInt16(kVK_ANSI_7), UInt16(kVK_ANSI_8), UInt16(kVK_ANSI_9),
+        ].firstIndex(of: keyCode)
     }
 }
 
-private enum ClipboardRailPalette {
-    static var bufferTargetRail: NSColor {
-        switch RimeUI.appearance {
-        case .night: return RimeUI.color(0x122A21)
-        case .day: return RimeUI.color(0xE7F6EF)
-        case .quiet: return RimeUI.color(0x272727)
-        }
-    }
-
-    static var clipboardSelected: NSColor {
-        switch RimeUI.appearance {
-        case .night: return RimeUI.color(0x1A4430)
-        case .day: return RimeUI.color(0xCDEBDE)
-        case .quiet: return RimeUI.color(0x3C3C3C)
-        }
+private enum ClipboardHistoryPalette {
+    static var selectedBackground: NSColor {
+        RimeUI.clipboardSelectedBackground
     }
 
     static var warningText: NSColor {
-        switch RimeUI.appearance {
-        case .night, .quiet: return RimeUI.color(0xFF9230)
-        case .day: return RimeUI.color(0x8A4B00)
-        }
+        RimeUI.warningTextColor
     }
 }
 
-private final class ClipboardCardDocumentView: NSView {
-    private(set) var cards: [ClipboardCardButton] = []
-
+private final class ClipboardHistoryCardDocumentView: NSView {
+    private(set) var cards: [ClipboardHistoryCardButton] = []
     override var isFlipped: Bool { true }
 
-    func setCards(_ cards: [ClipboardCardButton], viewportWidth: CGFloat) {
+    func setCards(_ cards: [ClipboardHistoryCardButton], viewportWidth: CGFloat) {
         self.cards = cards
-        for card in cards where card.superview !== self {
-            addSubview(card)
-        }
+        cards.filter { $0.superview !== self }.forEach(addSubview)
         layoutCards(viewportWidth: viewportWidth)
     }
 
     func layoutCards(viewportWidth: CGFloat) {
         var x: CGFloat = 0
         for card in cards {
-            let width = card.preferredCardWidth
             card.frame = NSRect(
                 x: x,
                 y: 0,
-                width: width,
-                height: ClipboardRailMetrics.cardHeight
+                width: ClipboardHistoryWindowMetrics.cardWidth,
+                height: ClipboardHistoryWindowMetrics.cardHeight
             )
-            x += width + ClipboardRailMetrics.cardSpacing
+            x += ClipboardHistoryWindowMetrics.cardWidth
+                + ClipboardHistoryWindowMetrics.cardSpacing
         }
-        let contentWidth = cards.isEmpty ? 0 : x - ClipboardRailMetrics.cardSpacing
+        let contentWidth = cards.isEmpty ? 0 : x - ClipboardHistoryWindowMetrics.cardSpacing
         frame = NSRect(
             x: 0,
             y: 0,
             width: max(viewportWidth, contentWidth),
-            height: ClipboardRailMetrics.cardHeight
+            height: ClipboardHistoryWindowMetrics.cardHeight
         )
     }
 }
 
-private final class ClipboardHorizontalScrollView: NSScrollView {
+private final class ClipboardHistoryHorizontalScrollView: NSScrollView {
     override func scrollWheel(with event: NSEvent) {
-        guard event.modifierFlags.contains(.shift),
-              abs(event.scrollingDeltaX) < 0.01,
-              abs(event.scrollingDeltaY) >= 0.01,
-              let documentView else {
+        let delta = ClipboardHistoryScrollRules.horizontalDelta(
+            deltaX: event.scrollingDeltaX,
+            deltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas,
+            shiftHeld: event.modifierFlags.contains(.shift)
+        )
+        guard abs(delta) > 0.01, let documentView else {
             super.scrollWheel(with: event)
             return
         }
         let maximumX = max(0, documentView.frame.width - contentSize.width)
         var origin = contentView.bounds.origin
-        origin.x = min(max(0, origin.x + event.scrollingDeltaY), maximumX)
+        origin.x = min(max(0, origin.x + delta), maximumX)
         contentView.scroll(to: origin)
         reflectScrolledClipView(contentView)
     }
 }
 
-private final class ClipboardCardButton: NSButton {
+private final class ClipboardHistoryCardButton: NSButton {
     let itemID: UUID
-    private let valueLabel = NSTextField(labelWithString: "")
+    private let quickLabel = NSTextField(labelWithString: "")
+    private let sourceIconView = NSImageView()
+    private let sourceLabel = NSTextField(labelWithString: "")
+    private let timeLabel = NSTextField(labelWithString: "")
+    private let previewLabel = NSTextField(wrappingLabelWithString: "")
+    private let previewImageView = NSImageView()
     private var trackingArea: NSTrackingArea?
-    private var isHovered = false
-    private var isSelectedItem = false
-    private var isRailActive = false
-    private(set) var preferredCardWidth: CGFloat = 28
+    private var hovered = false
+    private var selectedItem = false
+    private var focusedItem = false
+    private var itemKind: ClipboardItemKind = .unknown
     private(set) var renderedBorderWidth: CGFloat = 1
+    var isRenderedSelected: Bool { selectedItem }
+    var isThumbnailRendered: Bool {
+        previewImageView.image != nil && !previewImageView.isHidden
+    }
 
     init(itemID: UUID) {
         self.itemID = itemID
@@ -533,57 +957,75 @@ private final class ClipboardCardButton: NSButton {
         setButtonType(.momentaryChange)
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = ClipboardRailMetrics.cardCornerRadius
+        layer?.cornerRadius = 10
         layer?.masksToBounds = true
 
-        valueLabel.font = .systemFont(ofSize: 10)
-        valueLabel.lineBreakMode = .byTruncatingTail
-        valueLabel.maximumNumberOfLines = 1
-        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        valueLabel.setAccessibilityElement(false)
-        addSubview(valueLabel)
-
+        quickLabel.font = .monospacedSystemFont(ofSize: 9, weight: .bold)
+        quickLabel.alignment = .center
+        sourceLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        sourceLabel.lineBreakMode = .byTruncatingTail
+        sourceIconView.imageScaling = .scaleProportionallyDown
+        sourceIconView.isHidden = true
+        timeLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+        timeLabel.alignment = .right
+        previewLabel.font = .systemFont(ofSize: 12)
+        previewLabel.maximumNumberOfLines = 4
+        previewLabel.lineBreakMode = .byWordWrapping
+        previewImageView.imageScaling = .scaleProportionallyUpOrDown
+        previewImageView.wantsLayer = true
+        previewImageView.layer?.cornerRadius = 7
+        previewImageView.layer?.masksToBounds = true
+        previewImageView.isHidden = true
+        [quickLabel, sourceIconView, sourceLabel, timeLabel,
+         previewLabel, previewImageView].forEach {
+            $0.setAccessibilityElement(false)
+            addSubview($0)
+        }
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func layout() {
         super.layout()
-        valueLabel.frame = bounds.insetBy(
-            dx: ClipboardRailMetrics.cardHorizontalInset,
-            dy: 1
+        quickLabel.frame = NSRect(x: 10, y: 9, width: 28, height: 15)
+        sourceIconView.frame = NSRect(x: 43, y: 8, width: 16, height: 16)
+        sourceLabel.frame = NSRect(x: 64, y: 9, width: bounds.width - 133, height: 15)
+        timeLabel.frame = NSRect(x: bounds.width - 66, y: 9, width: 56, height: 15)
+        previewLabel.frame = NSRect(x: 11, y: 34, width: bounds.width - 22, height: bounds.height - 43)
+        previewImageView.frame = NSRect(
+            x: 11,
+            y: 34,
+            width: bounds.width - 22,
+            height: bounds.height - 43
         )
     }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        super.hitTest(point) == nil ? nil : self
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let trackingArea { removeTrackingArea(trackingArea) }
-        let replacement = NSTrackingArea(
+        let area = NSTrackingArea(
             rect: .zero,
             options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
-        addTrackingArea(replacement)
-        trackingArea = replacement
+        addTrackingArea(area)
+        trackingArea = area
     }
 
     override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        applyAppearance()
+        hovered = true
+        NSCursor.pointingHand.set()
+        refreshAppearance()
     }
 
     override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        applyAppearance()
+        hovered = false
+        NSCursor.arrow.set()
+        refreshAppearance()
     }
 
     override func resetCursorRects() {
@@ -591,70 +1033,105 @@ private final class ClipboardCardButton: NSButton {
         addCursorRect(bounds, cursor: .pointingHand)
     }
 
-    func update(text: String, selected: Bool, railActive: Bool) {
+    func update(
+        item: ClipboardHistoryItem,
+        quickIndex: Int?,
+        sourceIcon: NSImage?,
+        thumbnail: NSImage?,
+        selected: Bool,
+        focused: Bool
+    ) {
+        let fallbackPreview: String
+        switch item.kind {
+        case .text: fallbackPreview = "文本内容"
+        case .link: fallbackPreview = "链接"
+        case .image: fallbackPreview = "图片"
+        case .files: fallbackPreview = "文件"
+        case .color: fallbackPreview = "颜色"
+        case .unknown: fallbackPreview = "剪贴板内容"
+        }
+        let previewSource = item.displayText
+            ?? item.canonicalText
+            ?? fallbackPreview
         let preview = Self.boundedPreview(
-            text,
-            maximumCharacters: ClipboardRailMetrics.previewCharacterLimit
+            previewSource,
+            maximumCharacters: ClipboardHistoryWindowMetrics.previewCharacterLimit
         )
-        let accessiblePreview = Self.boundedPreview(
-            text,
-            maximumCharacters: ClipboardRailMetrics.accessibilityCharacterLimit
+        let accessible = Self.boundedPreview(
+            previewSource,
+            maximumCharacters: ClipboardHistoryWindowMetrics.accessibilityCharacterLimit
         )
-        valueLabel.stringValue = preview
-        toolTip = accessiblePreview
-        setAccessibilityLabel(accessiblePreview)
-        setAccessibilityHelp(selected ? "已选择；双击加入 Buffer" : "单击选择；双击加入 Buffer")
+        quickLabel.stringValue = quickIndex.map { "⌘\($0)" }
+            ?? item.kind.rawValue.uppercased()
+        sourceLabel.stringValue = item.sourceApplicationName
+            ?? item.kind.rawValue.uppercased()
+        setSourceIcon(sourceIcon)
+        timeLabel.stringValue = Self.relativeTimestamp(item.capturedAt)
+        previewLabel.stringValue = preview
+        itemKind = item.kind
+        setThumbnail(thumbnail)
+        setAccessibilityLabel("\(item.kind.rawValue)：\(accessible)")
+        let activationHelp = "双击或回车使用；富内容会复制，然后在目标中粘贴"
+        setAccessibilityHelp(selected ? "已选择；\(activationHelp)" : "单击选择；\(activationHelp)")
         setAccessibilitySelected(selected)
-        isSelectedItem = selected
-        isRailActive = railActive
-
-        let measured = ceil((preview as NSString).size(withAttributes: [
-            .font: NSFont.systemFont(ofSize: 10),
-        ]).width) + ClipboardRailMetrics.cardHorizontalInset * 2
-        preferredCardWidth = min(
-            ClipboardRailMetrics.maximumCardWidth,
-            max(28, measured)
-        )
-        applyAppearance()
+        selectedItem = selected
+        focusedItem = focused
+        refreshAppearance()
     }
 
-    private func applyAppearance() {
-        let foreground: NSColor
+    func setSourceIcon(_ image: NSImage?) {
+        sourceIconView.image = image
+        sourceIconView.contentTintColor = image?.isTemplate == true
+            ? RimeUI.textSecondary
+            : nil
+        sourceIconView.isHidden = image == nil
+    }
+
+    func setThumbnail(_ image: NSImage?) {
+        previewImageView.image = image
+        let shouldShowImage = itemKind.allowsImageThumbnail && image != nil
+        previewImageView.isHidden = !shouldShowImage
+        previewLabel.isHidden = shouldShowImage
+    }
+
+    func refreshAppearance() {
         let background: NSColor
         let border: NSColor
-        let borderWidth: CGFloat
-
-        if isSelectedItem && isRailActive {
-            foreground = RimeUI.selectedCandidateTextColor
-            background = RimeUI.selectedCandidateBackgroundColor
-            border = RimeUI.selectedCandidateTextColor
-            borderWidth = 2
-        } else if isSelectedItem {
-            foreground = RimeUI.textPrimary
-            background = ClipboardRailPalette.clipboardSelected
-            border = RimeUI.accentTextColor
-            borderWidth = 1
-        } else if isHovered {
-            foreground = RimeUI.textPrimary
+        if selectedItem {
+            background = ClipboardHistoryPalette.selectedBackground
+            border = RimeUI.accentBlue
+            renderedBorderWidth = focusedItem ? 2 : 1.5
+        } else if hovered {
             background = RimeUI.surface3
             border = RimeUI.borderStrong
-            borderWidth = 1
+            renderedBorderWidth = 1
         } else {
-            foreground = RimeUI.textPrimary
             background = RimeUI.surface2
             border = RimeUI.border
-            borderWidth = 1
+            renderedBorderWidth = 1
         }
-
-        valueLabel.textColor = foreground
+        quickLabel.textColor = selectedItem ? RimeUI.accentBlue : RimeUI.textMuted
+        sourceLabel.textColor = RimeUI.textSecondary
+        if sourceIconView.image?.isTemplate == true {
+            sourceIconView.contentTintColor = RimeUI.textSecondary
+        }
+        timeLabel.textColor = RimeUI.textMuted
+        previewLabel.textColor = RimeUI.textPrimary
+        previewImageView.layer?.backgroundColor = RimeUI.surface3.cgColor
         layer?.backgroundColor = background.cgColor
         layer?.borderColor = border.cgColor
-        layer?.borderWidth = borderWidth
-        renderedBorderWidth = borderWidth
+        layer?.borderWidth = renderedBorderWidth
     }
 
-    private static func boundedPreview(_ text: String,
-                                       maximumCharacters: Int) -> String {
+    private static func relativeTimestamp(_ date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "NOW" }
+        if seconds < 3_600 { return "\(seconds / 60)M" }
+        if seconds < 86_400 { return "\(seconds / 3_600)H" }
+        return "\(seconds / 86_400)D"
+    }
+
+    private static func boundedPreview(_ text: String, maximumCharacters: Int) -> String {
         let normalized = text.replacingOccurrences(
             of: "[\\r\\n\\t]+",
             with: " ",
@@ -662,5 +1139,37 @@ private final class ClipboardCardButton: NSButton {
         )
         guard normalized.count > maximumCharacters else { return normalized }
         return String(normalized.prefix(maximumCharacters)) + "…"
+    }
+}
+
+private final class ClipboardFirstMouseButton: NSButton {
+    private var pointerTrackingArea: NSTrackingArea?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTrackingArea { removeTrackingArea(pointerTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: isEnabled ? .pointingHand : .arrow)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        (isEnabled ? NSCursor.pointingHand : .arrow).set()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
     }
 }

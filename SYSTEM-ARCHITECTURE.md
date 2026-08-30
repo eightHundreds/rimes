@@ -1,6 +1,10 @@
 # RIMES · 系统架构
 
-版本：2026-08-26 · 权威全局架构文档
+> **2026-08-30 Buffer UI、结果复制与主题最新覆盖（当前最高优先级）**：Buffer 初始为单行紧凑原生工作台。普通/source-only/target-only 折叠为 44pt，实时 source+target 折叠为 78pt；点击正文唯一的前置输入/插件图标可展开或收起恢复的 33pt 顶部工具栏及 1pt divider，对应展开高度为 78/112pt。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭；空白 chrome、状态、间距和弹性留白是拖窗区，控件保持首击交互。右侧专用 24pt 拖拽条不存在。展开态只在当前进程/会话生效，不写偏好，并在隐藏或 secure/session protection 时重置折叠。alternative 数量与独立候选浮窗均不增高；target rail 不显示角色图标。完整且新鲜的非 `BufferModel` 生成结果提供复制按钮，纯 `Command+C` 与点击按钮等价：冻结并在写入前重新验证同一 source/workspace/generation/有序 block IDs 与文本，将 block 文本按顺序无分隔写入系统剪贴板，再走安全关闭/暂停生命周期。复制不经过 `prepare`、`consume`、`BufferDeliveryCoordinator` 或 `Delivery.insert`，不提交、修改或消费 source；普通 Buffer 原文、空/未完成、protected 或 stale/drifted 结果 fail closed/按既有规则透传。墨竹、翡翠、静谧归为 **Classic** 家族的三种配色；**Rasta** 是独立完整的红黄绿语义主题。本文后续 toolbarless、非持久弹层、专用右侧拖动区、常显工具栏、旧高度、target 角色图标、旧主题分类或把复制写成 Delivery 的表述均属历史，由本条覆盖。
+
+> **2026-08-30 Buffer 点击、指针与拖动补充**：前置输入/插件图标在祖先 rail 手势识别前被排除，点击只切换顶部工具栏；enabled 的按钮、弹出控件与可选 chip 在 nonactivating panel 内主动显示 pointing-hand。只有展开工具栏的空白 chrome、状态、间距和弹性留白使用 open/closed-hand 并执行拖窗；正文轨、窗口背景、插件/配置控件、复制、发送和关闭命中区都不参与拖动。
+
+版本：2026-08-30 · 权威全局架构文档
 关系：本文档描述**整个系统**（既有输入核心 + 缓冲工作台）。`WORKBENCH-DESIGN.md` 是工作台的产品方案与决策记录；`ARCHITECTURE.md` 是 P1 时代的交接文档（已滞后，仅存档）。三者冲突时以本文档为准。
 
 代码规模：约 31000 行（Swift + 一层 C++ librime 桥）。单进程、后台 agent（`LSUIElement`）。
@@ -9,27 +13,30 @@
 
 ## 0.0 当前状态覆盖（2026-08-26）
 
-本节是当前实现的权威摘要；后文保留的 Marine Chrome、My Prompt、Remarkable、常驻刷新按钮以及“开启 Buffer 即持续接管所有焦点”的描述是历史实现，与本节冲突时以本节为准。
+本节是当前实现的权威摘要；页首 2026-08-30 最新覆盖优先于本节。后文保留的 Marine Chrome、My Prompt、Remarkable、toolbarless/弹层/专用右侧拖动条、永久展开工具栏、旧几何、target 角色图标、常驻刷新按钮以及“开启 Buffer 即持续接管所有焦点”的描述是历史实现。
 
 - **三种状态分离**：工作台是否可见、是否仍有未投递内容、输入事件当前走“直输”还是“缓冲”分别存储和转换。显示工作台不会隐式开始捕获，切回直输也不会删除 Buffer 内容。
 - **逻辑输入面与焦点绑定**：Buffer 正文是 nonactivating `NSPanel` 内的块级逻辑输入面，不建立会夺走宿主 first responder 的原生文本编辑器。缓冲路由必须绑定当前精确、可信、非 secure 的外部 `FocusToken`；焦点切换后默认回到直输，旧 token 的 Return、方向键、删除键和普通字符都不能影响新输入框。用户重新点击逻辑输入面时，才对当前 token 开启捕获并设置块间插入位置；再次点击外部应用时，即使仍是同一个输入框，也会先结算 Buffer 组字再自动回到直输，不需要额外的 switcher。
-- **无用户刷新按钮**：右上角刷新按钮及固定刷新槽已经移除。任务 generation 作废、配置变更重启、上下文重验等内部生命周期刷新仍然存在，但由状态机触发，不再作为常驻 UI 操作。
+- **折叠正文与可切换工具栏**：Buffer 初始只显示紧凑正文；唯一前置输入/插件图标切换 33pt 工具栏与 1pt divider。工具栏承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭。其空白 chrome/status/spacing/spacer 可拖窗，所有控件仍可首击；正文与窗口背景不可拖，右侧 24pt 专用拖动条已删除。工具栏状态仅进程内存在，隐藏或保护时折叠。任务 generation 作废、配置变更重启、上下文重验等内部生命周期刷新仍由状态机触发。target rail 不显示角色图标。
 - **按内容决定轨道**：派生插件在输入为空且没有真实结果或显式状态时只显示一条轨道；存在实际 source/result/status 时，才扩成双轨或把 source 轨交换为 result 轨。占位文本本身不能制造空白第二行。
 - **最后一块投递后的可选收尾**：设置“最后一块上屏后关闭工作台”默认开启并覆盖 `Default` 与所有 Buffer 插件。只有精确的最后一个待投递 block 经 `Delivery.insert` 成功、对应 source 已原子消费、期间没有新内容或 generation 漂移、同一 owner/工作台会话仍有效且原目标仍存活时，才执行 close-and-pause。设置关闭、部分成功、失败、迟到 generation、新内容、目标/token 丢失或会话切换都保持打开。
-- **Clipboard 显式开启可捕获当下内容一次**：Clipboard History 仍默认关闭。只有用户明确执行 off→on、且 nonactivating 工作台在该操作后真实位于当前 Space 并可见、无 secure/session 保护时，才允许读取并收录一次当前合格纯文本。隐藏/保护期间、普通显隐以及锁屏/睡眠/会话恢复一律只更新 `changeCount` baseline，不补抓不可见或受保护期间的内容。
-- **Capsule 本机 Markdown 与分级上屏**：Capsule 0.3 在 `~/Library/RimeBuffer/capsule/entries/*.md` 用 Obsidian 可读 front matter + 正文管理 Prompt、Memory 与 Skill 绝对路径，并在第一次初始化时只预设一次标题为 `RIMES 默认词条`、正文为 `RIMES` 的 Memory。工具栏下拉框让 Prompt、Memory、Password 与 Skill 单独搜索；普通条目按标题/正文检索，空结果只提供当前所选类型的有效创建动作，选择后仍由 `BufferDeliveryCoordinator -> Delivery.insert` 上屏。Password 保持独立密文目录：`passwords/*.md` 仅暴露标题/UUID/更新时间，网址、App、用户名、当前密码和曾用密码均为 ChaCha20-Poly1305 密文；选中密码不会接管按键，只有显式上屏请求打开访问密钥弹窗后，60 秒内的四段本地并击才进入独立捕获路径，完成后重新验证精确外部 FocusToken/client 并签发两秒一次性 permit。普通 Secure Input 拦截不变；密码禁止进入普通 block、剪贴板、日志与仓库，也禁止 AX 回退。
-- **Mailbox 与 Buffer/Clip 生命周期分离**：`⌘⇧M` 打开的 Mailbox 使用本地持久化会话，跨输入法进程重启保存；Buffer 正文与 Clipboard History 仍只属于当前进程，不因 Mailbox 引入发送历史。会话正文使用固定列、全宽、等宽的 CLI transcript，角色只改变提示符和弱强调，不改变左右位置或正文宽度。MCP/HTTP 等单向推送先进入 Mailbox 审核，只能“加入 Buffer”或“拒绝”；其输入框保存本地备注，不伪造回传通道。
-- **AI 生成的格式与目的地相互独立**：Plain/Markdown/JSON 是内容格式，原地或 Mailbox 是目的地；紧凑选择器显示六种明确组合，旧 `Mailbox` 偏好迁移为 `Mailbox · Plain`。选择任一 Mailbox 组合后，点击主按钮或按 Return 会冻结连接器、模型、模式、格式、源块与 prompt，先持久化用户 turn 再关闭 Buffer。后台任务不受 Buffer pause/切插件影响。三种格式的 block snapshots 都以 50 ms 合并刷新为进程内 `MailboxGenerationPreview`，两个 Mailbox pane 可同步看到稳定的纯文本临时行；不完整的 Markdown/JSON 不会被标成结构化终态。preview 不写入 mailbox.json、不参与下一轮 prompt、不标未读、不发 toast，失败或重启时直接丢弃。完整终态经所选格式校验后才以同一消息 ID 原子落盘、标未读并弹通知；失败保留源块。Mailbox 保存原始正文与格式，Markdown、JSON 和含缩进/ASCII 的 Plain 由安全原生展示层分别排版，AI 续问沿用会话最近回复格式。
-- **Esc 关闭共享外壳**：工作台可见时，未修饰 `Esc` 关闭并暂停完整 Buffer 或 Clipboard-only 外壳。Buffer capture 路径只处理 Buffer 所拥有的组字；Clipboard-only/直输路径不提交、不取消也不改写宿主正在进行的 composition。失配或重复回调只消费，不得把 Esc 泄漏给宿主或关闭错误会话。
-- **活动状态只有一个视觉承载者**：AI/插件的连接、生成、失败等同一条活动信息只能显示在正文 rail 或工具栏状态列之一。正文 rail 已承担该状态时工具栏必须留空；正文不渲染该状态时，工具栏才作为后备，避免同一“正在连接/生成”文案上下重复。
-- **当前插件范围**：只维护 **AI 生成 2.1、实时翻译 2.1、意识流输入 1.3**。`Marine Chrome`、`My Prompt`、`Remarkable` 已下架，不再进入当前 catalog、安装/默认启用策略或运行时 owner 路由。后文相关章节仅用于追溯旧实现。
+- **Clipboard History 是同级独立窗口与持久化子系统**：`⌘⇧P` 打开屏幕底部的 nonactivating 窗口，不显示或改变 Buffer。收录开启且 secure input、锁屏、睡眠、会话失活均不存在时，同一 RIMES 进程在后台读取 pasteboard，将文本、链接、图片、文件、颜色与未知类型的原始 representation 持久写入 `~/Library/Application Support/RIMES/clipboard/clipboard.sqlite`；保护期间不读，恢复只更新 `changeCount` baseline，不补抓。原始负载惰性读取，不写正文日志或仓库；拒绝 confidential/transient 标记。横向卡片支持全库元数据与图片类别别名搜索、左右选择、Return / `⌘1`–`⌘9` 直接激活、`⌘C` 复制原始内容、Delete 持久删除；图片记录和可解码的图片文件异步加载有界缩略图，卡片显示真实来源 App 图标。完整文本走 exact-token 插入；图片/RTF/HTML/文件等先无损恢复 pasteboard，再以带内部标签、定向精确宿主 PID 的 `Command+V` 完成粘贴。该事件桥只在显式激活时按需请求 Post Event 权限，并在 token/client/PID 前后失配时 fail closed；标签事件绕过 RIMES 自身 Buffer 粘贴路由但不改变普通用户快捷键。Paste 导入是只读、幂等、可审计的本地迁移路径；历史、原始负载与预览仅在本机，不进仓库、不做云端或跨设备同步。
+- **Capsule 是同级本机内容模块**：Capsule 在 `~/Library/RimeBuffer/capsule/entries/*.md` 用 Obsidian 可读 front matter + 正文管理 Prompt、Memory 与 Skill 绝对路径，并在第一次初始化时只预设一次标题为 `RIMES 默认词条`、正文为 `RIMES` 的 Memory。Password 使用独立密文目录：`passwords/*.md` 仅暴露标题/UUID/更新时间，网址、App、用户名、当前密码和曾用密码均为 ChaCha20-Poly1305 密文。可输入的 `CapsuleWindowController` 由 `⌘⇧C` 全局开关；`CapsulePaneViewController` 按四类搜索并完整增删改查。Capsule 不进入 Buffer catalog、插件启停、派生 workspace、Return 投递或飞耀并击路径；当前窗口是管理面，不是外部投递目标。
+- **Mailbox 是同级本机会话模块**：`⌘⇧M` 打开的 Mailbox 使用本地持久化会话，跨输入法进程重启保存；Buffer 正文只属于当前进程，Clipboard History 则使用自己的本机持久库，两者都不因 Mailbox 引入发送历史。会话正文使用固定列、全宽、等宽的 CLI transcript，角色只改变提示符和弱强调，不改变左右位置或正文宽度。左栏“新建对话”进入进程内草稿态，不预先持久化空会话；模型选择器只列当前已配置的连接器/模型，Codex CLI 与 Claude Code CLI 分别只暴露各自默认模型，OpenAI 兼容 API 暴露本机私有配置中的 model。该选择在首次 Return 时冻结为会话级快照，不修改全局连接器选择；同一次动作原子创建会话、持久化首个用户 turn 并预留后台 generation，随后按冻结的连接器/模型发起生成。MCP/HTTP 等单向推送先进入 Mailbox 审核；查看、备注和 AI 续问不依赖 Buffer，“发送到 Buffer / 拒绝”由可选桥接协调器提供，不属于 Mailbox Store 或窗口生命周期。
+- **AI 生成只写入 Buffer 内联结果**：紧凑选择器只保留 Plain、Markdown、JSON 三种内容格式，不再提供 Mailbox 目的地。点击主按钮或按 Return 会冻结连接器、模型、模式、格式、源块与 prompt，并由 `AITextPluginWorkspace` 在 Buffer 生命周期内生成；partial/final 只更新独立 target rail，完整终态通过格式校验后才可由用户经统一投递协调器上屏。旧 `destination=mailbox` 或旧 compact `Mailbox` 偏好在读取时静默迁移为 inline；仅当退役的 v2 Mailbox 目的地同时携带合法 `format.v2` 时保留该格式，其他缺失、损坏或 v1-only 组合均回落 Plain。AI 生成路由不创建 Mailbox thread，也不调用 Mailbox coordinator。Mailbox 协调器本身也不再接受 Buffer generation plan 或消费 Buffer 源块；Mailbox 仍在自己的独立窗口中支持新建对话、会话级模型选择与真实续问。
+- **生成结果复制是独立快照事务**：完整且新鲜的非 `BufferModel` 结果才显示复制按钮；纯 `Command+C` 与按钮共用同一路由。事务冻结并在写前重新验证 source identity、workspace、generation、有序 block IDs 与每块文本，随后按 block 顺序无分隔写入系统剪贴板并安全 close-and-pause。普通 Buffer 原文、空/未完成、protected、stale 或 drifted 结果不复制。该路径不调用 `prepare`、`consume`、`BufferDeliveryCoordinator` 或 `Delivery.insert`，不提交、修改或消费 source。
+- **Esc 分属各自窗口**：Buffer 继续以安全关闭流程处理自身组字；Clipboard 搜索非空时 `Esc` 先清搜索，搜索为空时再关闭自己的窗口，始终不提交、不取消也不改写宿主 composition。失配或重复回调只消费，不得把 Esc 泄漏给宿主或关闭错误会话。
+- **活动状态只有一个视觉承载者**：AI/插件的连接、生成、失败等同一条活动信息只显示一次；正文 target/status rail 已承载时，展开工具栏不重复，正文没有承载时才由工具栏状态区作为后备。
+- **当前插件范围**：只维护 **AI 生成 2.1、实时翻译 2.1、意识流输入 1.4**。`Marine Chrome`、`My Prompt`、`Remarkable` 已下架，不再进入当前 catalog、安装/默认启用策略或运行时 owner 路由。后文相关章节仅用于追溯旧实现。
 - **隔空传字已下架**：设置入口、启动服务、局域网配对传输、直输/缓冲镜像和接收投递路径均已移除。旧配对偏好或密钥文件不会被自动删除，但运行时不再读取或使用它们。
 
 ---
 
 ## 0. 一句话
 
-RIMES 是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加了一个**独立、常驻、上屏前的文本工作台**：中文 commit、ASCII/英文/标点、已接受的外部文字与用户主动请求的插件结果都先进入缓冲，再由用户逐块或长按全部投递到实时校验的输入框。当前维护的 AI 生成、实时翻译与意识流输入都经过同一投递边界；Mailbox 则独立保存 AI 会话和待审核外部推送。核心输入方案是雾凇全拼、自然码双拼、小鹤双拼、五笔 86 与英文；`my_combo` 由默认关闭的「并击」扩展拥有。意识流不修改当前普通输入方案：扩展关闭时把焦点绑定的物理 `a-z` 当作连续全拼，扩展开启时使用扩展当前的飞耀并击/互击模式映射物理批次，分别保留同批结算与相邻左/右半区跨批重组语义。完整音节自动加入 soft ASCII syllable Space，尚未配对的单侧拼音片段只映射、不切割。用户物理 Space 才是立即请求、以 `·` 可视化并参与短句强分块的 hard boundary；自动 Space 显示为普通空格，只参与全拼音节提示。AI 生成只在 Return 或主按钮明确请求时运行；意识流按停顿自动猜测配置上限内的 1–5 个互斥版本（默认 5）。多结果都在单一 target viewport 中分页并由 pager、↑/↓ 或数字 1–5 选择，Return/纸飞机先原子确认当前版本再发送，任何结果都不能自动上屏。`Command+Shift+B` 可全局开关工作台，`Command+Shift+P` 只显示/隐藏剪贴板历史 rail，`Command+Shift+M` 全局开关 Mailbox；secure input、失效焦点与工作台自有输入框始终隔离。
+RIMES 是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加 Buffer、Clipboard History、Mailbox 与 Capsule 四个同级本机模块。Buffer 是独立、常驻、上屏前的文本工作台：中文 commit、ASCII/英文/标点、已接受的外部文字与用户主动请求的插件结果先进入缓冲，再由用户逐块或长按全部投递到实时校验的输入框。当前维护的 AI 生成、实时翻译与意识流输入都经过同一投递边界；Mailbox 独立保存 AI 会话和待审核外部推送；Clipboard History 在无保护且收录开启时后台持久保存多类型 pasteboard representation，并只在 `⌘⇧P` 打开的底部窗口展示。核心输入方案是雾凇全拼、自然码双拼、小鹤双拼、五笔 86 与英文；`my_combo` 由默认关闭的「并击」扩展拥有。意识流不修改当前普通输入方案：扩展关闭时把焦点绑定的物理 `a-z` 当作连续全拼，扩展开启时使用扩展当前的飞耀并击/互击模式映射物理批次，分别保留同批结算与相邻左/右半区跨批重组语义。完整音节自动加入 soft ASCII syllable Space，尚未配对的单侧拼音片段只映射、不切割。用户物理 Space 才是立即请求、以 `·` 可视化并参与短句强分块的 hard boundary；自动 Space 显示为普通空格，只参与全拼音节提示。AI 生成只在 Return 或主按钮明确请求时运行；意识流按停顿自动猜测配置上限内的 1–5 个互斥版本（默认 5）。多结果都在单一 target viewport 中分页并由 pager、↑/↓ 或数字 1–5 选择，Return/纸飞机先原子确认当前版本再发送，任何结果都不能自动上屏。`Command+Shift+B/P/M/C` 分别开关 Buffer、Clipboard History、Mailbox 与 Capsule；secure input、失效焦点与模块自有窗口始终隔离。
+
+`Command+Shift+C` 全局开关独立 Capsule 管理窗口；Capsule 不属于 Buffer 插件体系。
 
 ---
 
@@ -66,7 +73,8 @@ RIMES 是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并�
                                                 ├─ Codex CLI（ChatGPT 登录态） │
                                                 ├─ Claude Code（CLI 授权态）   │
                                                 └─ OpenAI 兼容 API           │
- 意识流 raw ───────────▶ StreamInputWorkspace ─▶ 独立可配置 AI 渠道 ──▶ 1–5 个完整猜测 │
+ 意识流 raw ───────────▶ StreamInputWorkspace ─▶ 本地 Rime + Octagram ─┐             │
+                                                    └─复杂输入→独立 AI 回退─┴▶ 1–5 个完整猜测 │
  [计划] 多目标/远端 ACK────┤◀▶ DeliveryRouter（M5；当前不存在）                          │
                           └──────────────────────────────────────────────────────────┘
                                     │ 底座
@@ -195,10 +203,10 @@ MarineChromeWorkspace.Job ── 一次显式网页评论/回复生成
 - **RimeBufferController 按键隔离与 Return 手势**：缓冲模式在最外层吞掉普通/Shift+Return 与 Backspace。精确外部租约持有缓冲控制期间，`CompositionSession` 会常驻一次不可见 U+200B marked-text guard（包括 Rime 空闲和引擎不可用阶段），防止 Chromium/ProseMirror 在 IMK handled 结果之外观察 raw Return 并提交；guard 生命周期与真实组字状态分离，空闲 guard 不会把 `composition.composing` / lease `compositionActive` 置真，且 marked range 标为不可靠。Return keyDown 绑定当时的 `FocusToken`；有未决 Rime/并击组字或未 ready 意识流 raw 时只收束/强制生成并抑制到物理抬起。ready 意识流则在该 keyDown 先执行同一个 `prepareForDelivery()` 确认，删除其他候选后继续当前轻按/长按手势；其他可投递内容也在 keyDown 定点重建 guard，再由 keyUp/物理轮询判定轻按 `sendNext` 或持续 1.2 秒的长按 `sendAll`。每次被接管的物理按键持有 sticky keyUp / `didCommand(insertNewline:)` suppression，发送最后一个 transient block 令 buffer inactive、动作 reset 或失焦都不能把迟到/重复回调放给宿主；旧字段的 stale callback 不改变当前按压状态，下一次确认的 non-repeat keyDown 才退休旧代并立即按新状态路由。`didCommand` 只防御性消费，不形成第二条发送路径。Backspace 仅在精确租约下改 Rime/缓冲。隔离分支先于 raw fallback，故引擎失败和不可信焦点也不会把这两个键交给宿主。
 - **RimeBufferController 全选/粘贴路由**：`BufferClipboardShortcutRules` 只识别单一 Control 或 Command 修饰的 A/V；额外 Shift/Option 或 Control+Command 保持宿主快捷键。精确外部租约下，普通/插件 source 先收束 Rime 或 chord 组字再对 `BufferModel` 全选/粘贴，意识流则只操作 raw source。NSEvent 主路与 `didCommand(selectAll:/paste:)` 共用防重和物理 keyDown 所有权；对 Notes 等先套用 Cocoa 标准键位的宿主，只有在对应物理 Control+A/V 仍按下时，才把 `moveToBeginningOfParagraph:` / `pageDown:` command-only 回调还原为工作台动作，并从严格 live lease 恢复缺失的 callback client。真实 preedit 收束后，每次精确 A/V 都重装 U+200B host guard，避免 Chromium/Electron 在 IMK handled 周边再次执行宿主快捷键；`setMarkedText` 同步返回后必须重验同一租约。正在计时的 Return 发送会在 source 编辑前取消，但仍吞掉它的迟到 keyUp，防止新文本被误发。`NSPasteboard.general` 只在 secure input 为 false 且精确租约校验之间读取；延迟 pasteboard provider 返回后再重验，任一门控失配都不修改 source。
 - **ShiftModifierGesture**：在所有 keyDown 早退之前记录 Shift 已被作为修饰键，并保存起始左/右 Shift keysym、session 与 schema。物理 press 不立即进入 `ascii_composer`；release 只为同 session/schema 的独立短按补发匹配的一对事件，其余手势不发。候选 Option 选择、预先按住的 Option/Control/Command、双 Shift 和失焦因此都不会留下 Rime modifier 债务，也不会先执行 `commit_code` 再尝试回滚。
-- **CandidateWindow**：Rime 候选交互与显示的唯一状态机及唯一原生 panel 内容层级。直输模式由原 `nonactivatingPanel` 跟随当前精确宿主 caret；Buffer 捕获同一精确 `FocusToken` 时，`BufferInlineView` 在逻辑插入 caret 处内联投影 preedit，同一个候选 panel 只把 anchor 切到该 Buffer caret，始终保持为独立 WindowServer surface，不迁入工作台，也不占工作台布局。该 panel 使用 `.moveToActiveSpace + .fullScreenAuxiliary`，不常驻所有 Space；若已显示却仍属于旧 Space，则在再次置前前先 `orderOut`。两种 route 不创建第二个选择 authority，因此主题、尺寸、翻页、单字选择和 token 化点击仍完全共用。普通宿主保持 `.popUpMenu`；只有精确验证的 iShot 非激活标注租约临时使用 `CGShieldingWindowLevel()` 以兼容截图遮罩，隐藏、失权或换宿主时立即恢复普通层级。高层级不提供展示权限：最终显示还要重验 secure input，`isVisible` 必须以 panel 的真实 WindowServer 可见性与 active-Space 状态为准。show/hide 统一记账；权限失败先清除候选按钮、inline preedit、tooltip 和 accessibility 明文，再隐藏 panel 并清空 presentation。候选专属键盘/鼠标/Option 手势仍过同一真实可见性门。三行矩阵继续共用原 scroll viewport 与 frame-driven document stack；意识流的 1–5 个 alternatives 在另一单一 target viewport 分页，不使用 Rime 候选状态机。
+- **CandidateWindow**：Rime 候选交互与显示的唯一状态机及唯一原生 panel 内容层级。直输模式由原 `nonactivatingPanel` 跟随当前精确宿主 caret；Buffer 捕获同一精确 `FocusToken` 时，`BufferInlineView` 在逻辑插入 caret 处内联投影 preedit，同一个候选 panel 只把 anchor 切到该 Buffer caret，始终保持为独立 WindowServer surface，不迁入工作台，也不占工作台布局。该 panel 使用 `.moveToActiveSpace + .fullScreenAuxiliary`，不常驻所有 Space；若已显示却仍属于旧 Space，则在再次置前前先 `orderOut`。两种 route 不创建第二个选择 authority，因此主题、尺寸、翻页、单字选择和 token 化点击仍完全共用。普通宿主保持 `.popUpMenu`；只有精确验证的 iShot 非激活标注租约临时使用 `CGShieldingWindowLevel()` 以兼容截图遮罩，隐藏、失权或换宿主时立即恢复普通层级。高层级不提供展示权限：最终显示还要重验 secure input，`isVisible` 必须以 panel 的真实 WindowServer 可见性与 active-Space 状态为准。正常 hidden→visible 使用 60 ms ease-out 淡入，普通组字结束使用 45 ms ease-in 淡出；visible→visible 的候选刷新不重播动画，旧淡出 completion 由 generation 拒绝，淡出开始即同步撤销逻辑候选与交互权。Reduce Motion、secure input、失焦/全局隐藏与其他权限失败仍立即清除候选按钮、inline preedit、tooltip 和 accessibility 明文并 `orderOut`。show/hide 统一记账；候选专属键盘/鼠标/Option 手势仍过同一真实可见性门。三行矩阵继续共用原 scroll viewport 与 frame-driven document stack；意识流的 1–5 个 alternatives 在另一单一 target viewport 分页，不使用 Rime 候选状态机。
 - **InputFocusCoordinator**：把 controller、租约 `IMKTextInput`、`controller.client()` 当前对象身份、bundle id、宿主进程/前台锚点与单调 token 绑定；普通 App 的 `liveTarget` 重验全部身份及 frontmost bundle/PID。只有精确 bundle/path allowlist 中的 `com.apple.Spotlight`、`com.wiheads.paste`、`cn.better365.ishot` 与 `com.apple.appkit.xpc.openAndSavePanelService` 可走瞬态界面路径：activation 只创建 suspended 预热租约，新鲜 keyDown 才建立可投递 epoch。Spotlight/Paste/iShot 冻结唯一 service PID、自有可见窗口和下层前台锚点；打开/保存面板接受多个 genuine 系统 service PID，但不选择其中任何一个，而是冻结发起 App bundle/PID 与其最前 layer-0 面板窗口 ID。后续 target/event/commit 都重验同一权限组合；keyUp/flagsChanged 不能建立或解锁，任一 workspace activation 都撤销。事件时间戳必须晚于 activation floor/最近已接受事件；先于 activate 的首键只建立短期 provisional 租约。无 bundle 的首键可暂用当前 PID，但不缓存该推测身份；后续 bundle/path 验证会刷新 epoch。同一 proxy 跨字段或跨 controller 复用时，生命周期回调保持锁闭，直到完全验证的 keyDown 确认新字段。异步 chord 回放失配、弱 client 过期时，旧 session 只在 Rime 内回收/丢弃，不调用已移动或释放的 proxy。
 - **ChordExtensionStore + ChordController + ChordSettings**：「并击」扩展拥有启用状态、飞耀并击/互击模式与组键间隔；常规 Rime 路径仅在扩展开启且当前 schema 为 `my_combo` 时负责 release-replay。意识流独立于当前普通 schema，只在扩展开启时复用同一模式、时长、`FlyChordBatchState` 与 schema parser，把飞耀批次映射成全拼；扩展关闭则使用逐字连续全拼。全新 profile 默认关闭，旧 `my_combo` 与旧 chord/mutual 配置按语义版本迁移，学习进度与内部 ID 不变。
-- **StatusMenu**：不建独立 NSStatusItem，系统输入法菜单顶层保留「设置 / Mailbox / 维护」；Mailbox 标题动态显示未读数与实际快捷键，工作台显隐、剪贴板历史、常显、移屏、更新、日志、部署、重装和重启都收进「维护」子菜单。
+- **StatusMenu**：不建独立 NSStatusItem，系统输入法菜单顶层保留「设置 / Buffer / Clipboard History / Mailbox / Capsule / 维护」；Mailbox 标题动态显示未读数与实际快捷键，Buffer 常显、移屏、更新、日志、部署、重装和重启仍收进「维护」子菜单。
 
 ### 4.2 缓冲层
 
@@ -272,7 +280,7 @@ BufferDeliveryCoordinator (单例)
 
 设置中的缓冲插件 Switch 独立管理一个可多选的启用集合；当前 AI 生成、实时翻译与意识流输入以带 SF Symbol 的同类卡片呈现。具有声明式 schema 的内置或宿主已知插件统一显示“设置…”按钮，由 `PluginConfigurationViewController` 渲染，不允许外部包注入 AppKit 视图。`PluginConfigurationUserDefaultsStore` 以每插件单字典保存普通偏好；含 `secureText` 的配置必须进入 0700 目录中的 0600 私有文件，保存通知只携带插件 ID 和字段 ID。完整约束见 [PLUGIN-CONFIGURATION.md](PLUGIN-CONFIGURATION.md)。外部 Action Plugin v1 无需升级 manifest：身份图标继承首个 action 的 `symbol`，未知符号回退为通用拼图。展开工作台中的紧凑选择器只枚举已启用集合，并以 `Default` 表示显式不使用插件；`BufferPluginSelectionStore` 再把集合中的选择收敛为一个当前 owner。选择器与 `Command+Shift+↑/↓` 共用这一有序目录，键盘在两端循环。两条入口都只原子替换 owner，不改其他插件的启用状态；关闭当前 owner 的后台 Switch 会同时回到 `Default`。缓冲插件不会贡献动态“扩展”路由。旧版本中三个 provider-specific plugin id 会迁移到「AI 生成」owner，并把原选择保留为连接器偏好。owner 切换会取消旧 owner 的在途请求、停止其工作台状态并作废旧翻译/AI generation，但**不撤销已完成外部 Action Plugin block 生成时的投递 authority**；只有该外部插件被禁用、卸载、升级或原 runtime 失效时，才撤销对应权限。
 
-实时翻译不伪装成 HTTP Action Plugin。`AppleTranslationWorkspace` 读取 `BufferModel.stagedText`；界面上方源轨合并显示全文且不分 block，下方目标轨独立显示译文 block，两条轨道分别横向滚动。顶部功能栏永久显示且空白区域可拖动，发送按钮对齐下方目标语言行。默认 provider 是 Apple 本地翻译：AppKit 工作台挂载 1×1 的 `NSHostingView`，通过 SwiftUI `translationTask` 获得只在视图生命周期内有效的 `TranslationSession`，原文不交给网络服务。用户也可选择当前 AI 渠道；宿主用严格 JSON 边界构造翻译请求，再由共享 `AITextConnectorRegistry` 执行。自动刷新采用 single-in-flight + latest-queued；只有与当前原文、语言和 provider 配置完全匹配的 generation 才进入可发送态。保存配置、原文变化或内部生命周期作废时，保留原文 `BufferModel`，按新快照重启；界面不提供手动刷新按钮。未 review 的 Action Plugin 目标绑定块禁止作为翻译源，避免加工后绕过原焦点/上下文校验。`BufferDeliveryCoordinator` 通过 `BufferDeliveryContentSource` 选择普通缓冲或译文缓冲，并在每个 block 投递前按 workspace/generation/id 重取实时内容。译文 `.processor` 来源继承所有源 block 中最严格的 remote-mirror 策略。
+实时翻译不伪装成 HTTP Action Plugin。`AppleTranslationWorkspace` 读取 `BufferModel.stagedText`；界面上方源轨合并显示全文且不分 block，下方目标轨独立显示译文 block，两条轨道分别横向滚动，折叠态合计 78pt。正文前置输入/插件图标切换 33pt 工具栏和 1pt divider，展开态为 112pt；工具栏提供插件选择、翻译配置、状态与关闭，target rail 不显示角色图标，发送按钮对齐目标行。默认 provider 是 Apple 本地翻译：AppKit 工作台挂载 1×1 的 `NSHostingView`，通过 SwiftUI `translationTask` 获得只在视图生命周期内有效的 `TranslationSession`，原文不交给网络服务。用户也可选择当前 AI 渠道；宿主用严格 JSON 边界构造翻译请求，再由共享 `AITextConnectorRegistry` 执行。自动刷新采用 single-in-flight + latest-queued；只有与当前原文、语言和 provider 配置完全匹配的 generation 才进入可发送态。保存配置、原文变化或内部生命周期作废时，保留原文 `BufferModel`，按新快照重启；界面不提供手动刷新按钮。未 review 的 Action Plugin 目标绑定块禁止作为翻译源，避免加工后绕过原焦点/上下文校验。`BufferDeliveryCoordinator` 通过 `BufferDeliveryContentSource` 选择普通缓冲或译文缓冲，并在每个 block 投递前按 workspace/generation/id 重取实时内容。译文 `.processor` 来源继承所有源 block 中最严格的 remote-mirror 策略；完整新鲜译文的复制另走系统剪贴板快照事务，不进入该投递协调器。
 
 Remarkable 同样不伪装成 HTTP Action Plugin，也不成为派生 delivery source。它实现通用的内置货架动作接口；设备必须先开启 USB Web interface 并通过 USB 连接，只有用户点击“识别当前页”才开始读取。插件通过 `/usr/bin/ssh` 按 `.metadata.lastOpened` 选择最近打开文档，从 `.content.cPages.lastOpened.value` 定位当前页及其 PDF 页序，连续读取两次 `<document UUID>/<page UUID>.rm` 并要求字节完全一致，以此冻结识别前的页面身份与内容快照。
 
@@ -295,16 +303,19 @@ Marine 页面上下文 ─Return/右侧 AI 主按钮─▶ Marine prepare prompt
                               AI target rail / Action Plugin blocks（完成后才可发）
 
 当前完整意识流 raw ─灵敏/平衡/稳定三档，默认 220/800 ms─▶ StreamInputWorkspace
-                                  └─▶ 意识流独立选择的 AITextProvider（默认 OpenAI 兼容）
-                                      └─▶ 配置上限内 1–5 个完整互斥猜测 ─单轨分页─▶ 仅 final 所选项可发
+                                  └─▶ StreamInputModularInferenceEngine
+                                      ├─▶ 私有 Rime session + 隐藏 Octagram 简体 schema
+                                      └─▶ 不支持/失败时顺序回退到意识流独立 AITextProvider
+                                          └─▶ 配置上限内 1–5 个完整互斥猜测 ─单轨分页─▶ 仅 final 所选项可发
 ```
 
 - **翻译（已实现）**：当前 macOS 15.1 SDK 下使用 SwiftUI `translationTask(configuration)` 桥接；Translation 与 `_Translation_SwiftUI` 弱链接，最低系统仍是 macOS 13，13/14 只显示不可用状态。`prepareTranslation()` 由系统在首次使用语言组合时准备本地模型。
 - **Codex/Claude CLI**：Codex 用一次性 app-server 的双向 stdio JSON-RPC 接收 `item/agentMessage/delta`；除显式 `RIMEBUFFER_CODEX_PATH` 覆盖外，自动探测优先 ChatGPT.app bundled Codex，再按顺序选择第一个通过能力检查的 Homebrew、用户 PATH、常见版本管理器或编辑器内置安装。专用 ChatGPT 登录持久化在 `~/Library/RimeBuffer/ai/codex-home`，它不读取 `~/.codex`，设置页也把凭据状态与 CLI 能力状态分开呈现。结构化 account/login 流程只打开受限 HTTPS 授权 URL，以 loginId 匹配完成事件并经 account/read 复核 ChatGPT 账户；生成前再断言 MCP 列表为空。Claude 在后台以 `claude auth status --json` 的 `loggedIn` 布尔值检查 CLI 授权，设置页通过固定 `claude auth login --claudeai` 浏览器流程授权，生成则用 `stream-json` partial。RimeBuffer 不读取 Claude 凭据文件，不传透 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CONFIG_DIR` 或 ambient API key。兼容性不依赖版本号：Codex 以完整隔离 argv 的无提示词 initialize + 空 MCP 握手为准，Claude 以实际生成所需的工具关闭与流式参数为准；满足能力契约的新旧版本均可使用。能力/授权结果在后台缓存并周期复核，hot path 不启动子进程；生成前以 stat 指纹确认已验证可执行文件未被替换。两者都由 `Process` 直接启动，参数固定，工作目录临时且为 0700，不启用 shell、工具、网络工具或会话持久化；能力或隔离参数不成立时 fail-closed。这是“本地启动 CLI”而不是“本地推理”。
 - **OpenAI 兼容 API**：在“设置 › 连接器 › AI 模型”配置 Base URL、model 和 API key；端点为 `POST {baseURL}/chat/completions`，必须返回 SSE，按 `choices[].delta.content`/`[DONE]` 收口，2xx 非 SSE 响应 fail-closed。远程地址必须 HTTPS，HTTP 仅允许 loopback，且拒绝 userinfo/query/fragment 与 redirect。意识流 `.alternativeGuesses` 专用请求显式关闭 `thinking`、要求 JSON object、设置 `max_tokens=1024` 与低 temperature；普通「AI 生成」不带这些字段。阶段诊断只记录 UUID、状态码、耗时、字节/块数和枚举结果，并通过进程级异步串行 writer 写入，不含 URL/model/raw/prompt/正文/key。配置与密钥存于 0600 文件 `~/Library/RimeBuffer/ai/openai-compatible.json`，不写 UserDefaults 或日志。意识流不读取普通连接器的当前单选，始终直接使用这份配置（当前模型 `deepseek-v4-flash`）。`ai` 是 app bundle 外的产品持久状态：开发重播种、pkg 覆盖安装和应用内更新都必须保留，用户无需在版本更新后重新填写。
+- **本地模块化意识流引擎**：默认第一模块是进程内 `RimeEngine` 的独立、可复用 session，固定选择不进入 F4 的 `stream_input_local` 隐藏 schema；该 schema 只保留 `script_translator + uniquifier`，关闭用户词典学习，并通过官方简体 `zh-hans-t-essay-bgw` Octagram 模型做上下文排序。只有隐藏 schema、grammar 配置和已审计模型三者都存在、且 bridge 确认 Octagram module 已注册时本地模块才启动，缺件时直接顺序回退 AI，不以普通 `rime_ice` 掩盖部署故障；插件全局注册本身不预热，只有它被选中且 Buffer 开启或首次实际捕获时才在后台准备，避免与普通输入启动争锁。一次查询在桥接层的同一把锁内完成 `set_input → get_context → 逐项 highlight → 拷贝完整 commit preview → clear`；调用方只接收自有内存，后台线程不会持有或竞争普通 IMK 使用的 bridge scratch 字符串，也不会把尚未翻译的 raw 尾部静默截掉。local raw 限 512 bytes、hard clause 限 8 段；soft Space 转为拼音分隔符，hard Space 分段后用有界 rank beam 合并，含未转换 ASCII 尾部的 preview、Latin/错拼/超限/零候选都按同一冻结请求顺序回退到配置的 AI 模块。私有 session 不 commit、不选词、不训练，用户词典维护令其失效后按 `sessionExists` 懒重建，解码失败则销毁失效 session。每个模块的 completion 仅接受一次，取消句柄持续拥有所有已启动阶段。模块只产出候选，焦点/revision/投递 authority 仍全部由 `StreamInputWorkspace` 持有。
 - **意识流调度与连续渲染**：响应节奏由灵敏 140/500、平衡 220/800（默认）或稳定 350/1200 ms 三档映射为 debounce/max-wait；连续字母或已结算 FlyYao 批次只重置所选 debounce，本次 burst 首次 raw 变更建立的 max-wait 不重置，因此不停输入也会按上限刷新。显式 `.chord`/`.mutual` 的第一枚键先撤销旧投递权，再按 `ChordSettings.duration` 等待当前物理批次；并击只映射同批，互击还能把有效的相邻左/右半区批次重组。所有精确映射都一次性写入全拼，但只有完整音节同时追加一个 soft ASCII Space，尚未配对的单侧拼音片段与单键不加 Space，无映射批则保留字母原码且不伪造分隔。soft Space 走普通 debounce。用户物理 Space 写入 hard boundary；若 raw 已以 soft Space 结尾则只移除 sidecar 标记、原位提升同一字节。hard Space 上轨显示 `·`，立即触发完整快照请求；前导/连续 hard Space no-op。数字 `1`–`5` 与普通 ↑/↓ 只切换尚未确认的候选；修饰方向键仍放行。精确 Control/Command+A 选中 raw 上轨，Control/Command+V 将 ASCII 字母小写化、把空白段归一为 hard Space 并立即触发一次完整 raw 请求；非法字符或 16 KiB 越界时整次粘贴原子不改状态。workspace 采用有界 make-before-break，最多允许旧视觉 producer + 新 challenger 两路；跨 revision 的旧响应、所有 partial 和 baseline 只服务于显示，绝不进入下一轮 prompt。唯一例外是同 revision 的一次 minimum-candidate retry 可携带此前严格验证的 final 作为有界 JSON 排重数据；墓碑回调仍按 job/generation 丢弃。
 - **意识流全局推断边界**：请求边界始终冻结候选上限、响应节奏、当前包含 ASCII Space 的完整 raw 拼音以及 soft-space offsets，任何响应都是对全文的替代解释；进行中修改配置只影响下一次实际请求。`StreamInputPinyinHints` 产生最多三条 lossless 边界提示，不跨 hard Space 组音节并以 ` | ` 显式保留 hard boundary；soft Space 作为普通拼音音节边界保留，未知 English/错键不丢失，超过 512 bytes 时省略提示。本地提示数大于一时 `minimumGuessCount=2`，候选上限为 1 时自动封顶为 1。首个严格合法 final 不足下限时只重试一次，已验证候选作为有字节上限、JSON 编码且明确不可信的 `excludedGuesses` 送入重试；新旧 final 以旧候选优先顺序合并、精确去重并截到冻结上限。prompt、provider schema/decoder、retry merge、provisional 与 final 都强制同一个 1–5 上限。重试仍重复或失败时，此前合法 final 仍可 ready；retry partial 与 baseline 永不成为 fallback，首轮没有合法 terminal fallback 的 schema/非空/大小失败仍拒绝。retry partial 从旧候选之后的稳定槽位开始，final 逐槽精确替换；多候选在一个稳定 target viewport 中分页，活动项再做确定性宿主分块。每个非空 hard-Space 子句提出一个最小投递块目标，soft Space 不增加该目标；若补拆会切断英文单词、URL、代码、数字或引文，受保护片段保持原子。协调器在冻结 delivery generation 前确认当前候选并清除其余候选，Return keyDown 也执行同一确认，因此同一次轻按可从 keyUp 开始发送。raw 贯穿所选答案的部分投递保留，最后一块成功才连同结果清除；首块投递后主动继续输入才会建立全新 raw 并撤销未发送尾部，已投递前缀不得复活。
-- **共同隐私/体验边界**：普通「AI 生成」与当前唯一的 prepared Action Plugin 都只在用户用 Return 或右侧 AI 主按钮明确请求时运行；多个 prepared 动作不会被 Return 自动选择，仍要求点击各自的显式动作。意识流是唯一按输入停顿自动请求的 AI 例外，且只发送当前焦点绑定的 raw 全拼。普通「AI 生成」只发送当前 `BufferModel.stagedText`，不附带历史、preedit、剪贴板或屏幕上下文；prepared Action Plugin 只发送插件明确返回且通过身份校验的 prompt。首字前仅展示安全的连接/思考摘要/重试/校验状态与等待秒数，不展示 raw chain-of-thought。普通生成正文可细分为受保护的语义 block；意识流的每个结果则必须是可独立投递的完整猜测，不得在候选间拆句。未 review 的 Action Plugin 目标绑定块不能被作为普通 AI 源文。
+- **共同隐私/体验边界**：普通「AI 生成」与当前唯一的 prepared Action Plugin 都只在用户用 Return 或右侧 AI 主按钮明确请求时运行；多个 prepared 动作不会被 Return 自动选择，仍要求点击各自的显式动作。意识流按停顿自动运行本地模块；只有本地明确不支持或失败时，才把当前焦点绑定的 raw 全拼送到其独立 AI 回退渠道。普通「AI 生成」只发送当前 `BufferModel.stagedText`，不附带历史、preedit、剪贴板或屏幕上下文；prepared Action Plugin 只发送插件明确返回且通过身份校验的 prompt。首字前仅展示安全的连接/思考摘要/重试/校验状态与等待秒数，不展示 raw chain-of-thought。普通生成正文可细分为受保护的语义 block；意识流的每个结果则必须是可独立投递的完整猜测，不得在候选间拆句。未 review 的 Action Plugin 目标绑定块不能被作为普通 AI 源文。
 - **Marine 边界（历史兼容）**：旧 Marine 实现通过 `preparePath` 产出 prompt，自身不保存模型凭据、启动 Codex/Claude 或直接调用 OpenAI；连接器执行与 `blocks-v1` 校验仍在 RimeBuffer 内完成，结果绑定原 runtime/context/focus authority。该实现已下架，不进入当前设置、owner 或发布门禁。
 
 ### 4.5 投递层
@@ -336,9 +347,11 @@ Delivery.insert(_ text, into: client)
 ```
 普通输入                         Buffer 捕获（普通 / 派生轨）
 ┌──────────────────────┐       ┌─────────────────────────────────────┐
-│ CandidateWindow panel │       │ 常显工具栏 + Buffer 内容轨             │
-│ 跟随宿主 caret         │       │ preedit 内联于逻辑插入 caret           │
-└──────────────────────┘       └─────────────────────────────────────┘
+│ CandidateWindow panel │       │ 可切换 Toolbar 33pt + divider 1pt      │
+│ 跟随宿主 caret         │       ├─────────────────────────────────────┤
+└──────────────────────┘       │ 内容轨：折叠 44/78，展开 78/112pt      │
+                               │ preedit 内联于逻辑插入 caret           │
+                               └─────────────────────────────────────┘
                                       │
                                ┌──────▼───────────────────────┐
                                │ CandidateWindow 独立悬浮 panel │
@@ -346,16 +359,16 @@ Delivery.insert(_ text, into: client)
                                └──────────────────────────────┘
 ```
 
-- **缓冲工作台是独立 `NSPanel`**：默认 nonactivating，不改变 AppKit key-window 身份，但用户显式从隐藏态唤出时会先收束宿主直输组字，并把当前精确外部 `FocusToken` 的逻辑输入权交给 Buffer；宿主文本框只保留为之后分块/整块上屏的投递锚点。随后以同一 live lease 前后校验一次 caret 行矩形。IMK 的 `attributes(forCharacterIndex:)` 使用 inline-session 相对下标 `0`；禁止传入文档级 `selectedRange`/`markedRange`。合法目标优先把工作台放在输入框下方，空间不足则翻到上方；只有基础 rails 与可选 Clipboard rail 参与最大工作台高度及稳定一侧预判，真实 frame 始终贴输入行 10pt。无可信目标、secure input、零/异常/离屏矩形才使用鼠标所在屏幕的居中靠下位置。工作台显示后不会随同屏字段、输入或流式刷新追踪移动；自动 origin 不覆盖用户保存的 canonical frame，被动启动、Clipboard-only 显示和会话恢复也不切换输入路由。普通/单交换基础高度为 78pt，实时翻译与意识流 live-expand 的 source+target 基础高度为 112pt；Rime preedit 在现有 source rail 内联显示，候选 panel 独立浮动，二者都不改变工作台高度。派生 workspace 可提供 1–5 个互斥 alternative，`BufferInlineView` 只保留一个稳定 target viewport，通过 pager 切换当前 alternative，不再按候选数叠行。主条只保留正文轨与固定的 22×22 纯图标主操作。顶部功能栏的 88pt 状态列只在 active、保护、焦点阻塞和失败等可操作状态参与布局；正文 target/status rail 已显示同一活动信息时该状态列必须为空，只有正文不承担时才作为后备。插件动作、弹性拖动区、上下文诊断、按状态出现的 22pt 返回编辑控件和关闭保持稳定；没有刷新槽。`NSControl` 与正文轨不可拖。焦点锚定布局切 owner 或轨道时保持靠输入框的一侧并向外增减；手动/无目标布局仍固定底边。frame 持久化保存不含任何候选几何的 canonical 78/112pt（或加 Clipboard）高度，并在屏幕拓扑变化后夹回可见区域；旧展开态与候选位置偏好不再参与布局。原来的标题/字数、手动遮蔽、历史、清空和工具层发送入口均已移除。
+- **缓冲工作台是独立 `NSPanel`**：默认 nonactivating，不改变 AppKit key-window 身份，但用户显式从隐藏态唤出时会先收束宿主直输组字，并把当前精确外部 `FocusToken` 的逻辑输入权交给 Buffer；宿主文本框只保留为之后分块/整块上屏的投递锚点。随后以同一 live lease 前后校验一次 caret 行矩形。IMK 的 `attributes(forCharacterIndex:)` 使用 inline-session 相对下标 `0`；禁止传入文档级 `selectedRange`/`markedRange`。合法目标优先把工作台放在输入框下方，空间不足则翻到上方；以 Buffer 最大 112pt 高度预判稳定一侧，真实 frame 始终贴输入行 10pt。无可信目标、secure input、零/异常/离屏矩形才使用鼠标所在屏幕的居中靠下位置。工作台显示后不会随同屏字段、输入或流式刷新追踪移动；自动 origin 不覆盖用户保存的 canonical frame。Rime preedit 在现有 source rail 内联显示，候选 panel 独立浮动，二者都不改变工作台高度。派生 workspace 可提供 1–5 个互斥 alternative，`BufferInlineView` 只保留一个稳定 target viewport，通过 pager 切换当前 alternative，不再按候选数叠行。工作台初始为单行正文：普通/source-only/target-only 为 44pt，live source+target 为 78pt；正文只保留一个可点击的前置输入/插件图标与固定的 22×22 纯图标主操作。该图标切换 33pt 顶部工具栏和 1pt divider，展开后分别为 78pt 与 112pt；工具栏集中承载插件选择、当前插件配置、按状态出现的返回编辑、状态与关闭。工具栏空白 chrome/status/spacing/spacer 可拖窗，控件保持交互；正文、背景与尾部动作不可拖，并无专用右侧拖动条。展开态不持久化，隐藏或保护时折叠。target rail 没有角色图标；正文状态已显示时工具栏不重复。完整且新鲜的生成结果另显示复制按钮，纯 `Command+C` 与之等价；复制写系统剪贴板后安全关闭，不经过 Delivery，也不消费 source。frame 持久化保存不含候选几何的 canonical frame，并在屏幕拓扑变化后夹回可见区域。Clipboard History 拥有自己的窗口和 frame，完全不参与 Buffer 几何或输入 ownership。
 - **输入空态是 placeholder**：Default 与所有派生 Buffer 的 source 空态文案仅在逻辑输入未激活、source 与 preedit 都为空且 source rail 实际可见时渲染。点击 source rail 并成功取得精确 `FocusToken` 的 Buffer 输入权后，提示立即退出布局，空插入点只显示光标；离开 Buffer 回到直输后，若仍为空则恢复提示。不可编辑的 target 空态，以及 loading、failed、unavailable、protection 等运行状态不是 placeholder，不随 source 聚焦隐藏。
 - **React single-exchange 的原生映射是显式契约**：`AI -> derived singleExchange`，`Marine -> derived singleExchange`，`Remarkable -> standardBufferImport`。AI 与 Marine 都有独立 source/context 和 result workspace，视觉交换不改变其投递 authority；现有 refresh 会提前清除未投递结果，因此结果态只暴露“返回编辑”这一明确放弃动作。Remarkable 不属于 `DerivedBufferWorkspaceRouter`：它完成 SSH 当前页稳定复验与本地 OCR 后，把带 `.ssh` provenance 的识别正文写入普通 `BufferModel`，随后只走普通缓冲投递。若强行套 exchange rail 会制造第二份结果状态并绕开其原生安全生命周期，所以保留标准 rail。`BufferNativePresentationContract` 与 `buffer-window-smoke` 同时钉住三种映射。
 - **跨 Space/显示器恢复是唯一焦点跟随例外**：缓冲捕获开启且新焦点仍是精确、可信、非 secure 的外部文本目标时，如果工作台滞留旧 Space，或合法 caret 已在另一物理显示器，就只迁移一次。当前 Space 同屏字段切换、输入和流式刷新不移动窗口。自动路径在真正置前前再次校验 token、secure input 与会话保护；拿不到合法 caret 时只重排原 frame，不使用鼠标屏 fallback。未固定窗口同时使用 `.moveToActiveSpace` 与 `.fullScreenAuxiliary`，固定窗口使用 `.canJoinAllSpaces` 与 `.fullScreenAuxiliary`；两组 Space 行为互斥。自动 origin 不覆盖用户手动位置，关闭仍通过暂停捕获表达明确隐藏意图。
-- **全局切换快捷键与 Esc**：`GlobalHotKeyController` 用 Carbon 注册精确且可配置的 `Command+Shift+B`、`Command+Shift+P` 与 `Command+Shift+M`，不需 Accessibility 权限。B 调用 `BufferWindowController.toggleVisibility()`：隐藏时走 `openAndResume()`，先把当前精确宿主 token 的逻辑输入路由切到 Buffer，再把非 pin 面板带到当前 Space；显示时复用 `closeAndPause()`，安全收束当前组字、保留块、暂停捕获并隐藏。P 只切换剪贴板 rail；需要显示外壳时调用被动 `show()`，不恢复 Buffer 捕获。M 只开关独立 Mailbox 窗口，关闭复用标准窗口生命周期，不恢复 Buffer 捕获或复用旧宿主焦点。注册快捷键均被消费，不继续传给前台应用。无论工作台由 B 还是 P 显示，只要共享外壳可见，未修饰 `Esc` 都关闭它；Clipboard-only 不得因此触碰宿主 composition。
+- **全局切换快捷键与 Esc**：`GlobalHotKeyController` 用 Carbon 注册精确且可配置的 `Command+Shift+B`、`Command+Shift+P`、`Command+Shift+M` 与 `Command+Shift+C`，不需 Accessibility 权限。B 调用 `BufferWindowController.toggleVisibility()` 并沿用 Buffer 的 open/resume 与 close/pause 生命周期；P 调用 `ClipboardHistoryWindowController.toggleVisibility()`，打开或关闭屏幕底部的独立 nonactivating 窗口，不恢复 Buffer 捕获；M 与 C 分别开关 Mailbox、Capsule。注册快捷键均被消费，不继续传给前台应用。Buffer 的 `Esc` 只关闭 Buffer；Clipboard 搜索非空时 `Esc` 先清搜索，搜索为空时关闭 Clipboard 自己，始终不触碰宿主 composition。
 - **切离 RIMES**：任何非 RIMES 的 TIS 通知都先 fail-closed 撤销精确焦点租约并收束候选；只有输入源 ID 真实变化到非 RIMES 时，才进一步复用 `closeAndPause()` 隐藏工作台、暂停捕获、停止 transient 插件工作并保留 staged blocks。重复的同一非 RIMES ID 通知不产生第二次关闭；切回 RIMES 也不自动恢复工作台。
-- **边缘绘制**：圆角层内缩到透明窗口边距，并覆盖固定的墨竹/翡翠工作台背景 token，避免 HUD 背景采样破坏对比度；边框按 backing scale 以路径内 hairline 绘制，避免把居中 border 压在窗口 bounds 上造成圆角或边缘裁剪毛边。
-- **关闭不会删除已有块**：先显式收束当前组字，暂停捕获，结束 transient 加载/错误状态并保留已有模型块，再隐藏。从设置/输入法菜单显示工作台时会恢复底层捕获。工作台没有手动清空或撤销入口；隐私选项触发的跨 app 清理仍是不可恢复的安全操作。
+- **边缘绘制与主题**：圆角层内缩到透明窗口边距，使用当前 appearance family 的完整工作台背景 token，避免 HUD 背景采样破坏对比度；边框按 backing scale 以路径内 hairline 绘制，避免把居中 border 压在窗口 bounds 上造成圆角或边缘裁剪毛边。墨竹、翡翠、静谧是 Classic 家族配色；Rasta 是独立完整的红黄绿语义主题。
+- **关闭不会删除已有块**：先显式收束当前组字，折叠工具栏，暂停捕获，结束 transient 加载/错误状态并保留已有模型块，再隐藏。从设置/输入法菜单显示工作台时会恢复底层捕获。工作台没有手动清空或撤销入口；隐私选项触发的跨 app 清理仍是不可恢复的安全操作。
 - **常显与多屏**：pin 开启时工作台加入所有桌面与全屏辅助空间；关闭时只属于一个 Space。候选始终是独立 panel：直输时跟随宿主 caret，Buffer 捕获时跟随当前 active Space 上的 Buffer 逻辑 caret；即使工作台 pinned，候选也只服务当前唯一 `FocusToken`，继续遵守 `.moveToActiveSpace + .fullScreenAuxiliary`。菜单“移到当前屏幕”和设置中的移屏动作只搬动工作台外壳，不切换输入路由；可见候选随 live caret 重定位。
-- **隐私**：工作台不再维护手动遮蔽状态；secure input 会隐藏正文并禁用发送与插件动作。此时 Ctrl/Cmd+A/V 保留宿主原生处理，RIMES 在任何 pasteboard API 调用之前就返回。锁屏、睡眠或会话切出会撤销 FocusToken，只在 Rime 内回收/丢弃组字并隐藏窗口；恢复后等待新焦点租约。可选的切 app 清理只认真实外部 A→B，A→本应用窗口→A 不清理；混有任一外部来源块时则整体保留。
+- **隐私**：工作台不再维护手动遮蔽状态；secure input 会折叠工具栏、隐藏正文并禁用发送与插件动作。此时 Ctrl/Cmd+A/V 保留宿主原生处理，RIMES 在任何 pasteboard API 调用之前就返回。锁屏、睡眠或会话切出会撤销 FocusToken、重置工具栏，只在 Rime 内回收/丢弃组字并隐藏窗口；恢复后等待新焦点租约。可选的切 app 清理只认真实外部 A→B，A→本应用窗口→A 不清理；混有任一外部来源块时则整体保留。
 - **Rime 候选呈现自动跟随逻辑输入目标**：直输 route 使用宿主 caret，Buffer 精确 capture 使用 `BufferInlineView` 中当前可见的逻辑 caret；两者都由同一个独立 nonactivating candidate panel 悬浮呈现。用户不再手动选择候选位置。Buffer 只投影 preedit，不复制候选选择状态；两种 route 复用同一 Rime 上下文与 token 化选择动作。候选条只保留 `1`–`9` 候选与齿轮设置；历史 `0 + tray` Buffer 入口及其鼠标/无障碍状态已删除，数字 `0` 不再被候选层消费。意识流 alternative pager 是另一类派生交互。
 - **外部待决项**：当前由复用的 `MailboxPaneViewController` 在设置页或独立 `MailboxWindowController` 中“加入 Buffer / 拒绝”；异步来源只写入会话和通知，不会自行拉起工作台。`WorkbenchBarView` 仅保留为历史三层方案素材；`panel-render` 已直接渲染真实 `BufferWindowController`，避免预览与运行时再次漂移。
 
@@ -365,7 +378,10 @@ Delivery.insert(_ text, into: client)
 左侧一级导航
 ├─ 输入法：输入方案 / 词库
 ├─ 外观：候选窗 / 主题
-├─ 窗口：Buffer / Clip / Mailbox
+├─ Buffer：Buffer
+├─ Clipboard：Clipboard History
+├─ Mailbox：Mailbox
+├─ Capsule：Capsule
 ├─ 连接器：AI 模型 / 本地网关
 ├─ 插件：全部 / 缓冲插件 / 内置扩展
 ├─ 维护：更新与重启 / 日志与数据
@@ -373,21 +389,21 @@ Delivery.insert(_ text, into: client)
 ```
 
 - 每个一级页的子页固定显示在右侧顶部；route/subpage 使用稳定字符串身份，不依赖 sidebar 行号。启停内置扩展后目录会重建；若当前扩展被停用，安全回退到「插件 ▸ 内置扩展」。
-- 主题只提供深色「墨竹」与浅色「翡翠」；为兼容已安装版本，`appearanceMode` 仍持久化为 `night` / `day`。两套主题主动选择 Aqua/Dark Aqua，不跟随系统明暗或系统强调色；产品强调色固定为绿色，同时继续尊重“增强对比度”辅助功能。
+- 主题设置先选 appearance family，再选家族配色。墨竹（`night`）、翡翠（`day`）与静谧（`quiet`）是 Classic 家族的三种配色并保持旧持久值兼容；Rasta（`rasta`）是独立完整主题，以红/黄/绿分别表达终止或破坏、配置或导航、输入或就绪等语义，并覆盖表面、文字、控件、状态与强调色，而不是只替换 Classic 的单个 accent。所有主题继续尊重“增强对比度”辅助功能。
 - 输入法页只有「输入方案 / 词库」。五个普通方案按稳定 schema ID 映射为 `rime_ice`、`double_pinyin`、`double_pinyin_flypy`、`wubi86` 与 `english`；新安装默认当前方案为 `rime_ice`。`my_combo` 不出现在核心卡片中，由默认关闭的「并击」扩展负责。扩展开启只增加能力和可部署 schema，不暗中替换当前普通方案；用户在扩展设置中显式选择「设为当前输入方案」后才切换。扩展关闭时先收束当前组字、退回上一次普通方案，并拒绝 F4 里可能残留的 `my_combo`。同一 `my_combo` 由扩展模式区分只结算当前批的飞耀并击与可跨左右批配对的飞耀互击；组键间隔、课程、练习和进度也都在该扩展。内部插件 ID `builtin.fly-chord-learning`、schema ID 与进度路径保持不变。`my_combo` 的候选拼写、中文/英文翻译及过滤链继承 `rime_ice`。词库页通过 librime `levers` API 维护真实用户学习库，导入是合并，导出是可移植 TSV，不复制 live LevelDB。
-- 缓冲区、连接器和外部插件管理仍接真实运行时；“AI 模型”子页用单选控件在 Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 三个模型源间切换，展示两个 CLI 的可用性与授权/远程服务隐私说明，并管理 OpenAI 兼容 API 的 Base URL、model 与 API key。该单选独立于缓冲插件 owner；AI 生成与实时翻译可使用共享选择，意识流则维护自己的渠道选择（仍复用连接器授权/凭据）。插件列表中凡 registry 能解析配置 schema 的当前项目都显示同一个“设置…”入口。通用 SSE/SSH provider 尚未实现；旧 Remarkable 专用动作仅留在历史兼容代码。当前没有按来源编辑信任等级或重新生成 token 的 UI。
+- 缓冲区、连接器和外部插件管理仍接真实运行时；“AI 模型”子页用单选控件在 Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 三个模型源间切换，展示两个 CLI 的可用性与授权/远程服务隐私说明，并管理 OpenAI 兼容 API 的 Base URL/model 与 API key。该单选独立于缓冲插件 owner；AI 生成与实时翻译可使用共享选择，意识流的本地模块不需要凭据，其复杂输入回退仍维护自己的 AI 渠道选择并复用对应连接器授权。插件列表中凡 registry 能解析配置 schema 的当前项目都显示同一个“设置…”入口。通用 SSE/SSH provider 尚未实现；旧 Remarkable 专用动作仅留在历史兼容代码。当前没有按来源编辑信任等级或重新生成 token 的 UI。
 
 ### 5.3 统一插件平台
 
 - `PluginRegistry` 是发现、命名空间、内置扩展生命周期和统一启停 facade；`PluginKey(domain, rawID)` 防止内置与外部包同名遮蔽。
-- **预置 Buffer 插件分发**：当前四个第一方 Buffer 插件仍编译在签名的 RIMES 进程内，网络内容不能带来可执行 Swift/脚本。`Catalog/buffer-plugins.json` 是版本与默认状态的唯一来源，生成运行时 catalog 与中英文 README 表，CI 用 `scripts/sync-buffer-plugin-catalog.py --check` 锁定结果。全新用户预装并启用 AI 生成 2.1、实时翻译 2.1、意识流输入 1.3 与 Capsule 0.3；已下架的 My Prompt、Remarkable、Marine Chrome 不进入 catalog、下载或运行时 owner 路由。
+- **预置 Buffer 插件分发**：当前三个第一方 Buffer 插件仍编译在签名的 RIMES 进程内，网络内容不能带来可执行 Swift/脚本。`Catalog/buffer-plugins.json` 是版本与默认状态的唯一来源，生成运行时 catalog 与中英文 README 表，CI 用 `scripts/sync-buffer-plugin-catalog.py --check` 锁定结果。全新用户预装并启用 AI 生成 2.1、实时翻译 2.1 与意识流输入 1.4；Capsule 是目录外的核心模块，`builtin.capsule` 只可能作为旧偏好残留并由 registry reconcile 清除。已下架的 My Prompt、Remarkable、Marine Chrome 不进入 catalog、下载或运行时 owner 路由。
 - **外部缓冲插件**仍完全沿用 Action Plugin v1：`ActionPluginHost + ActionPluginManager` 是执行、runtime binding、授权与撤权的唯一 authority。Registry 不重建 wire metadata，也不能让外部包贡献原生 AppKit 设置页，因此 Marine 兼容路径不变。
-- **内置扩展/缓冲插件**是随应用编译的可信模块。统计、打字测速和「并击」贡献动态设置页；AI 生成、实时翻译与意识流输入贡献 `.bufferAction`，在唯一 owner 下互斥运行且不伪装成左侧动态扩展页。「并击」保留历史内部 ID 以延续设置与学习进度，但启停已成为运行时能力门控：关闭后普通输入不再运行 chord replay，意识流也回到逐字全拼。Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是 `AITextConnectorRegistry` 下的三个普通连接器；意识流用自己的 provider 字段选择其中一个，默认 OpenAI 兼容，不跟随共享 AI 单选。
+- **内置扩展/缓冲插件**是随应用编译的可信模块。统计、打字测速和「并击」贡献动态设置页；AI 生成、实时翻译与意识流输入贡献 `.bufferAction`，在唯一 owner 下互斥运行且不伪装成左侧动态扩展页。「并击」保留历史内部 ID 以延续设置与学习进度，但启停已成为运行时能力门控：关闭后普通输入不再运行 chord replay，意识流也回到逐字全拼。Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是 `AITextConnectorRegistry` 下的三个普通连接器；意识流默认先走本地 Rime/Octagram，仅在回退时使用自己的 provider 字段，默认 OpenAI 兼容且不跟随共享 AI 单选。
 - `InputTelemetryBus` 是非消费型、脱敏的主线程观测通道：不携带正文、候选、IMK client、FocusToken、应用或焦点身份。secure input、RIMES 自身窗口和不可信/失焦目标不发事件；字符计数只在真正进入缓冲或 `Delivery.insert` 成功后发布。
 
 ### 5.4 其它 UI
 - **StatusMenu**：系统输入法菜单里的命令入口。
-- **MailboxWindowController / MailboxPaneViewController**：独立可编辑会话窗口与设置页复用双栏 CLI transcript；共享本地 Store 选中态，关闭时不恢复 Buffer。
+- **MailboxWindowController / MailboxPaneViewController**：独立可编辑会话窗口与设置页复用双栏 CLI transcript；共享本地 Store 选中态，关闭时不恢复 Buffer。独立窗口的“新建对话”先维护进程内草稿与会话级模型选择，首次 Return 才通过 `AITextMailboxGenerationCoordinator` 创建持久会话并启动生成，因此取消或关闭草稿不会留下空会话，也不会改写全局连接器偏好。
 - **KeyboardHeatmapView / YearHistoryHeatmapView**：统计内置扩展中的每日键盘热力图与全部历史日历热力图。
 - **开发预览模式**：`settings-preview/render`、`panel-render`、`gateway-serve` 子命令，无头渲染/验证，不接进正式菜单。
 
@@ -427,12 +443,12 @@ Delivery.insert(_ text, into: client)
 | Marine Chrome 配对 | 固定 manifest ID 仅收窄 Origin；首次连接需 RIMES 原生确认，并以 60 秒随机 claim 领取专用 Bearer；拒绝/超时不覆盖旧凭据 | ✅ |
 | 来源门控 | `SourceTrust` 有询问/信任/拦截三种类型；当前规则固定：Marine 信任，MCP/HTTP/SSE/SSH 询问，无按来源覆盖 UI | ✅ 固定规则；可配置化属后续 |
 | MCP 隐私边界 | 工具只给不看不发；无读缓冲/读上下文/触发投递工具 | ✅ 写死 |
-| 网络出站清单 | 更新检查与用户显式调用的 Codex/Claude/OpenAI 连接器已存在；SSE 订阅/SSH 仍属后续 | ✅ 已实现项按用户动作或现有设置运行 |
+| 网络出站清单 | 更新检查、用户显式调用的 Codex/Claude/OpenAI，以及本地意识流不支持时按现有配置启用的 AI 回退已存在；SSE 订阅/SSH 仍属后续 | ✅ 本地可解码输入不出站；回退状态可见 |
 | AI 连接器隐私红线 | 只在点击生成时发当前缓冲全文或通过身份校验的 prepared prompt；CLI 非本地推理；工具/会话关闭，能力与隔离契约不成立时 fail-closed | ✅ |
 | CLI 授权边界 | Codex 只用应用专属 `codex-home`；Claude 只调官方 CLI 登录/状态命令，不读凭据文件或传送 OAuth token/替代配置目录；Marine 不接触凭据 | ✅ |
 | OpenAI 凭据 | Base URL/model/API key 保存到 0600 私有 JSON；拒绝非 HTTPS 远程端点与 redirect | ✅ |
 
-**明确不做**（v1 边界）：后台常驻或跨进程持久化的剪贴板捕获、AirDrop 目标、Turn/Artifact 完整版本模型、宿主文本撤回，以及工作台内的块级/无边界自由编辑面。当前可选 Clipboard rail 仅在工作台真实可见且无保护状态时读取，历史只存在当前进程；显式 off→on 可收录一次当下内容，普通显隐和保护/会话恢复只建 baseline，不补抓期间内容。
+**明确不做**（当前边界）：剪贴板云端/跨设备同步、读取 confidential/transient 或保护期间内容、AirDrop 目标、Turn/Artifact 完整版本模型、宿主文本撤回，以及工作台内的块级/无边界自由编辑面。独立 Clipboard History 在收录开启且无保护时由同一进程持久保存多类型原始 representation；图片与可解码图片文件提供本机异步有界预览和来源 App 图标。保护/会话恢复只建 baseline，不补抓期间内容。
 
 ---
 
@@ -441,8 +457,9 @@ Delivery.insert(_ text, into: client)
 - **进程**：单进程后台 agent（`LSUIElement`，`.accessory`）。IMKServer 连接名必须与 Info.plist 一致。持进程生命周期。
 - **身份三元组冻结**：bundle id `com.isaac.inputmethod.RimeBuffer` + mode `.Hans` + 目录 `ETInput.app`，CI 断言钉死字面值（防重复注册鬼影）。
 - **持久化**：
-  - UserDefaults：缓冲开关、工作台显隐/canonical frame/常显、跨 app 清理选项、当前普通输入方案、并击扩展开关/模式/时长、候选窗尺寸、网关开关/端口、外观。候选承载位置由精确输入 route 自动决定，旧候选锚点偏好不再读取；按来源信任覆盖尚未实现，因此当前不在持久化项中。
-  - 仅进程内：缓冲 blocks；输入法进程重启后不恢复，发送历史与清空撤销不再保留。
+  - UserDefaults：缓冲开关、工作台显隐/canonical frame/常显、跨 app 清理选项、当前普通输入方案、并击扩展开关/模式/时长、候选窗尺寸、网关开关/端口、外观。工具栏展开态只在进程/会话内存在并在隐藏或保护时重置；候选承载位置由精确输入 route 自动决定，旧工具栏展开和候选锚点偏好不再读取。按来源信任覆盖尚未实现，因此当前不在持久化项中。
+  - 仅进程内：缓冲 blocks 与工具栏展开态；输入法进程重启后不恢复，发送历史与清空撤销不再保留。
+  - 本机私有 SQLite + 压缩负载：Clipboard History 的文本、链接、图片、文件、颜色与未知 representation；缩略图按需异步解码且有界，不上传云端。
   - 0600 文件：gateway-token、marine-chrome 专用 token/origin、remote 身份私钥、`ai/openai-compatible.json`（Base URL/model/API key）。
   - 0600 JSON：按键统计（按日 + 全历史）、打字测速聚合、并击课程/练习进度；沿用旧飞耀学习文件与路径。测速中的“成文字符”按 Rime commit 计数（直输或进入缓冲均计入），只保存数量、不保存正文；损坏、超限或非普通文件均 fail-closed，不覆盖原数据。
   - Rime 用户数据：`~/Library/RimeBuffer`；词库维护只经官方 `levers` 导入/导出 portable TSV 或恢复官方快照，不直接复制/修改 LevelDB。
@@ -463,22 +480,26 @@ Sources/RimeBuffer/
   CompositionSession.swift      marked text / preedit
   CandidateWindow.swift         唯一 Rime 候选状态/独立浮窗 + host/Buffer caret 路由
   InputFocusCoordinator.swift   FocusToken / client+前台PID租约 / target-event-lifecycle 规则
-  BufferWindowController.swift  永久展开：单轨78pt/双轨112pt + 760pt母版 + 固定槽工具栏/单交换状态/安全投递动作
-  BufferInlineView.swift        工作台 source选中、待发送 chips、来源徽标与1–5 alternative单target轨分页
+  BufferWindowController.swift  初始44/78pt + 可切换33+1pt工具栏后78/112pt + 760pt母版 + 生成结果复制/单交换状态/安全投递动作
+  BufferInlineView.swift        前置输入图标、source选中、待发送 chips、来源徽标与1–5 alternative单target轨分页（target无角色图标）
+  BufferGeneratedResultCopy.swift 非BufferModel生成结果的冻结/写前重验与纯规则probe
   BufferModel.swift             缓冲枢纽（blocks / 全选粘贴 / 成功消费 / transient；无发送历史）
   BufferDeliveryCoordinator.swift 精确目标上的逐块投递与成功块消费
-  GlobalHotKeyController.swift    Command+Shift+B 工作台；Command+Shift+P Clip；Command+Shift+M Mailbox
+  GlobalHotKeyController.swift    Command+Shift+B Buffer；Command+Shift+P Clipboard History；Command+Shift+M Mailbox；Command+Shift+C Capsule
+  CapsuleWindowController.swift   四类本机 Markdown/密文条目 CRUD 面板与独立可输入窗口
+  CapsuleWindowSmoke.swift        独立窗口 CRUD、脱敏与路径规则 smoke
   ActionPlugins.swift            manifest/runtime config/Bearer HTTP/prepare→本地连接器/动作生命周期与安全分流
   ActionPluginManager.swift      插件安装/下载/启停/卸载与原子文件事务
   Origin.swift                  来源溯源 + echo 守卫              [工作台新增]
-  Delivery.swift                唯一上屏咽喉 + 密码框护栏
+  Delivery.swift                Buffer 唯一上屏咽喉 + secure-input 护栏
   ChordExtension.swift          并击扩展开关、飞耀模式与旧配置迁移
   ChordController.swift         my_combo 门控的批次回放 + ChordSettings
   RimeKey/RimeModels/InputSchemaCatalog   键映射/五个核心方案/可选扩展方案目录
   RimeUI.swift                  配色/主题
-  StatusMenu.swift              设置 / Mailbox / 维护三级系统输入法菜单命令
-  ClipboardHistoryModel.swift   可见性与保护态门控的进程内剪贴板历史
-  ClipboardRailView.swift       工作台 40pt 剪贴板轨
+  StatusMenu.swift              设置 / Buffer / Clipboard History / Mailbox / Capsule / 维护系统输入法菜单命令
+  ClipboardHistoryWindowController.swift 独立底部 nonactivating 窗口、exact FocusToken 投递与会话保护
+  ClipboardHistoryModel.swift   独立窗口、保护态门控、本机SQLite多类型历史、图片别名搜索与异步有界缩略图
+  ClipboardRailView.swift       独立窗口横向卡片时间流、搜索与键盘交互（保留旧文件名）
   SettingsWindow.swift          垂直一级导航 + 横向子页设置壳
   SettingsRouting.swift         稳定 route/subpage + 动态扩展目录与回退
   PluginPlatform/BuiltInPlugins 统一 Registry、能力模型与内置扩展生命周期
@@ -503,13 +524,13 @@ Sources/RimeBuffer/
     InboundBus.swift            汇聚 + 门控 + 背压 + 流式
     LocalGateway.swift          回环 HTTP/MCP 服务器
     GatewayToken.swift          0600 token
-    InboundTrayWindow.swift     Mailbox 独立窗口（保留旧类型别名）
+    InboundTrayWindow.swift     Mailbox 独立窗口（文件名暂保留，运行时类型已统一为 Mailbox）
     InboundToast.swift          完整消息落盘后的右上角未读通知
   Mailbox/
     MailboxModels.swift         会话 / 消息 / 生成 / 审核模型
     MailboxStore.swift          0600 JSON 原子落盘、跨重启恢复与未读状态
-    MailboxPaneViewController.swift  设置页与独立窗口共用双栏 UI
-    AITextMailboxGenerationCoordinator.swift  独立后台 AI 任务与真实续问
+    MailboxPaneViewController.swift  设置页与独立窗口共用双栏 UI、进程内新对话草稿与模型选择
+    AITextMailboxGenerationCoordinator.swift  新会话原子创建、独立后台 AI 任务与真实续问
   MarineChromeGatewayAuth.swift 专用 token / Chrome origin 配对
   MarineChromePairingPrompt.swift 本机双确认与确认码弹窗
   MarineChromePlugin.swift      短时网页租约 / AI workspace / 安全投递源
@@ -520,9 +541,9 @@ Sources/RimeBuffer/
   [计划] Delivery/DeliveryRouter 多目标投递 + 远端 ACK + 持久账本
 ```
 
-**测试**：无 XCTest target；CI 运行编进二进制的 smoke 子命令。`plugin-configuration-smoke` 覆盖三个维护插件的默认值与运行时桥、意识流 v1.1 时序迁移、1–5 整数候选和三档节奏、普通/私有配置存储、0700/0600 权限、弱权限与 symlink 拒绝、值/通知脱敏，以及 AI 翻译 prompt 的 JSON 边界。`stream-input-smoke` 覆盖 `.chord`/`.mutual` 双路由、同批与跨左右批映射、单键不重组、非和弦边界清配对、自动 soft Space/物理 hard Space 原位提升、提示与宿主分块差异、三档调度与请求级配置冻结、provider 1–5 parser/schema/prompt、retry/partial/final 同一上限、首键撤销旧投递权、Backspace 先结算再逐字删除，以及原有焦点/secure/modifier 门、有界双路、迟到回调 tombstone、选择/投递和 raw 全选粘贴契约。`fly-chord-learning-smoke` 另验证 fixture 与真实部署 schema 都能被同一 mapper 消费。`buffer-window-smoke` 覆盖固定工具栏槽、状态显隐、live-expand/single-exchange、1–5 alternative 单 target rail pager、全选显示与固定 78/112pt AppKit 几何；`matrix-smoke` 仍覆盖普通 Rime 候选的 1–3 行及三行 viewport 上限。`buffer-smoke` 覆盖 Control/Command+A/V 精确组合规则、普通/插件 source 的全选替换、块光标粘贴、语义分块、精确连接文本与纯空白保留；secure input 不读 pasteboard 与延迟读取后租约重验仍需安装后的真实 IMK 交互回归。`ai-text-smoke`、`translation-smoke`、`stream-input-smoke` 与通用 `plugin-stream-smoke` 覆盖当前派生工作区、外部 Action Plugin 的分段/权限继承和 partial/final 一致性。这些 smoke 不调用真实模型或用户配置的真实 API；真实 librime 词库桥另有强制隔离 `RIMEBUFFER_USER_DIR` 的 `user-lexicon-bridge-smoke`。
+**测试**：无 XCTest target；CI 运行编进二进制的 smoke 子命令。`plugin-configuration-smoke` 覆盖三个维护插件的默认值与运行时桥、意识流 v1.1 时序迁移、1–5 整数候选和三档节奏、普通/私有配置存储、0700/0600 权限、弱权限与 symlink 拒绝、值/通知脱敏，以及 AI 翻译 prompt 的 JSON 边界。`stream-input-smoke` 覆盖模块化引擎接入、local hard/soft boundary 与有界候选 beam，以及 `.chord`/`.mutual` 双路由、三档调度、provider retry/partial/final、焦点/secure 门、有界双路、迟到回调 tombstone、选择/投递和 raw 全选粘贴契约。强制隔离 `RIMEBUFFER_USER_DIR` 的 `smoke` 还会部署隐藏 schema，以原子 `set_input` 查询验证“你好”、确认 F4 不含隐藏 schema与新普通 session 不被污染，并输出 30 次热解码 p50/p95；不调用真实模型或用户配置的 API。`fly-chord-learning-smoke` 另验证 fixture 与真实部署 schema 都能被同一 mapper 消费。`buffer-window-smoke` 覆盖初始紧凑正文、前置输入/插件图标两次切换、33pt 工具栏 + 1pt divider、工具栏空白拖动与控件交互、右侧专用拖动区删除、隐藏/保护折叠重置、target 无角色图标、live-expand/single-exchange、1–5 alternative 单 target rail pager、全选显示与 44/78pt 折叠、78/112pt 展开 AppKit 几何；`matrix-smoke` 仍覆盖普通 Rime 候选的 1–3 行及三行 viewport 上限。`buffer-smoke` 覆盖 Control/Command+A/V 精确组合规则、普通/插件 source 的全选替换、块光标粘贴、语义分块、精确连接文本与纯空白保留；secure input 不读 pasteboard 与延迟读取后租约重验仍需安装后的真实 IMK 交互回归。`ai-text-smoke`、`translation-smoke`、`stream-input-smoke` 与通用 `plugin-stream-smoke` 覆盖当前派生工作区、外部 Action Plugin 的分段/权限继承和 partial/final 一致性；`runBufferGeneratedResultCopyRulesProbe()` 覆盖正常单块、多块无分隔、普通 source 拒绝及漂移/不完整 fail-closed。
 
-`clipboard-history-smoke` 覆盖默认关闭、隐藏/关闭 rail 时零 pasteboard 读取、显式 off→on 且工作台可见时收录当前合格文本一次、去重与字节/条目上限、secure/锁屏/睡眠/会话保护即时遮蔽、普通显隐与恢复只建 baseline 且不补抓、进程重启为空，以及 40pt rail 的鼠标/键盘/可访问性行为；`buffer-window-smoke` 另覆盖 rail 开关与真实可见性门、加入 `BufferModel` 的 fail-closed guard、78/112 → 119/153pt outward resize、candidate `0` 放行与 1–9/齿轮边界，以及 canonical frame 不被运行时高度污染。`mailbox-store-smoke` 覆盖 0600/0700、原子写入、容量、旧消息缺失格式字段、Plain/Markdown/JSON 持久化、稳定且不落盘的 generation preview、跨重启中断、未读、持久审核、重复决策与 InboundBus 隔离/恢复；`mailbox-toast-smoke` 固定完成事件、流式 preview 零通知及自动已读竞态；`ai-text-mailbox-smoke` 覆盖选择快照、格式/目的地迁移、inline 格式、Plain 同-index 替换与多-index 流式排序、Markdown/JSON 终态、失败清 preview/保源、重复与迟到回调、真实续问与单向本地备注。
+`clipboard-history-smoke` 覆盖独立窗口显隐、关闭窗口后继续后台收录、收录关闭时零 pasteboard 读取、全 representation 有界归档、后台采集与保护切换竞态、去重与字节/条目上限、confidential/transient marker 拒绝、secure/锁屏/睡眠/会话保护即时遮蔽、恢复只建 baseline 且不补抓、SQLite 重开与退出前写队列 flush，以及横向卡片、元数据/图片别名搜索、异步有界图片缩略图、图片文件预览、真实来源 App 图标、左右选择、纯文本 exact-token 投递、富内容无损重建、定向宿主粘贴事件的标签/键形、`Command+C` 自收录抑制、Delete 与 Esc 行为。真实跨进程 Post Event 权限与宿主粘贴仍需安装态人工回归。`buffer-window-smoke` 独立覆盖 Buffer 折叠/展开几何、candidate `0` 放行与 1–9/齿轮边界；Clipboard 不再进入 BufferModel 或影响其 canonical frame。`mailbox-store-smoke` 覆盖 0600/0700、原子写入、容量、旧消息缺失格式字段、Plain/Markdown/JSON 持久化、稳定且不落盘的 generation preview、跨重启中断、未读、持久审核、重复决策与 InboundBus 隔离/恢复；其 UI 部分还覆盖原生新会话草稿不落盘、CLI 默认模型/OpenAI 配置模型目录、连接器异步可用性刷新、失败文案保留、延迟完成期间导航锁和模型选择冻结。`mailbox-toast-smoke` 固定完成事件、流式 preview 零通知及自动已读竞态；`ai-text-mailbox-smoke` 覆盖退役 Mailbox 偏好的缺失/损坏/合法 v2 迁移矩阵、持久化幂等性、真实 AppKit 输出菜单仅有 Plain/Markdown/JSON、AI 生成仅走 inline 路由、inline 格式校验，以及 Mailbox 原生首轮生成、真实续问、后台终态与单向本地备注。
 
 以下两个 smoke 只服务已下架实现的历史兼容审计，不属于当前 CI 或 Release 必跑门禁：
 
@@ -533,7 +554,7 @@ Sources/RimeBuffer/
 - `plugin-smoke` 覆盖 manifest 发现与 schema、可选 `preparePath` 契约、唯一 prepared presentation 提升到主操作及多动作歧义回退、request/generating/deliver 四态、普通块/其他 action/stale 结果不误亮纸飞机、上下文动作聚合及 `status.actionId` 动态切换、`~`/相对 runtime path、runtime 从新到旧回退与 status→prepare/invoke 精确绑定、只允许 loopback、prepared 五字段身份与 `blocks-v1` 格式校验、流式 1 MiB 响应上限、Bearer request、request/context/action/focus 路由规则、切 owner 后已完成 Marine block 仍保留原投递 authority、切换评论后迟到校验不得上屏、Mailbox 待审队列满载显式失败，以及 stale 结果经人工接受后保留来源但安全降级为普通文本。
 
 - `buffer-window-smoke` 覆盖 focus epoch/弱 lease 清理、target 的 current/expected token 与双 client 身份、普通前台 bundle/PID、事件顺序、provisional nil-bundle 不污染 PID cache、经验证身份刷新 epoch、复用 proxy 仅由可信 keyDown 解锁 lifecycle、own-PID 排除；Spotlight/Paste 矩阵另覆盖精确路径/唯一进程、双 PID/锚点匹配、进程重启/窗口隐藏拒绝、activation/keyDown/keyUp 建权差异及 workspace fail-closed；同时覆盖只在真实外部 A→B 触发的隐私清理。`activation-cache-smoke` 覆盖冷加载、命中、内容变化、原子替换、配置优先级变化与显式部署失效。
-- 同一 smoke 还覆盖工作台布局契约（主条 rail/22×22 icon-only primary、常显工具栏中的条件式 88pt actionable status/plugin-selector+actions/conditional edit/close、无 refresh slot、空状态不保留 status 宽度、AI/活动信息由正文 rail 或工具栏二选一承载、工具栏空白拖窗而控件与正文轨不拖、常规状态留空但行动性状态保留）、`Command+Shift+B` 工作台与 `Command+Shift+P` 剪贴板 rail 的精确全局路由、剪贴板 rail 不恢复 Buffer 捕获的纯切换计划、Buffer/Clipboard-only 可见态的未修饰 Esc 路由及重复 callback 消费、缓冲 Return 的轻按/长按轮询判定、Return/Backspace 路由与 callback ownership；另覆盖默认开启的“最后一块上屏后关闭工作台”偏好，以及 Default/全部 Buffer source 的统一 terminal-drain 判定、部分失败和 generation/new-content 漂移时不产生关闭回执。target/session 的最终关闭门禁与真实 Esc 关闭仍需安装后的 IMK 交互回归。布局 smoke 还覆盖长按进度在 secure-input 遮蔽时清除、live-expand source/target 对齐、single-exchange source/result 视觉切换、1–5 alternative 只显示活动页、pager、inline preedit、浮动候选及所有派生明文在遮蔽时擦除、active-Space 可见性、跨 Space/显示器恢复门控、旧 Space 的 unpinned 重排和 pinned/unpinned 全屏 behavior，以及窗口 geometry：完全离屏时回到 fallback screen、超宽 frame 收进相交 screen、永久展开的单轨 78pt 与双轨 112pt 基础高度、alternatives 和 Rime 候选都不改变工作台高度、手动/无目标布局底边固定、焦点锚定布局 10pt 贴边并向外增减，以及可见区域窄于常规最小宽度时仍能完整放入。候选 smoke 另覆盖 preedit 在 Buffer 插入 caret 的 UTF-8 cursor 定位、候选 panel content 始终留在 panel host、host/Buffer caret 路由、exact-focus/active-Space 门控和 secure scrub。真实 Space/full-screen、IMK 回调顺序、宿主隔离与实际投递仍需安装后的交互回归。
+- 同一 smoke 还覆盖 Buffer 工作台布局契约（初始单行正文、唯一前置输入/插件图标切换 33pt 工具栏 + 1pt divider、44/78pt 折叠与 78/112pt 展开、工具栏空白拖动而控件交互、无右侧专用拖动条、隐藏/保护折叠重置、22×22 icon-only primary、target 无角色图标、无 refresh slot、活动信息在正文优先且工具栏只作不重复的后备）、`Command+Shift+B` 精确全局路由、Buffer 未修饰 Esc 与重复 callback 消费、缓冲 Return 的轻按/长按轮询判定、Return/Backspace 路由与 callback ownership；另覆盖默认开启的“最后一块上屏后关闭工作台”偏好，以及 Default/全部 Buffer source 的统一 terminal-drain 判定、部分失败和 generation/new-content 漂移时不产生关闭回执。生成结果复制 probe 与快捷键 smoke 覆盖：只有完整新鲜的非 `BufferModel` source 可冻结，同 source/workspace/generation/blocks/text 写前重验，多块按顺序无分隔写系统剪贴板，纯 `Command+C` 与按钮等价，关闭后仍消费已接管 keyUp；普通 source、空/未完成、protected、stale/drifted 均 fail closed/按规则透传，且全程不触发 prepare/consume/`Delivery.insert` 或 source mutation。Clipboard 的 `Command+Shift+P`、元数据/图片别名搜索、图片与图片文件异步预览、来源 App 图标、选择/投递/复制/删除/Esc 与保护生命周期由 `clipboard-history-smoke` 独立覆盖。布局 smoke 还覆盖长按进度在 secure-input 遮蔽时清除、live-expand source/target 对齐、single-exchange source/result 视觉切换、1–5 alternative 只显示活动页、pager、inline preedit、浮动候选及所有派生明文在遮蔽时擦除、active-Space 可见性、跨 Space/显示器恢复门控、旧 Space 的 unpinned 重排和 pinned/unpinned 全屏 behavior，以及窗口 geometry：完全离屏时回到 fallback screen、超宽 frame 收进相交 screen、折叠/展开的四个规范高度、alternatives 和 Rime 候选都不改变工作台高度、手动/无目标布局底边固定、焦点锚定布局 10pt 贴边并向外增减，以及可见区域窄于常规最小宽度时仍能完整放入。候选 smoke 另覆盖 preedit 在 Buffer 插入 caret 的 UTF-8 cursor 定位、候选 panel content 始终留在 panel host、host/Buffer caret 路由、exact-focus/active-Space 门控和 secure scrub。真实 Space/full-screen、IMK 回调顺序、宿主隔离与实际投递仍需安装后的交互回归。
 - `buffer-smoke` 覆盖成功块即时消费且不留历史、未发送块顺序、插入点、暂停保留、transient 状态清理与不可恢复的隐私丢弃。真实窗口关闭/锁屏和 IMK 交互仍需安装后的真机验证。
 
 ---
@@ -547,7 +568,7 @@ Sources/RimeBuffer/
 | **前端** | 垂直一级导航+横向子页+动态扩展 / 44pt 单行条+稳定插件区 / 真实运行时预览入口 | ✅ 2026-07-19 已实现；待真实宿主验收 |
 | **spike** | NWListener HTTP/SSE ✓ · MCP 真 Claude Code ✓ · Apple Translation 弱链接/SwiftUI 桥 ✓ | ✅ 全过 |
 | **M2** 网关+MCP | LocalGateway / MCP tools / InboundBus / token / Mailbox | ✅ 本地持久化 Mailbox 审核；不再嵌入 Buffer |
-| **缓冲窗口** | FocusToken / 打开即逻辑聚焦 Buffer / Return+Backspace 隔离 / 78pt 基础轨 / inline preedit + 跟随 Buffer caret 的独立候选浮窗 / 成功块无历史消费 / 多屏与隐私 | ✅ 源码 smoke 已覆盖；待安装后真实宿主输入交互验收 |
+| **缓冲窗口** | FocusToken / 打开即逻辑聚焦 Buffer / 初始44/78pt + 前置图标切换33+1pt工具栏至78/112pt / 工具栏空白拖动 / 无专用右侧拖动条 / target 无角色图标 / 生成结果复制与纯 Cmd+C / Return+Backspace 隔离 / inline preedit + 独立候选浮窗 / 成功块无历史消费 / 多屏与隐私 | ✅ 源码 smoke 已覆盖；待安装后真实宿主输入交互验收 |
 | **Action Plugin v1** | manifest/runtime config/loopback Bearer HTTP/可选 preparePath/动态动作 UI/插件管理/FocusToken+context 安全分流 | ✅ 基础宿主 2026-07-18；prepare 2026-07-20 |
 | **M3** 实时翻译 | 独立双缓冲 / Apple 本地默认 / 当前 AI 渠道 / 语言选择 / 互斥撤权 | ✅ 已实现；待安装后真语言包验收 |
 | **M4** AI 插件与连接器 | 唯一「AI 生成」插件 / Codex、Claude Code、OpenAI 三源切换 / CLI/API 授权 / 双轨 workspace / 0600 凭据 | ✅ 已实现；待真实宿主端到端验收 |
@@ -557,7 +578,7 @@ Sources/RimeBuffer/
 | **Remarkable（历史）** | 旧 SSH/PDFKit/Vision 本地 OCR 导入实现 | 已下架；仅保留隔离兼容代码，不进入当前发布门禁 |
 | **M6** SSE/SSH + 收尾 | SSE/SSH provider / Mailbox 来源适配 / 视觉对齐 | 计划 |
 
-**作废/推迟**（产品决策）：隔空传字全部运行时能力与远端协议 v2；后台常驻/持久化剪贴板捕获；AirDrop。可见工作台内的显式、进程级 Clipboard rail 已实现，不属于该推迟项。
+**作废/推迟**（产品决策）：隔空传字全部运行时能力与远端协议 v2；Clipboard History 跨设备同步；AirDrop。本机后台持久化捕获、图片/文件历史与 Paste 迁移已经实现，不属于该推迟项。
 
 ---
 
@@ -567,7 +588,7 @@ Sources/RimeBuffer/
 2. **Delivery.insert 是唯一上屏咽喉**——任何新上屏路径都必须走它，安全护栏才生效。
 3. **FocusToken 是候选与缓冲投递的共同所有权**——迟到回调只能处理自己的 token；普通 App 的前台 bundle/PID 必须匹配；Spotlight/Paste 只能走各自精确 bundle/path + 唯一 PID/自有窗口路径，AppKit 打开/保存面板只能走精确系统 XPC 集合 + 发起 App/冻结窗口路径，禁止把其他 accessory app 或任意 XPC 服务泛化放行；禁止恢复 `active ?? recent`、`lastClient` 或 bundle-only 投递兜底。
 4. **NWListener 连接对象必须持有**——不持有会立刻释放，`weak self` 变 nil，连接静默失效（spike 抓到过）。
-5. **异步内容事件不许拉起候选面板或工作台**——外部待决项或完整 AI 终态只更新 Mailbox Store、未读数与专用 nonactivating toast；Mailbox/工作台显隐都由用户决定。唯一自动可见性修复是：缓冲已开启后，新的精确外部文本焦点证明窗口滞留旧 Space/显示器时，把既有工作台带回该焦点所在环境。
+5. **异步内容事件不许拉起候选面板或工作台**——外部待决项或 Mailbox 自有对话的完整 AI 终态只更新 Mailbox Store、未读数与专用 nonactivating toast；Buffer 内的 AI 生成终态只更新其现有 target rail。Mailbox/工作台显隐都由用户决定。唯一自动可见性修复是：缓冲已开启后，新的精确外部文本焦点证明窗口滞留旧 Space/显示器时，把既有工作台带回该焦点所在环境。
 6. **处理器必须在入缓冲侧跑**——结果先落块，投递路径保持同步、可逐块重验目标。
 7. **翻译 session 不得离开 SwiftUI 视图生命周期**——工作台内 1×1 `NSHostingView` 承载 `translationTask`；切插件、安全输入、锁屏和关闭时作废 generation。首次语言组合仍可由 macOS 请求下载本地模型。
 8. **钥匙串 vs ad-hoc 签名**——ad-hoc 下钥匙串每次重装弹密码，所有密钥用 0600 文件；拿 Dev ID 后再迁。

@@ -1,146 +1,249 @@
 import Cocoa
+import Carbon.HIToolbox
 
-/// Standalone, deterministic Clipboard model/view contract check. It uses an
-/// in-memory pasteboard double and never touches the user's NSPasteboard.
+private final class ClipboardUnreadableDataProvider: NSObject,
+    NSPasteboardItemDataProvider {
+    private(set) var requestCount = 0
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?,
+        item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        requestCount += 1
+        // Intentionally leave the requested representation unreadable.
+    }
+}
+
+/// Deterministic Clipboard model/window-view contract check. It never touches
+/// the user's NSPasteboard or registers the global shortcut.
 @MainActor
 enum ClipboardHistorySmoke {
+    static func renderPreview(to path: String) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimes-clipboard-preview-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let store = try? ClipboardHistoryStore(rootDirectory: root) else {
+            return false
+        }
+        let pasteboard = ClipboardHistoryPasteboardDouble()
+        let model = ClipboardHistoryModel(
+            configuration: .init(),
+            pasteboard: pasteboard,
+            clock: Date.init,
+            sourceApplicationName: { "Safari" },
+            sourceApplicationBundleIdentifier: { "com.apple.Safari" },
+            store: store,
+            schedulesAutomaticPolling: false
+        )
+        model.start()
+        model.update(windowVisible: true, captureEnabled: true, protection: [])
+        _ = model.ingest("https://docs.example.com/product/clipboard-history")
+        _ = model.ingest("下周把 Capsule 的导入流程和 Obsidian 目录一起复查。")
+        _ = model.ingest("RIMES keeps this clipboard timeline in its local private store.")
+        _ = model.ingest("swift build -c debug")
+
+        // Use a real project asset so the preview exercises the production
+        // rich-image path instead of drawing a placeholder thumbnail.
+        let iconURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Logo/AppIcon.iconset/icon_256x256.png")
+        if let iconData = (try? Data(contentsOf: iconURL)) ?? makeFixturePNG(),
+           let archive = try? ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [NSPasteboard.PasteboardType.png.rawValue],
+                    dataByType: [
+                        NSPasteboard.PasteboardType.png.rawValue: iconData,
+                    ]
+                ),
+           ]) {
+            pasteboard.usesAsynchronousArchive = true
+            pasteboard.stubArchive = archive
+            pasteboard.stubChangeCount += 1
+            _ = model.pollNow()
+            pasteboard.completeAsynchronousRead()
+            let ingestionDeadline = Date(timeIntervalSinceNow: 1)
+            while !model.items.contains(where: { $0.kind == .image }),
+                  Date() < ingestionDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+        }
+
+        let pane = ClipboardHistoryPaneView(model: model)
+        pane.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: ClipboardHistoryWindowMetrics.preferredWidth,
+            height: ClipboardHistoryWindowMetrics.preferredHeight
+        )
+        let thumbnailDeadline = Date(timeIntervalSinceNow: 2)
+        while pane.snapshotForSmoke().renderedThumbnailCount == 0,
+              Date() < thumbnailDeadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        guard pane.snapshotForSmoke().renderedThumbnailCount > 0 else {
+            return false
+        }
+        pane.layoutSubtreeIfNeeded()
+        pane.displayIfNeeded()
+        guard let bitmap = pane.bitmapImageRepForCachingDisplay(in: pane.bounds) else {
+            return false
+        }
+        pane.cacheDisplay(in: pane.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else {
+            return false
+        }
+        do {
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     static func run() -> Bool {
         var ok = true
-
         func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
             guard !condition() else { return }
-            // Failure labels describe contracts and deliberately never include
-            // clipboard payloads.
             FileHandle.standardError.write(Data("FAILED: \(message)\n".utf8))
             ok = false
         }
 
-        // The global visibility shortcut never resumes Buffer capture. Its
-        // pure plan only enables/disables the rail and, when necessary, asks
-        // the existing nonactivating shell to become visible on this Space.
         expect(
-            ClipboardRailVisibilityToggleRules.plan(
-                railEnabled: false,
-                workbenchVisibleOnActiveSpace: false
-            ) == ClipboardRailVisibilityTogglePlan(
-                railEnabled: true,
-                showWorkbench: true
+            ClipboardHistoryWindowVisibilityRules.isVisibleOnActiveSpace(
+                isOrdered: true,
+                isOnActiveSpace: true
             ),
-            "hidden disabled rail did not plan enable-and-show"
+            "active-space visibility"
         )
         expect(
-            ClipboardRailVisibilityToggleRules.plan(
-                railEnabled: true,
-                workbenchVisibleOnActiveSpace: false
-            ) == ClipboardRailVisibilityTogglePlan(
-                railEnabled: true,
-                showWorkbench: true
+            !ClipboardHistoryWindowVisibilityRules.isVisibleOnActiveSpace(
+                isOrdered: true,
+                isOnActiveSpace: false
             ),
-            "enabled rail on another Space was disabled instead of shown"
-        )
-        expect(
-            ClipboardRailVisibilityToggleRules.plan(
-                railEnabled: false,
-                workbenchVisibleOnActiveSpace: true
-            ) == ClipboardRailVisibilityTogglePlan(
-                railEnabled: true,
-                showWorkbench: false
-            ),
-            "visible disabled rail did not plan enable in place"
-        )
-        expect(
-            ClipboardRailVisibilityToggleRules.plan(
-                railEnabled: true,
-                workbenchVisibleOnActiveSpace: true
-            ) == ClipboardRailVisibilityTogglePlan(
-                railEnabled: false,
-                showWorkbench: false
-            ),
-            "visible enabled rail did not plan hide in place"
+            "other-space window reported visible"
         )
 
-        // Clipboard is a content source for Buffer, not a keyboard-routing
-        // control. Adding while direct keeps host typing direct; adding while
-        // captured preserves the exact capture token. Protection refuses the
-        // mutation without altering staged content.
-        let directBuffer = BufferModel()
-        let eligibleState = ClipboardWorkbenchIntegrationRules.captureState(
-            workbenchVisibleOnActiveSpace: true,
-            hiddenForSession: false,
-            railEnabled: true,
+        let eligible = ClipboardHistoryWindowLifecycleRules.captureState(
+            windowVisibleOnActiveSpace: true,
+            captureEnabled: true,
             secureInput: false,
             screenLocked: false,
             sessionInactive: false,
             sleeping: false
         )
-        expect(
-            ClipboardWorkbenchIntegrationRules.addToBuffer(
-                "从剪贴板加入",
-                state: eligibleState,
-                contentShielded: false,
-                model: directBuffer
-            ),
-            "eligible Clipboard item was not added to Buffer"
-        )
-        expect(
-            directBuffer.inputRoute == .directToHost,
-            "Clipboard add implicitly enabled Buffer capture"
-        )
-        expect(
-            directBuffer.stagedText == "从剪贴板加入",
-            "Clipboard add changed staged text"
-        )
-
-        var focusEpochs = FocusEpochState()
-        let captureToken = focusEpochs.activate()
-        directBuffer.activateCapture(for: captureToken)
-        expect(
-            ClipboardWorkbenchIntegrationRules.addToBuffer(
-                "继续",
-                state: eligibleState,
-                contentShielded: false,
-                model: directBuffer
-            ),
-            "captured Clipboard add failed"
-        )
-        expect(
-            directBuffer.capturesInput(for: captureToken),
-            "Clipboard add replaced exact Buffer capture"
-        )
-        let stagedTextBeforeDirectRoute = directBuffer.stagedText
-        directBuffer.routeDirectPreservingContent(
-            reason: "clipboard integration smoke"
-        )
-        expect(
-            directBuffer.inputRoute == .directToHost,
-            "Buffer route did not return to direct after Clipboard add"
-        )
-        expect(
-            directBuffer.stagedText == stagedTextBeforeDirectRoute,
-            "Buffer route switch cleared Clipboard-sourced content"
-        )
-        let protectedState = ClipboardWorkbenchIntegrationRules.captureState(
-            workbenchVisibleOnActiveSpace: true,
-            hiddenForSession: false,
-            railEnabled: true,
+        let secure = ClipboardHistoryWindowLifecycleRules.captureState(
+            windowVisibleOnActiveSpace: true,
+            captureEnabled: true,
             secureInput: true,
             screenLocked: false,
             sessionInactive: false,
             sleeping: false
         )
-        let textBeforeProtectedAdd = directBuffer.stagedText
+        let stacked = ClipboardHistoryWindowLifecycleRules.captureState(
+            windowVisibleOnActiveSpace: true,
+            captureEnabled: true,
+            secureInput: true,
+            screenLocked: true,
+            sessionInactive: true,
+            sleeping: true
+        )
+        expect(eligible.allowsClipboardObservation, "eligible window did not capture")
+        expect(eligible.allowsContentPresentation, "eligible window did not present")
+        expect(!secure.allowsClipboardObservation, "secure input left capture open")
         expect(
-            !ClipboardWorkbenchIntegrationRules.addToBuffer(
-                "不应加入",
-                state: protectedState,
-                contentShielded: true,
-                model: directBuffer
+            stacked.protection == [.secureInput, .screenLocked, .sessionInactive],
+            "stacked protection projection"
+        )
+
+        expect(
+            ClipboardHistoryPasteboardPolicy.allowsPlainTextRead(
+                typeNames: ["public.utf8-plain-text"]
             ),
-            "protected Clipboard item entered Buffer"
+            "ordinary plain text marker rejected"
         )
         expect(
-            directBuffer.stagedText == textBeforeProtectedAdd,
-            "protected Clipboard add changed Buffer content"
+            !ClipboardHistoryPasteboardPolicy.allowsPlainTextRead(
+                typeNames: ["public.utf8-plain-text", "org.nspasteboard.ConcealedType"]
+            ),
+            "concealed pasteboard marker accepted"
+        )
+        expect(
+            !ClipboardHistoryPasteboardPolicy.allowsPlainTextRead(
+                typeNames: ["org.nspasteboard.TransientType"]
+            ),
+            "transient pasteboard marker accepted"
+        )
+        do {
+            let isolatedPasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-smoke.\(UUID().uuidString)")
+            )
+            defer { isolatedPasteboard.releaseGlobally() }
+            let item = NSPasteboardItem()
+            let fixture = "RIMES rich clipboard fixture"
+            let rich = NSAttributedString(
+                string: fixture,
+                attributes: [.font: NSFont.boldSystemFont(ofSize: 16)]
+            )
+            let richData = try rich.data(
+                from: NSRange(location: 0, length: rich.length),
+                documentAttributes: [
+                    .documentType: NSAttributedString.DocumentType.rtf,
+                ]
+            )
+            expect(item.setString(fixture, forType: .string), "rich fixture text")
+            expect(item.setData(richData, forType: .rtf), "rich fixture RTF")
+            isolatedPasteboard.clearContents()
+            expect(
+                isolatedPasteboard.writeObjects([item]),
+                "rich fixture pasteboard write"
+            )
+            let synthesizedUTF16 = isolatedPasteboard.pasteboardItems?.first?
+                .data(forType: .init("public.utf16-external-plain-text"))
+            let archive = try ClipboardPasteboardArchive.capture(
+                from: isolatedPasteboard
+            )
+            expect(archive.items.count == 1, "rich fixture archive item count")
+            expect(
+                archive.items[0].dataByType[
+                    NSPasteboard.PasteboardType.string.rawValue
+                ] != nil,
+                "rich fixture lost readable plain text"
+            )
+            expect(
+                archive.items[0].dataByType[
+                    NSPasteboard.PasteboardType.rtf.rawValue
+                ] != nil,
+                "rich fixture lost RTF"
+            )
+            expect(
+                archive.items[0].dataByType[
+                    "public.utf16-external-plain-text"
+                ] == synthesizedUTF16,
+                "rich fixture did not mirror readable synthesized UTF-16"
+            )
+        } catch {
+            expect(false, "rich fixture archive: \(error.localizedDescription)")
+        }
+        runCapturePolicyChecks(expect: expect)
+        expect(
+            ClipboardHistoryScrollRules.horizontalDelta(
+                deltaX: 0,
+                deltaY: 1,
+                precise: false,
+                shiftHeld: true
+            ) == 48,
+            "Shift discrete-wheel acceleration"
+        )
+        expect(
+            ClipboardHistoryScrollRules.horizontalDelta(
+                deltaX: 0,
+                deltaY: 4,
+                precise: true,
+                shiftHeld: true
+            ) == 10,
+            "Shift precise-wheel acceleration"
         )
 
         let pasteboard = ClipboardHistoryPasteboardDouble()
@@ -160,26 +263,99 @@ enum ClipboardHistorySmoke {
                 defer { now.addTimeInterval(1) }
                 return now
             },
+            sourceApplicationName: { "Fixture App" },
             schedulesAutomaticPolling: false
         )
 
-        // Starting while hidden and every disabled poll are pasteboard-silent.
         pasteboard.stubChangeCount = 7
         model.start()
-        expect(pasteboard.changeCountReadCount == 0, "hidden start read change count")
         expect(!model.pollNow(), "hidden poll reported capture")
         expect(pasteboard.changeCountReadCount == 0, "hidden poll read change count")
         expect(pasteboard.plainTextReadCount == 0, "hidden poll read text")
 
-        model.update(workbenchVisible: true, railEnabled: false, protection: [])
-        _ = model.pollNow()
-        expect(pasteboard.changeCountReadCount == 0, "disabled rail read change count")
+        model.update(windowVisible: true, captureEnabled: false, protection: [])
+        expect(!model.pollNow(), "disabled poll reported capture")
+        expect(pasteboard.changeCountReadCount == 0, "disabled poll touched pasteboard")
 
-        // A direct user enable/show gesture may import the item that already
-        // exists. The same API remains completely silent while hidden or
-        // protected, and ordinary protection resume stays baseline-only.
+        model.update(windowVisible: true, captureEnabled: true, protection: [])
+        expect(pasteboard.changeCountReadCount == 1, "visible start missed baseline")
+        expect(pasteboard.plainTextReadCount == 0, "baseline read text")
+        pasteboard.stubChangeCount = 8
+        pasteboard.stubPlainText = "first"
+        expect(model.pollNow(), "changed pasteboard was not captured")
+        expect(model.items.first?.sourceApplicationName == "Fixture App", "source app missing")
+        expect(model.items.first?.text == "first", "captured wrong item")
+
+        let firstID = model.items.first?.id
+        pasteboard.stubChangeCount = 9
+        pasteboard.stubPlainText = "first"
+        expect(model.pollNow(), "duplicate was not accepted")
+        expect(model.itemCount == 1, "duplicate created a second item")
+        expect(model.items.first?.id == firstID, "duplicate identity changed")
+
+        pasteboard.stubChangeCount = 10
+        expect(
+            model.baselineAfterOwnPasteboardWrite(expectedChangeCount: 10),
+            "exact own-write baseline rejected"
+        )
+        let readsBeforeOwnWritePoll = pasteboard.plainTextReadCount
+        expect(!model.pollNow(), "own write baseline recaptured content")
+        expect(
+            pasteboard.plainTextReadCount == readsBeforeOwnWritePoll,
+            "own write baseline read text"
+        )
+        pasteboard.stubChangeCount = 11
+        pasteboard.stubPlainText = "concurrent external write"
+        expect(
+            !model.baselineAfterOwnPasteboardWrite(expectedChangeCount: 10),
+            "stale own-write baseline hid a concurrent external copy"
+        )
+        expect(model.pollNow(), "concurrent external copy was not captured")
+        expect(
+            model.items.first?.text == "concurrent external write",
+            "concurrent external copy captured the wrong value"
+        )
+
+        expect(!model.ingest(""), "empty item accepted")
+        expect(!model.ingest(" \n\t "), "whitespace item accepted")
+        expect(!model.ingest("bad\0value"), "NUL item accepted")
+        expect(!model.ingest(String(repeating: "x", count: 33)), "oversized item accepted")
+        expect(model.ingest("second"), "second item rejected")
+        expect(model.ingest("third"), "third item rejected")
+        expect(model.moveSelection(delta: 1), "selection movement failed")
+        let selectedBeforeDelete = model.selectedID
+        expect(model.deleteSelected(), "selected delete failed")
+        expect(
+            !model.items.contains(where: { $0.id == selectedBeforeDelete }),
+            "selected delete retained item"
+        )
+
+        model.update(
+            windowVisible: true,
+            captureEnabled: true,
+            protection: [.screenLocked]
+        )
+        let protectedCountReads = pasteboard.changeCountReadCount
+        let protectedTextReads = pasteboard.plainTextReadCount
+        pasteboard.stubChangeCount = 11
+        pasteboard.stubPlainText = "protected"
+        expect(!model.pollNow(), "protected poll reported capture")
+        expect(model.items.isEmpty, "protected items projection leaked")
+        expect(model.itemCount > 0, "protected history was discarded")
+        expect(pasteboard.changeCountReadCount == protectedCountReads, "protected count read")
+        expect(pasteboard.plainTextReadCount == protectedTextReads, "protected text read")
+
+        model.update(windowVisible: true, captureEnabled: true, protection: [])
+        expect(!model.pollNow(), "protected interval was backfilled")
+        expect(pasteboard.plainTextReadCount == protectedTextReads, "resume read text")
+        dynamicProtection = [.secureInput]
+        pasteboard.stubChangeCount = 12
+        expect(!model.pollNow(), "dynamic secure input reported capture")
+        dynamicProtection = []
+        expect(!model.pollNow(), "dynamic protection resume backfilled")
+
         let explicitPasteboard = ClipboardHistoryPasteboardDouble()
-        explicitPasteboard.stubChangeCount = 41
+        explicitPasteboard.stubChangeCount = 40
         explicitPasteboard.stubPlainText = "already copied"
         let explicitModel = ClipboardHistoryModel(
             configuration: configuration,
@@ -187,357 +363,982 @@ enum ClipboardHistorySmoke {
             schedulesAutomaticPolling: false
         )
         explicitModel.start()
-        expect(
-            !explicitModel.captureCurrentIfEligible(),
-            "hidden explicit capture reported content"
-        )
-        expect(
-            explicitPasteboard.changeCountReadCount == 0
-                && explicitPasteboard.plainTextReadCount == 0,
-            "hidden explicit capture touched pasteboard"
-        )
-        explicitModel.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: []
-        )
-        expect(
-            explicitPasteboard.plainTextReadCount == 0,
-            "eligible baseline imported current text without explicit intent"
-        )
-        expect(
-            explicitModel.captureCurrentIfEligible(),
-            "explicit enable did not capture current text"
-        )
-        expect(
-            explicitModel.items.map(\.text) == ["already copied"],
-            "explicit capture stored the wrong projection"
-        )
-        explicitModel.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: [.secureInput]
-        )
-        let explicitProtectedCountReads = explicitPasteboard.changeCountReadCount
-        let explicitProtectedTextReads = explicitPasteboard.plainTextReadCount
-        explicitPasteboard.stubChangeCount = 42
-        explicitPasteboard.stubPlainText = "must stay protected"
-        expect(
-            !explicitModel.captureCurrentIfEligible(),
-            "protected explicit capture reported content"
-        )
-        expect(
-            explicitPasteboard.changeCountReadCount == explicitProtectedCountReads
-                && explicitPasteboard.plainTextReadCount == explicitProtectedTextReads,
-            "protected explicit capture touched pasteboard"
-        )
-        explicitModel.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: []
-        )
-        expect(
-            !explicitModel.pollNow(),
-            "protection resume backfilled clipboard without explicit intent"
-        )
-        expect(
-            explicitPasteboard.plainTextReadCount == explicitProtectedTextReads,
-            "protection resume read clipboard text"
-        )
+        expect(!explicitModel.captureCurrentIfEligible(), "hidden explicit capture")
+        explicitModel.update(windowVisible: true, captureEnabled: true, protection: [])
+        expect(explicitModel.captureCurrentIfEligible(), "explicit current capture failed")
+        expect(explicitModel.items.map(\.text) == ["already copied"], "explicit item mismatch")
 
-        // Enabling establishes a change-count-only baseline. Text is read only
-        // after a later observed change.
-        model.update(workbenchVisible: true, railEnabled: true, protection: [])
-        expect(pasteboard.changeCountReadCount == 1, "eligible start missed baseline")
-        expect(pasteboard.plainTextReadCount == 0, "baseline read text")
-        pasteboard.stubChangeCount = 8
-        pasteboard.stubPlainText = "first"
-        expect(model.pollNow(), "changed pasteboard was not captured")
-        expect(pasteboard.plainTextReadCount == 1, "changed pasteboard text read count")
-        expect(model.items.count == 1, "first item count")
-        expect(model.storedByteCount == 5, "first item byte accounting")
+        do {
+            let asyncPasteboard = ClipboardHistoryPasteboardDouble()
+            asyncPasteboard.usesAsynchronousArchive = true
+            asyncPasteboard.stubChangeCount = 50
+            let asyncModel = ClipboardHistoryModel(
+                configuration: .init(
+                    maximumItems: 10,
+                    maximumItemBytes: 1_024 * 1_024,
+                    maximumTotalBytes: 4 * 1_024 * 1_024,
+                    pollingInterval: 1
+                ),
+                pasteboard: asyncPasteboard,
+                schedulesAutomaticPolling: false
+            )
+            asyncModel.start()
+            asyncModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: []
+            )
+            asyncPasteboard.stubChangeCount = 51
+            asyncPasteboard.stubArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [NSPasteboard.PasteboardType.string.rawValue],
+                    dataByType: [
+                        NSPasteboard.PasteboardType.string.rawValue:
+                            Data("discarded async".utf8),
+                    ]
+                ),
+            ])
+            expect(asyncModel.pollNow(), "async capture was not scheduled")
+            asyncModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: [.secureInput]
+            )
+            asyncPasteboard.completeAsynchronousRead()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            expect(
+                asyncModel.itemCount == 0,
+                "protected transition accepted in-flight async capture"
+            )
 
-        // Input ownership and Clipboard history are independent lifecycles.
-        // Switching the Buffer route in either direction must preserve both
-        // the already-staged blocks and the in-memory Clipboard item.
-        let historyCountBeforeRouteRoundTrip = model.itemCount
-        let stagedTextBeforeRouteRoundTrip = directBuffer.stagedText
-        directBuffer.activateCapture(for: captureToken)
-        directBuffer.routeDirectPreservingContent(
-            reason: "clipboard history route round trip smoke"
-        )
-        expect(
-            model.itemCount == historyCountBeforeRouteRoundTrip,
-            "Buffer route switch cleared Clipboard history"
-        )
-        expect(
-            directBuffer.stagedText == stagedTextBeforeRouteRoundTrip,
-            "Buffer route round trip cleared staged content"
-        )
+            asyncModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: []
+            )
+            asyncPasteboard.stubChangeCount = 52
+            let utf16Type = "public.utf16-plain-text"
+            asyncPasteboard.stubArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [utf16Type],
+                    dataByType: [
+                        utf16Type: "accepted async".data(
+                            using: .utf16LittleEndian
+                        )!,
+                    ]
+                ),
+            ])
+            expect(asyncModel.pollNow(), "eligible async capture was not scheduled")
+            asyncPasteboard.completeAsynchronousRead()
+            let deadline = Date(timeIntervalSinceNow: 2)
+            while asyncModel.itemCount == 0, Date() < deadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            expect(
+                asyncModel.items.first?.text == "accepted async",
+                "eligible async capture was not applied"
+            )
+        } catch {
+            expect(false, "async archive fixture threw: \(error.localizedDescription)")
+        }
 
-        // Exact duplicates are promoted in place rather than copied.
-        let firstID = model.items.first?.id
-        pasteboard.stubChangeCount = 9
-        pasteboard.stubPlainText = "first"
-        expect(model.pollNow(), "duplicate was not accepted for promotion")
-        expect(model.items.count == 1, "duplicate created a second item")
-        expect(model.items.first?.id == firstID, "duplicate changed item identity")
-
-        expect(!model.ingest(""), "empty item accepted")
-        expect(!model.ingest(" \n\t "), "whitespace-only item accepted")
-        expect(!model.ingest("bad\0value"), "NUL item accepted")
-        expect(!model.ingest(String(repeating: "x", count: 33)), "oversized item accepted")
-
-        // Selection is clamped, deletion selects the nearest survivor, and the
-        // newest entries remain inside both configured bounds.
-        expect(model.ingest("second"), "second item rejected")
-        expect(model.ingest("third"), "third item rejected")
-        expect(model.moveSelection(delta: 1), "right selection failed")
-        let selectedBeforeDelete = model.selectedID
-        expect(model.deleteSelected(), "selected delete failed")
-        expect(!model.items.contains(where: { $0.id == selectedBeforeDelete }),
-               "selected delete retained item")
-        expect(model.selectedID != nil, "delete did not choose neighbor")
-
-        let boundedPasteboard = ClipboardHistoryPasteboardDouble()
         let boundedModel = ClipboardHistoryModel(
             configuration: .init(
-                maximumItems: 10,
+                maximumItems: 2,
                 maximumItemBytes: 8,
                 maximumTotalBytes: 10,
                 pollingInterval: 1
             ),
-            pasteboard: boundedPasteboard,
+            pasteboard: ClipboardHistoryPasteboardDouble(),
             schedulesAutomaticPolling: false
         )
-        expect(boundedModel.ingest("aaaa"), "bounded item one rejected")
-        expect(boundedModel.ingest("bbbb"), "bounded item two rejected")
-        expect(boundedModel.ingest("cccc"), "bounded item three rejected")
-        expect(boundedModel.items.count == 2, "total-byte eviction count")
-        expect(boundedModel.storedByteCount == 8, "total-byte eviction accounting")
+        _ = boundedModel.ingest("aaaa")
+        _ = boundedModel.ingest("bbbb")
+        _ = boundedModel.ingest("cccc")
+        expect(boundedModel.itemCount == 2, "item bound failed")
+        expect(boundedModel.storedByteCount == 8, "byte bound failed")
         expect(!boundedModel.ingest("123456789"), "per-item byte cap failed")
-        expect(!boundedModel.ingest("中文中"), "UTF-8 byte cap failed")
 
-        let countBoundedModel = ClipboardHistoryModel(
-            configuration: .init(
-                maximumItems: 2,
-                maximumItemBytes: 32,
-                maximumTotalBytes: 96,
-                pollingInterval: 1
-            ),
-            pasteboard: ClipboardHistoryPasteboardDouble(),
-            schedulesAutomaticPolling: false
+        let imageSearchItem = ClipboardHistoryItem(
+            id: UUID(),
+            kind: .image,
+            displayText: "图像",
+            searchText: nil,
+            canonicalText: nil,
+            textCompleteness: .unavailable,
+            byteCount: 1,
+            payloadByteCount: 1,
+            capturedAt: Date(),
+            sourceApplicationName: "Fixture",
+            sourceApplicationBundleIdentifier: "fixture.image",
+            sourceNamespace: "rimes.clipboard.smoke",
+            sourceID: "image-search"
         )
-        _ = countBoundedModel.ingest("one")
-        _ = countBoundedModel.ingest("two")
-        _ = countBoundedModel.ingest("three")
-        expect(countBoundedModel.items.count == 2, "item-count eviction failed")
-
-        // Explicit protection shields the UI and avoids even changeCount. A
-        // resume observes only a fresh baseline, so protected content cannot be
-        // backfilled.
-        model.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: [.secureInput]
+        let searchableItems = explicitModel.items + model.items + [imageSearchItem]
+        expect(
+            ClipboardHistorySearchRules.filter(searchableItems, query: "ALREADY copied")
+                .map(\.text) == ["already copied"],
+            "case-insensitive multi-term search failed"
         )
-        let protectedCountReads = pasteboard.changeCountReadCount
-        let protectedTextReads = pasteboard.plainTextReadCount
-        pasteboard.stubChangeCount = 10
-        pasteboard.stubPlainText = "protected"
-        expect(!model.pollNow(), "protected poll reported capture")
-        expect(pasteboard.changeCountReadCount == protectedCountReads,
-               "protected poll read change count")
-        expect(pasteboard.plainTextReadCount == protectedTextReads,
-               "protected poll read text")
-        expect(model.items.isEmpty, "protected primary item projection leaked")
-        expect(model.visibleItems.isEmpty, "protected items remained visible")
-        expect(model.itemCount > 0, "protected history was not retained in memory")
-        expect(model.selectedItem == nil, "protected selection remained visible")
-
-        model.update(workbenchVisible: true, railEnabled: true, protection: [])
-        expect(pasteboard.changeCountReadCount == protectedCountReads + 1,
-               "resume did not establish baseline")
-        expect(pasteboard.plainTextReadCount == protectedTextReads,
-               "resume backfilled protected text")
-        expect(!model.pollNow(), "unchanged resume baseline captured text")
-        pasteboard.stubChangeCount = 11
-        pasteboard.stubPlainText = "after"
-        expect(model.pollNow(), "post-resume change was not captured")
-
-        // A live Secure Input probe follows the same no-read/resume-baseline
-        // rule even when the workbench's explicit session state is unchanged.
-        dynamicProtection = [.secureInput]
-        let dynamicCountReads = pasteboard.changeCountReadCount
-        let dynamicTextReads = pasteboard.plainTextReadCount
-        pasteboard.stubChangeCount = 12
-        pasteboard.stubPlainText = "dynamic-protected"
-        expect(!model.pollNow(), "dynamic protection reported capture")
-        expect(pasteboard.changeCountReadCount == dynamicCountReads,
-               "dynamic protection read change count")
-        expect(pasteboard.plainTextReadCount == dynamicTextReads,
-               "dynamic protection read text")
-        dynamicProtection = []
-        expect(!model.pollNow(), "dynamic protection resume backfilled content")
-        expect(pasteboard.changeCountReadCount == dynamicCountReads + 1,
-               "dynamic protection resume missed baseline")
-        expect(pasteboard.plainTextReadCount == dynamicTextReads,
-               "dynamic protection resume read text")
-
-        model.stop()
-        let stoppedCountReads = pasteboard.changeCountReadCount
-        let stoppedTextReads = pasteboard.plainTextReadCount
-        pasteboard.stubChangeCount = 13
-        _ = model.pollNow()
-        expect(pasteboard.changeCountReadCount == stoppedCountReads,
-               "stopped model read change count")
-        expect(pasteboard.plainTextReadCount == stoppedTextReads,
-               "stopped model read text")
-
-        // A second model has no access to the first model's history: there is
-        // intentionally no disk or UserDefaults restoration path.
-        let freshModel = ClipboardHistoryModel(
-            configuration: configuration,
-            pasteboard: ClipboardHistoryPasteboardDouble(),
-            schedulesAutomaticPolling: false
+        expect(
+            ClipboardHistorySearchRules.filter(searchableItems, query: "missing").isEmpty,
+            "no-result search failed"
         )
-        expect(freshModel.items.isEmpty, "fresh model restored persisted history")
-
-        let timerPasteboard = ClipboardHistoryPasteboardDouble()
-        let timerModel = ClipboardHistoryModel(
-            configuration: .init(
-                maximumItems: 3,
-                maximumItemBytes: 32,
-                maximumTotalBytes: 64,
-                pollingInterval: 60
-            ),
-            pasteboard: timerPasteboard,
-            schedulesAutomaticPolling: true
+        expect(
+            ClipboardHistorySearchRules.filter(searchableItems, query: "图片")
+                .map(\.id) == [imageSearchItem.id],
+            "localized image-kind search failed"
         )
-        timerModel.start()
-        expect(!timerModel.hasScheduledPolling, "hidden model scheduled polling")
-        timerModel.update(workbenchVisible: true, railEnabled: true, protection: [])
-        expect(timerModel.hasScheduledPolling, "eligible model did not schedule polling")
-        timerModel.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: [.sessionInactive]
-        )
-        expect(!timerModel.hasScheduledPolling, "protected model kept polling timer")
-        timerModel.update(workbenchVisible: true, railEnabled: true, protection: [])
-        expect(timerModel.hasScheduledPolling, "resumed model did not restart polling")
-        timerModel.stop()
-        expect(!timerModel.hasScheduledPolling, "stopped model kept polling timer")
 
+        runArchiveAndStoreChecks(expect: expect)
         runViewChecks(expect: expect)
         return ok
+    }
+
+    private static func runCapturePolicyChecks(
+        expect: (_ condition: @autoclosure () -> Bool, _ message: String) -> Void
+    ) {
+        let externalUTF16 = NSPasteboard.PasteboardType(
+            "public.utf16-external-plain-text"
+        )
+
+        do {
+            let pasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-readable-text.\(UUID().uuidString)")
+            )
+            defer { pasteboard.releaseGlobally() }
+            let provider = ClipboardUnreadableDataProvider()
+            let item = NSPasteboardItem()
+            let textData = Data("readable UTF-8 fallback".utf8)
+            expect(item.setData(textData, forType: .string), "fallback text data")
+            expect(
+                item.setDataProvider(provider, forTypes: [externalUTF16]),
+                "external UTF-16 provider"
+            )
+            pasteboard.clearContents()
+            expect(pasteboard.writeObjects([item]), "fallback fixture write")
+            expect(
+                pasteboard.pasteboardItems?.first?.types.contains(externalUTF16) == true,
+                "fallback fixture did not advertise external UTF-16"
+            )
+            expect(
+                pasteboard.pasteboardItems?.first?.data(forType: externalUTF16) == nil,
+                "fallback fixture external UTF-16 was unexpectedly readable"
+            )
+            let archive = try ClipboardPasteboardArchive.capture(from: pasteboard)
+            expect(archive.items.count == 1, "fallback fixture archive count")
+            expect(
+                archive.items[0].dataByType[NSPasteboard.PasteboardType.string.rawValue]
+                    == textData,
+                "fallback fixture lost decodable plain text"
+            )
+            expect(
+                archive.items[0].dataByType[externalUTF16.rawValue] == nil,
+                "fallback fixture retained unreadable synthesized text"
+            )
+        } catch {
+            expect(false, "readable fallback fixture: \(error.localizedDescription)")
+        }
+
+        do {
+            let pasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-no-fallback.\(UUID().uuidString)")
+            )
+            defer { pasteboard.releaseGlobally() }
+            let provider = ClipboardUnreadableDataProvider()
+            let item = NSPasteboardItem()
+            expect(
+                item.setDataProvider(provider, forTypes: [externalUTF16]),
+                "no-fallback external UTF-16 provider"
+            )
+            pasteboard.clearContents()
+            expect(pasteboard.writeObjects([item]), "no-fallback fixture write")
+            var rejected = false
+            do {
+                _ = try ClipboardPasteboardArchive.capture(from: pasteboard)
+            } catch ClipboardPasteboardArchive.ArchiveError
+                .unreadablePasteboardType {
+                rejected = true
+            } catch {}
+            expect(rejected, "unreadable external UTF-16 without fallback accepted")
+        }
+
+        do {
+            let pasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-unknown-type.\(UUID().uuidString)")
+            )
+            defer { pasteboard.releaseGlobally() }
+            let provider = ClipboardUnreadableDataProvider()
+            let item = NSPasteboardItem()
+            let unknownType = NSPasteboard.PasteboardType(
+                "com.rimes.smoke.unreadable"
+            )
+            expect(
+                item.setData(Data("known text".utf8), forType: .string),
+                "unknown fixture fallback text"
+            )
+            expect(
+                item.setDataProvider(provider, forTypes: [unknownType]),
+                "unknown fixture provider"
+            )
+            pasteboard.clearContents()
+            expect(pasteboard.writeObjects([item]), "unknown fixture write")
+            var rejected = false
+            do {
+                _ = try ClipboardPasteboardArchive.capture(from: pasteboard)
+            } catch ClipboardPasteboardArchive.ArchiveError
+                .unreadablePasteboardType {
+                rejected = true
+            } catch {}
+            expect(rejected, "unknown unreadable pasteboard type accepted")
+        }
+
+        do {
+            let pasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-malformed-text.\(UUID().uuidString)")
+            )
+            defer { pasteboard.releaseGlobally() }
+            let provider = ClipboardUnreadableDataProvider()
+            let item = NSPasteboardItem()
+            expect(
+                item.setData(Data([0xFF]), forType: .string),
+                "malformed fixture text data"
+            )
+            expect(
+                item.setDataProvider(provider, forTypes: [externalUTF16]),
+                "malformed fixture external UTF-16 provider"
+            )
+            pasteboard.clearContents()
+            expect(pasteboard.writeObjects([item]), "malformed fixture write")
+            var rejected = false
+            do {
+                _ = try ClipboardPasteboardArchive.capture(from: pasteboard)
+            } catch ClipboardPasteboardArchive.ArchiveError
+                .unreadablePasteboardType {
+                rejected = true
+            } catch {}
+            expect(rejected, "malformed plain text unlocked unreadable UTF-16")
+        }
+
+        do {
+            let pasteboard = NSPasteboard(
+                name: .init("com.rimes.clipboard-confidential.\(UUID().uuidString)")
+            )
+            defer { pasteboard.releaseGlobally() }
+            let provider = ClipboardUnreadableDataProvider()
+            let first = NSPasteboardItem()
+            expect(
+                first.setDataProvider(provider, forTypes: [.string]),
+                "confidential fixture lazy provider"
+            )
+            let second = NSPasteboardItem()
+            expect(
+                second.setData(
+                    Data(),
+                    forType: .init("org.nspasteboard.ConcealedType")
+                ),
+                "confidential fixture marker"
+            )
+            pasteboard.clearContents()
+            expect(
+                pasteboard.writeObjects([first, second]),
+                "confidential fixture write"
+            )
+            let requestsBeforeCapture = provider.requestCount
+            var rejected = false
+            do {
+                _ = try ClipboardPasteboardArchive.capture(from: pasteboard)
+            } catch ClipboardPasteboardArchive.ArchiveError.confidentialContent {
+                rejected = true
+            } catch {}
+            expect(rejected, "later confidential marker was accepted")
+            expect(
+                provider.requestCount == requestsBeforeCapture,
+                "payload read occurred before global confidential preflight"
+            )
+        }
+    }
+
+    private static func runArchiveAndStoreChecks(
+        expect: (_ condition: @autoclosure () -> Bool, _ message: String) -> Void
+    ) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimes-clipboard-history-smoke-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        do {
+            let textType = NSPasteboard.PasteboardType.string.rawValue
+            let htmlType = NSPasteboard.PasteboardType.html.rawValue
+            let archive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [textType, htmlType],
+                    dataByType: [
+                        textType: Data("durable fixture".utf8),
+                        htmlType: Data("<b>durable fixture</b>".utf8),
+                    ]
+                ),
+            ])
+            let compressed = try archive.encodeRawDeflate()
+            let decoded = try ClipboardPasteboardArchive.decodeRawDeflate(
+                compressed
+            )
+            expect(
+                decoded == archive,
+                "lossless archive round trip"
+            )
+            expect(
+                decoded.requiresPasteboardRestorationForTextInsertion,
+                "HTML archive must not flatten through plain insertion"
+            )
+            let reconstructed = try decoded.makePasteboardItems()
+            expect(
+                reconstructed.count == 1
+                    && reconstructed[0].data(
+                        forType: NSPasteboard.PasteboardType(htmlType)
+                    ) == Data("<b>durable fixture</b>".utf8),
+                "archive did not reconstruct exact pasteboard representations"
+            )
+            let plainArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [textType],
+                    dataByType: [textType: Data("plain fixture".utf8)]
+                ),
+            ])
+            expect(
+                !plainArchive.requiresPasteboardRestorationForTextInsertion,
+                "plain text archive unexpectedly requires pasteboard restore"
+            )
+            guard let fixturePNG = makeFixturePNG() else {
+                expect(false, "fixture PNG creation")
+                return
+            }
+            let imageArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [NSPasteboard.PasteboardType.png.rawValue],
+                    dataByType: [
+                        NSPasteboard.PasteboardType.png.rawValue: fixturePNG,
+                    ]
+                ),
+            ])
+            expect(
+                imageArchive.containsImageRepresentation,
+                "image archive representation detection"
+            )
+            for identifier in [
+                "public.png",
+                "public.jpeg",
+                "public.heic",
+                "com.compuserve.gif",
+                "org.webmproject.webp",
+            ] {
+                expect(
+                    ClipboardPasteboardArchive.isImageRepresentationType(
+                        identifier
+                    ),
+                    "image UTI detection"
+                )
+            }
+            expect(
+                !ClipboardPasteboardArchive.isImageRepresentationType(
+                    NSPasteboard.PasteboardType.fileURL.rawValue
+                ),
+                "file URL misclassified as image representation"
+            )
+            let fileURLType = NSPasteboard.PasteboardType.fileURL.rawValue
+            let imageFileArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [fileURLType, NSPasteboard.PasteboardType.png.rawValue],
+                    dataByType: [
+                        fileURLType: Data("file:///tmp/rimes-image.png".utf8),
+                        NSPasteboard.PasteboardType.png.rawValue: fixturePNG,
+                    ]
+                ),
+            ])
+            expect(
+                imageFileArchive.containsImageRepresentation,
+                "image-bearing file archive representation detection"
+            )
+            expect(
+                imageFileArchive.makeImageThumbnail(maximumPixelSize: 3) != nil,
+                "image-bearing file archive thumbnail decode"
+            )
+            let thumbnail = imageArchive.makeImageThumbnail(maximumPixelSize: 3)
+            expect(thumbnail != nil, "image thumbnail decode")
+            expect(
+                max(thumbnail?.width ?? 0, thumbnail?.height ?? 0) <= 3,
+                "image thumbnail was not downsampled"
+            )
+            let mergedArchive = try ClipboardPasteboardArchive.merging([
+                plainArchive, imageArchive, imageFileArchive,
+            ])
+            expect(mergedArchive.items.count == 3, "ordered archive merge")
+            let directTextItem = ClipboardHistoryItem(
+                id: UUID(),
+                kind: .text,
+                displayText: "plain fixture",
+                searchText: "plain fixture",
+                canonicalText: "plain fixture",
+                textCompleteness: .complete,
+                byteCount: 13,
+                payloadByteCount: 13,
+                capturedAt: Date(),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "direct-text"
+            )
+            let richImageItem = ClipboardHistoryItem(
+                id: UUID(),
+                kind: .image,
+                displayText: "Image 8 × 6",
+                searchText: "image",
+                canonicalText: nil,
+                textCompleteness: .unavailable,
+                byteCount: fixturePNG.count,
+                payloadByteCount: fixturePNG.count,
+                capturedAt: Date(),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "rich-image"
+            )
+            expect(
+                ClipboardHistoryActivationRules.canInsertEveryItemAsPlainText(
+                    items: [directTextItem],
+                    archives: [plainArchive]
+                ),
+                "plain-text activation classification"
+            )
+            expect(
+                !ClipboardHistoryActivationRules.canInsertEveryItemAsPlainText(
+                    items: [directTextItem, richImageItem],
+                    archives: [plainArchive, imageArchive]
+                ),
+                "mixed rich activation classification"
+            )
+            let pasteMarker = ClipboardHistoryHostPasteRules.makeMarker()
+            let otherPasteMarker = ClipboardHistoryHostPasteRules.makeMarker()
+            expect(
+                ClipboardHistoryHostPasteRules.sequenceDecision(
+                    eventType: .keyDown,
+                    keyDownAccepted: false
+                ) == .passAndArmKeyDown,
+                "host paste sequence arms only its first keyDown"
+            )
+            expect(
+                ClipboardHistoryHostPasteRules.sequenceDecision(
+                    eventType: .keyUp,
+                    keyDownAccepted: false
+                ) == .consumeAndFinish,
+                "host paste sequence rejects a missing keyDown"
+            )
+            expect(
+                ClipboardHistoryHostPasteRules.sequenceDecision(
+                    eventType: .keyUp,
+                    keyDownAccepted: true
+                ) == .passAndFinish,
+                "host paste sequence completes an armed keyUp"
+            )
+            if let pasteEvents = ClipboardHistoryHostPasteRules.makeEventPair(
+                marker: pasteMarker
+            ),
+               let pasteDown = NSEvent(cgEvent: pasteEvents.keyDown),
+               let pasteUp = NSEvent(cgEvent: pasteEvents.keyUp) {
+                expect(
+                    ClipboardHistoryHostPasteRules.isTaggedPasteEvent(pasteDown),
+                    "tagged host paste keyDown"
+                )
+                expect(
+                    ClipboardHistoryHostPasteRules.isTaggedPasteEvent(pasteUp),
+                    "tagged host paste keyUp"
+                )
+                expect(
+                    ClipboardHistoryHostPasteRules.matches(
+                        pasteDown,
+                        marker: pasteMarker
+                    ),
+                    "tagged host paste nonce match"
+                )
+                expect(
+                    pasteMarker == otherPasteMarker
+                        || !ClipboardHistoryHostPasteRules.matches(
+                            pasteDown,
+                            marker: otherPasteMarker
+                        ),
+                    "tagged host paste nonce mismatch"
+                )
+                expect(
+                    pasteDown.keyCode == UInt16(kVK_ANSI_V)
+                        && pasteDown.modifierFlags.contains(.command),
+                    "host paste event shape"
+                )
+            } else {
+                expect(false, "host paste event construction")
+            }
+
+            let record = ClipboardHistoryImportRecord(
+                kind: .text,
+                displayText: "durable fixture",
+                searchText: "durable fixture fixture.app",
+                canonicalText: "durable fixture",
+                textCompleteness: .complete,
+                capturedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "record-1",
+                opaquePayload: compressed
+            )
+            let firstStore = try ClipboardHistoryStore(rootDirectory: root)
+            try firstStore.importSourceApplicationIcons([
+                .init(
+                    bundleIdentifier: "fixture.app",
+                    applicationName: "Fixture",
+                    pngData: fixturePNG
+                ),
+            ])
+            let persistedFixtureIcon = try firstStore.sourceApplicationIcon(
+                bundleIdentifier: "fixture.app"
+            )
+            expect(
+                persistedFixtureIcon == fixturePNG,
+                "source application icon persistence"
+            )
+            let first = try firstStore.importBatch([record])
+            expect(first.inserted == 1 && first.unchanged == 0, "store first import")
+            let second = try firstStore.importBatch([record])
+            expect(second.inserted == 0 && second.unchanged == 1, "store idempotent import")
+            let storedPayload = try firstStore.payload(for: record.id)
+            expect(
+                storedPayload?.opaquePayload == compressed,
+                "store lazy payload mismatch"
+            )
+            let audit = try firstStore.audit()
+            expect(audit.isConsistent, "store audit")
+            expect(audit.totalItemCount == 1 && audit.payloadItemCount == 1,
+                   "store audit counts")
+
+            let reopened = try ClipboardHistoryStore(rootDirectory: root)
+            let reopenedCount = try reopened.count()
+            expect(reopenedCount == 1, "store did not survive reopen")
+            let secondRecord = ClipboardHistoryImportRecord(
+                kind: .text,
+                displayText: "second fixture",
+                searchText: "second fixture",
+                canonicalText: "second fixture",
+                textCompleteness: .complete,
+                capturedAt: Date(timeIntervalSince1970: 1_700_000_101),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "record-2",
+                opaquePayload: try plainArchive.encodeRawDeflate()
+            )
+            _ = try reopened.importBatch([secondRecord])
+            _ = try reopened.promote(
+                ids: [record.id, secondRecord.id],
+                at: Date(timeIntervalSince1970: 1_700_000_300)
+            )
+            let promotedIDs = Array(
+                try reopened.loadAllMetadata().prefix(2).map(\.id)
+            )
+            expect(
+                promotedIDs == [record.id, secondRecord.id],
+                "store batch promotion order"
+            )
+            let deleted = try reopened.delete(
+                ids: [record.id, secondRecord.id]
+            )
+            expect(deleted == 2, "store persistent batch delete")
+            let countAfterDelete = try reopened.count()
+            expect(countAfterDelete == 0, "store delete retained record")
+
+            let persistedModel = ClipboardHistoryModel(
+                configuration: .init(),
+                pasteboard: ClipboardHistoryPasteboardDouble(),
+                store: reopened,
+                schedulesAutomaticPolling: false
+            )
+            persistedModel.start()
+            persistedModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: []
+            )
+            expect(
+                persistedModel.ingest("termination flush fixture"),
+                "model persistence fixture ingest"
+            )
+            expect(
+                persistedModel.flushPersistence(timeout: 5),
+                "model persistence flush timed out"
+            )
+            let countAfterFlush = try reopened.count()
+            expect(countAfterFlush == 1, "flush returned before durable upsert")
+            persistedModel.clear()
+            expect(
+                persistedModel.flushPersistence(timeout: 5),
+                "model persistence clear flush timed out"
+            )
+            let countAfterClearFlush = try reopened.count()
+            expect(
+                countAfterClearFlush == 0,
+                "flush returned before durable clear"
+            )
+
+            let imageRecord = ClipboardHistoryImportRecord(
+                kind: .image,
+                displayText: "Image 8 × 6",
+                searchText: "image fixture",
+                canonicalText: nil,
+                textCompleteness: .unavailable,
+                capturedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "image-record",
+                opaquePayload: try imageArchive.encodeRawDeflate()
+            )
+            let imageFileRecord = ClipboardHistoryImportRecord(
+                kind: .files,
+                displayText: "rimes-image.png",
+                searchText: "image file fixture",
+                canonicalText: "file:///tmp/rimes-image.png",
+                textCompleteness: .complete,
+                capturedAt: Date(timeIntervalSince1970: 1_700_000_201),
+                sourceApplicationName: "Fixture",
+                sourceApplicationBundleIdentifier: "fixture.app",
+                sourceNamespace: "rimes.clipboard.smoke",
+                sourceID: "image-file-record",
+                opaquePayload: try imageFileArchive.encodeRawDeflate()
+            )
+            _ = try reopened.importBatch([imageRecord, imageFileRecord])
+            let imageReopenedStore = try ClipboardHistoryStore(
+                rootDirectory: root
+            )
+            let reopenedImageCount = try imageReopenedStore.count()
+            expect(
+                reopenedImageCount == 2,
+                "image fixtures did not survive store reopen"
+            )
+            let imageModel = ClipboardHistoryModel(
+                configuration: .init(),
+                pasteboard: ClipboardHistoryPasteboardDouble(),
+                store: imageReopenedStore,
+                schedulesAutomaticPolling: false
+            )
+            imageModel.start()
+            imageModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: []
+            )
+            let metadataDeadline = Date(timeIntervalSinceNow: 2)
+            while imageModel.itemCount < 2, Date() < metadataDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            expect(imageModel.itemCount == 2, "reopened image metadata load")
+            var asynchronouslyLoadedThumbnail: CGImage?
+            var asynchronouslyLoadedFileThumbnail: CGImage?
+            imageModel.loadImageThumbnail(
+                id: imageRecord.id,
+                maximumPixelSize: 4
+            ) { asynchronouslyLoadedThumbnail = $0 }
+            imageModel.loadImageThumbnail(
+                id: imageFileRecord.id,
+                maximumPixelSize: 4
+            ) { asynchronouslyLoadedFileThumbnail = $0 }
+            let thumbnailDeadline = Date(timeIntervalSinceNow: 2)
+            while (asynchronouslyLoadedThumbnail == nil
+                    || asynchronouslyLoadedFileThumbnail == nil),
+                  Date() < thumbnailDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            expect(
+                max(
+                    asynchronouslyLoadedThumbnail?.width ?? 0,
+                    asynchronouslyLoadedThumbnail?.height ?? 0
+                ) <= 4 && asynchronouslyLoadedThumbnail != nil,
+                "reopened image thumbnail path"
+            )
+            expect(
+                max(
+                    asynchronouslyLoadedFileThumbnail?.width ?? 0,
+                    asynchronouslyLoadedFileThumbnail?.height ?? 0
+                ) <= 4 && asynchronouslyLoadedFileThumbnail != nil,
+                "image-bearing file thumbnail path"
+            )
+
+            let imagePane = ClipboardHistoryPaneView(model: imageModel)
+            imagePane.frame = NSRect(
+                x: 0,
+                y: 0,
+                width: ClipboardHistoryWindowMetrics.preferredWidth,
+                height: ClipboardHistoryWindowMetrics.preferredHeight
+            )
+            imagePane.layoutSubtreeIfNeeded()
+            let renderedThumbnailDeadline = Date(timeIntervalSinceNow: 2)
+            while imagePane.snapshotForSmoke().renderedThumbnailCount < 2,
+                  Date() < renderedThumbnailDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            expect(
+                imagePane.snapshotForSmoke().renderedThumbnailCount == 2,
+                "visible cards did not render image thumbnails"
+            )
+            var asynchronouslyLoadedIcon: Data?
+            imageModel.loadSourceApplicationIcon(
+                bundleIdentifier: "fixture.app"
+            ) { asynchronouslyLoadedIcon = $0 }
+            let iconDeadline = Date(timeIntervalSinceNow: 2)
+            while asynchronouslyLoadedIcon == nil, Date() < iconDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            expect(
+                asynchronouslyLoadedIcon == fixturePNG,
+                "persisted source icon lookup"
+            )
+            imageModel.clear()
+            expect(
+                imageModel.flushPersistence(timeout: 5),
+                "image fixture clear flush"
+            )
+
+            let directoryMode = try FileManager.default.attributesOfItem(
+                atPath: root.path
+            )[.posixPermissions] as? NSNumber
+            let databaseMode = try FileManager.default.attributesOfItem(
+                atPath: reopened.databaseURL.path
+            )[.posixPermissions] as? NSNumber
+            expect(directoryMode?.intValue == 0o700, "store directory permissions")
+            expect(databaseMode?.intValue == 0o600, "store database permissions")
+        } catch {
+            expect(false, "archive/store smoke threw: \(error.localizedDescription)")
+        }
     }
 
     private static func runViewChecks(
         expect: (_ condition: @autoclosure () -> Bool, _ message: String) -> Void
     ) {
-        let pasteboard = ClipboardHistoryPasteboardDouble()
         let model = ClipboardHistoryModel(
-            configuration: .init(
-                maximumItems: 8,
-                maximumItemBytes: 2_048,
-                maximumTotalBytes: 8_192,
-                pollingInterval: 1
-            ),
-            pasteboard: pasteboard,
-            schedulesAutomaticPolling: false
-        )
-        model.update(workbenchVisible: true, railEnabled: true, protection: [])
-        model.start()
-        _ = model.ingest("short")
-        _ = model.ingest(String(repeating: "long", count: 120))
-
-        let rail = ClipboardRailView(model: model)
-        rail.frame = NSRect(x: 0, y: 0, width: 260, height: ClipboardRailMetrics.railHeight)
-        rail.layoutSubtreeIfNeeded()
-
-        let passive = rail.snapshotForSmoke()
-        expect(passive.railHeight == 40, "rail height drifted")
-        expect(passive.cardCount == 2, "rail card count")
-        expect(passive.cardHeight == 20, "card height drifted")
-        expect(passive.widestCardWidth <= 220, "card width exceeded design cap")
-        expect(passive.selectedCardBorderWidth == 1, "passive selected border")
-        expect(!passive.stateIsVisible, "nonempty rail showed state")
-
-        rail.setActive(true)
-        let active = rail.snapshotForSmoke()
-        expect(active.isActive, "rail did not enter active state")
-        expect(active.selectedCardBorderWidth == 2, "active selected border")
-
-        let selectionBeforeModifiedKey = model.selectedID
-        if let commandRight = keyEvent(keyCode: 124, modifiers: [.command]) {
-            expect(!rail.handleKeyEvent(commandRight), "modified arrow was consumed")
-            expect(model.selectedID == selectionBeforeModifiedKey,
-                   "modified arrow changed selection")
-        } else {
-            expect(false, "modified-arrow event creation")
-        }
-
-        var acceptedItemID: UUID?
-        rail.onAddToBuffer = { item in
-            acceptedItemID = item.id
-            return true
-        }
-        guard let rightArrow = keyEvent(keyCode: 124) else {
-            expect(false, "right-arrow event creation")
-            return
-        }
-        expect(rail.handleKeyEvent(rightArrow), "view right-arrow routing failed")
-        let activatedID = model.selectedID
-        guard let returnKey = keyEvent(keyCode: 36) else {
-            expect(false, "Return event creation")
-            return
-        }
-        expect(rail.handleKeyEvent(returnKey), "Buffer callback activation failed")
-        expect(acceptedItemID == activatedID, "Buffer callback received wrong item")
-        expect(model.items.first?.id == activatedID, "activation did not promote item")
-
-        let orderBeforeRejectedActivation = model.items.map(\.id)
-        rail.onAddToBuffer = { _ in false }
-        expect(!rail.activateSelectedItem(), "rejected Buffer callback reported success")
-        expect(model.items.map(\.id) == orderBeforeRejectedActivation,
-               "rejected Buffer callback changed history order")
-
-        model.update(
-            workbenchVisible: true,
-            railEnabled: true,
-            protection: [.screenLocked, .sessionInactive]
-        )
-        let protectedSnapshot = rail.snapshotForSmoke()
-        expect(protectedSnapshot.isProtected, "protected rail state missing")
-        expect(protectedSnapshot.cardCount == 0, "protected rail retained text cards")
-        expect(protectedSnapshot.stateIsVisible, "protected rail missing state message")
-        expect(!rail.activateSelectedItem(), "protected rail activated item")
-
-        model.update(workbenchVisible: true, railEnabled: false, protection: [])
-        let disabledSnapshot = rail.snapshotForSmoke()
-        expect(disabledSnapshot.cardCount == 0, "disabled rail retained text cards")
-        expect(disabledSnapshot.stateIsVisible, "disabled rail missing state")
-
-        let emptyModel = ClipboardHistoryModel(
             configuration: .init(),
             pasteboard: ClipboardHistoryPasteboardDouble(),
             schedulesAutomaticPolling: false
         )
-        emptyModel.update(workbenchVisible: true, railEnabled: true, protection: [])
-        emptyModel.start()
-        let emptyRail = ClipboardRailView(model: emptyModel)
-        emptyRail.setActive(true)
-        if let emptyReturn = keyEvent(keyCode: 36) {
-            expect(emptyRail.handleKeyEvent(emptyReturn),
-                   "owned empty-rail Return leaked to input target")
-        } else {
-            expect(false, "empty Return event creation")
+        model.start()
+        model.update(windowVisible: true, captureEnabled: true, protection: [])
+        _ = model.ingest("alpha one")
+        _ = model.ingest("beta two")
+
+        let pane = ClipboardHistoryPaneView(model: model)
+        pane.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: ClipboardHistoryWindowMetrics.preferredWidth,
+            height: ClipboardHistoryWindowMetrics.preferredHeight
+        )
+        pane.layoutSubtreeIfNeeded()
+        let snapshot = pane.snapshotForSmoke()
+        expect(snapshot.cardCount == 2, "timeline card count")
+        expect(snapshot.cardWidth == 206, "timeline card width")
+        expect(snapshot.cardHeight == 126, "timeline card height")
+        expect(snapshot.selectedCardCount == 1, "timeline single selection")
+        expect(snapshot.selectedCardBorderWidth == 2, "selected timeline border")
+
+        guard let searchA = keyEvent(keyCode: 0, characters: "a") else {
+            expect(false, "search event creation")
+            return
         }
+        expect(!pane.handleKeyDown(searchA), "printable search bypassed Rime routing")
+        expect(pane.appendSearchText("a"), "Rime search commit was rejected")
+        expect(pane.query == "a", "logical search query mismatch")
+        expect(pane.snapshotForSmoke().queryCharacterCount == 1, "search snapshot mismatch")
+
+        guard let delete = keyEvent(keyCode: 51) else {
+            expect(false, "delete event creation")
+            return
+        }
+        expect(pane.handleKeyDown(delete), "query delete was not consumed")
+        expect(pane.query.isEmpty, "query delete removed an item instead")
+        expect(model.itemCount == 2, "query delete mutated history")
+
+        pane.updateComposingText("中")
+        expect(pane.composingText == "中", "Rime search preedit projection mismatch")
+        pane.updateComposingText("")
+
+        var activatedID: UUID?
+        pane.onActivate = { items in
+            activatedID = items.first?.id
+            return model.promote(ids: items.map(\.id))
+        }
+        guard let left = keyEvent(keyCode: 123),
+              let enter = keyEvent(keyCode: 36) else {
+            expect(false, "navigation event creation")
+            return
+        }
+        expect(pane.handleKeyDown(left), "left navigation not consumed")
+        let expectedID = model.selectedID
+        expect(pane.handleKeyDown(enter), "activation not consumed")
+        expect(activatedID == expectedID, "activation returned wrong item")
+        expect(model.items.first?.id == expectedID, "activation did not promote")
+
+        var copiedID: UUID?
+        pane.onCopy = { items in
+            copiedID = items.first?.id
+            return true
+        }
+        guard let commandCopy = keyEvent(
+            keyCode: 8,
+            characters: "c",
+            modifiers: [.command]
+        ), let capsLockCommandCopy = keyEvent(
+            keyCode: 8,
+            characters: "c",
+            modifiers: [.command, .capsLock]
+        ), let commandOne = keyEvent(
+            keyCode: 18,
+            characters: "1",
+            modifiers: [.command]
+        ), let commandRight = keyEvent(
+            keyCode: 124,
+            modifiers: [.command]
+        ) else {
+            expect(false, "command event creation")
+            return
+        }
+        expect(pane.handleKeyDown(commandCopy), "Command-C was not consumed")
+        expect(copiedID == model.selectedID, "Command-C copied wrong item")
+        expect(pane.handleKeyDown(capsLockCommandCopy), "Caps-Lock Command-C was not consumed")
+        expect(
+            ClipboardHistoryWindowController.hardwareKeyCodes(
+                for: NSSelectorFromString("copy:")
+            ) == [UInt16(kVK_ANSI_C)],
+            "Command-C callback ownership mapping"
+        )
+        let upFunctionCharacter = String(
+            UnicodeScalar(NSUpArrowFunctionKey)!
+        )
+        guard let upFunction = keyEvent(
+            keyCode: UInt16(kVK_UpArrow),
+            characters: upFunctionCharacter,
+            modifiers: [.function]
+        ) else {
+            expect(false, "function-key event creation")
+            return
+        }
+        expect(
+            !ClipboardHistoryWindowController.isPlainSearchInputEvent(upFunction),
+            "Cocoa function character was accepted as search text"
+        )
+        expect(
+            ClipboardHistoryWindowController.isRimeCompositionEditingEvent(upFunction),
+            "active Rime composition did not retain Up-arrow navigation"
+        )
+        expect(
+            !ClipboardHistoryWindowController.isLiteralSearchText(upFunctionCharacter),
+            "private-use function scalar was accepted as search text"
+        )
+        expect(
+            ClipboardHistoryWindowController.hardwareKeyCodes(
+                for: NSSelectorFromString("moveUp:")
+            ) == [UInt16(kVK_UpArrow)],
+            "Up-arrow callback ownership mapping"
+        )
+        expect(
+            ClipboardHistoryWindowController.hardwareKeyCodes(
+                for: NSSelectorFromString("insertTab:")
+            ) == [UInt16(kVK_Tab)],
+            "Tab callback ownership mapping"
+        )
+        expect(pane.handleKeyDown(commandOne), "Command-1 was not consumed")
+        expect(!pane.handleKeyDown(commandRight), "modified arrow was consumed")
+
+        let multiIDs = model.items.map(\.id)
+        guard multiIDs.count == 2,
+              let shiftRight = keyEvent(
+                keyCode: UInt16(kVK_RightArrow),
+                modifiers: [.shift]
+              ) else {
+            expect(false, "multi-selection fixture")
+            return
+        }
+        _ = model.select(id: multiIDs[0])
+        expect(
+            pane.handleKeyDown(shiftRight),
+            "Shift-Right multi-selection was not consumed"
+        )
+        expect(model.selectedIDs == Set(multiIDs), "Shift range selection")
+        expect(
+            pane.snapshotForSmoke().selectedCardCount == 2,
+            "multi-selection rendering"
+        )
+
+        _ = model.select(id: multiIDs[0])
+        expect(
+            pane.handleCardInteraction(
+                itemID: multiIDs[1],
+                modifiers: [.command],
+                clickCount: 1
+            ),
+            "Command-click multi-selection"
+        )
+        expect(model.selectedIDs == Set(multiIDs), "Command-click selection set")
+        var doubleClickedIDs: [UUID] = []
+        pane.onActivate = { items in
+            doubleClickedIDs = items.map(\.id)
+            return true
+        }
+        expect(
+            pane.handleCardInteraction(
+                itemID: multiIDs[1],
+                modifiers: [.command],
+                clickCount: 2
+            ),
+            "double-click activation"
+        )
+        expect(doubleClickedIDs == [multiIDs[1]], "double-click was not single-item")
+        _ = model.select(ids: multiIDs, focusedID: multiIDs[1])
+        var activatedIDs: [UUID] = []
+        pane.onActivate = { items in
+            activatedIDs = items.map(\.id)
+            return true
+        }
+        expect(pane.handleKeyDown(enter), "multi-selection Enter")
+        expect(activatedIDs == multiIDs, "multi-selection activation order")
+        expect(pane.handleKeyDown(delete), "multi-selection Delete")
+        expect(model.itemCount == 0, "multi-selection delete retained items")
+
+        var closeCount = 0
+        pane.onClose = { closeCount += 1 }
+        _ = pane.appendSearchText("a")
+        guard let escape = keyEvent(keyCode: 53) else {
+            expect(false, "escape event creation")
+            return
+        }
+        expect(pane.handleKeyDown(escape), "query escape was not consumed")
+        expect(pane.query.isEmpty && closeCount == 0, "first escape did not clear query")
+        expect(pane.handleKeyDown(escape), "close escape was not consumed")
+        expect(closeCount == 1, "second escape did not close")
+
+        model.update(
+            windowVisible: true,
+            captureEnabled: true,
+            protection: [.secureInput]
+        )
+        let protected = pane.snapshotForSmoke()
+        expect(protected.contentIsProtected, "protected view flag missing")
+        expect(protected.cardCount == 0, "protected view retained cards")
+        expect(protected.stateIsVisible, "protected view missing state")
+        expect(!pane.activateSelectedItems(), "protected view activated item")
     }
 
-    private static func keyEvent(keyCode: UInt16,
-                                 modifiers: NSEvent.ModifierFlags = []) -> NSEvent? {
+    private static func keyEvent(
+        keyCode: UInt16,
+        characters: String = "",
+        modifiers: NSEvent.ModifierFlags = []
+    ) -> NSEvent? {
         NSEvent.keyEvent(
             with: .keyDown,
             location: .zero,
@@ -545,19 +1346,54 @@ enum ClipboardHistorySmoke {
             timestamp: 0,
             windowNumber: 0,
             context: nil,
-            characters: "",
-            charactersIgnoringModifiers: "",
+            characters: characters,
+            charactersIgnoringModifiers: characters,
             isARepeat: false,
             keyCode: keyCode
         )
+    }
+
+    private static func makeFixturePNG() -> Data? {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 8,
+            pixelsHigh: 6,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        for x in 0..<8 {
+            for y in 0..<6 {
+                bitmap.setColor(
+                    (x + y).isMultiple(of: 2)
+                        ? NSColor(deviceRed: 0.1, green: 0.8, blue: 0.3, alpha: 1)
+                        : NSColor(deviceRed: 0.95, green: 0.8, blue: 0.1, alpha: 1),
+                    atX: x,
+                    y: y
+                )
+            }
+        }
+        return bitmap.representation(using: .png, properties: [:])
     }
 }
 
 private final class ClipboardHistoryPasteboardDouble: ClipboardHistoryPasteboardReading {
     var stubChangeCount = 0
     var stubPlainText: String?
+    var stubArchive: ClipboardPasteboardArchive?
+    var usesAsynchronousArchive = false
     private(set) var changeCountReadCount = 0
     private(set) var plainTextReadCount = 0
+    private var pendingArchiveCompletion:
+        ((Result<ClipboardPasteboardArchive?, Error>) -> Void)?
+
+    var usesTextOnlyCompatibilityArchive: Bool {
+        !usesAsynchronousArchive
+    }
 
     var changeCount: Int {
         changeCountReadCount += 1
@@ -567,6 +1403,24 @@ private final class ClipboardHistoryPasteboardDouble: ClipboardHistoryPasteboard
     func readPlainText() -> String? {
         plainTextReadCount += 1
         return stubPlainText
+    }
+
+    func readArchiveAsynchronously(
+        expectedChangeCount: Int,
+        completion: @escaping (Result<ClipboardPasteboardArchive?, Error>) -> Void
+    ) {
+        guard usesAsynchronousArchive,
+              expectedChangeCount == stubChangeCount else {
+            completion(.success(nil))
+            return
+        }
+        pendingArchiveCompletion = completion
+    }
+
+    func completeAsynchronousRead() {
+        let completion = pendingArchiveCompletion
+        pendingArchiveCompletion = nil
+        completion?(.success(stubArchive))
     }
 }
 

@@ -10,6 +10,11 @@ extension Notification.Name {
 /// the reply only after it has frozen the connector/model context and taken
 /// ownership of the background job.
 protocol MailboxAIReplyCoordinating: AnyObject {
+    func startMailboxConversation(
+        selection: MailboxNewConversationSelection,
+        body: String,
+        completion: @escaping (Result<MailboxGenerationHandle, Error>) -> Void
+    )
     func sendMailboxReply(threadID: UUID,
                           body: String,
                           completion: @escaping (Result<Void, Error>) -> Void)
@@ -26,8 +31,11 @@ final class MailboxInteractionBridge {
     weak var aiReplyCoordinator: MailboxAIReplyCoordinating?
 
     private var inboundItemIDsByThreadID: [UUID: UUID] = [:]
+    private var composerDraftsByThreadID: [UUID: String] = [:]
+    private var newConversationDraft = ""
+    private var newConversationSelection: MailboxNewConversationSelection?
 
-    private init() {}
+    fileprivate init() {}
 
     func associateInboundReview(threadID: UUID, itemID: UUID) {
         guard inboundItemIDsByThreadID[threadID] != itemID else { return }
@@ -40,16 +48,48 @@ final class MailboxInteractionBridge {
         notifyAssociationChanged(threadID: threadID)
     }
 
-    func pendingInboundItem(threadID: UUID) -> InboundItem? {
-        let itemID = inboundItemIDsByThreadID[threadID]
-        if let itemID,
-           let item = InboundBus.shared.pending.first(where: { $0.id == itemID }) {
-            return item
+    func inboundReviewItemID(threadID: UUID) -> UUID? {
+        inboundItemIDsByThreadID[threadID]
+    }
+
+    /// Composer drafts are process-local UI state, not Mailbox messages. Keep
+    /// them outside a pane instance so switching Settings routes or opening the
+    /// standalone window cannot discard text that has not been submitted.
+    func composerDraft(threadID: UUID) -> String? {
+        composerDraftsByThreadID[threadID]
+    }
+
+    func setComposerDraft(_ body: String, threadID: UUID) {
+        if body.isEmpty {
+            composerDraftsByThreadID.removeValue(forKey: threadID)
+        } else {
+            composerDraftsByThreadID[threadID] = body
         }
-        if itemID != nil {
-            inboundItemIDsByThreadID.removeValue(forKey: threadID)
-        }
-        return InboundBus.shared.pendingItem(mailboxThreadID: threadID)
+    }
+
+    func clearComposerDraft(threadID: UUID) {
+        composerDraftsByThreadID.removeValue(forKey: threadID)
+    }
+
+    func draftForNewConversation() -> String { newConversationDraft }
+
+    func setDraftForNewConversation(_ body: String) {
+        newConversationDraft = body
+    }
+
+    func selectionForNewConversation() -> MailboxNewConversationSelection? {
+        newConversationSelection
+    }
+
+    func setSelectionForNewConversation(
+        _ selection: MailboxNewConversationSelection?
+    ) {
+        newConversationSelection = selection
+    }
+
+    func clearNewConversationDraft() {
+        newConversationDraft = ""
+        newConversationSelection = nil
     }
 
     private func notifyAssociationChanged(threadID: UUID) {
@@ -66,6 +106,71 @@ final class MailboxInteractionBridge {
         } else {
             DispatchQueue.main.async(execute: post)
         }
+    }
+}
+
+/// Buffer promotion is an optional integration owned outside Mailbox. The
+/// reusable pane consumes this neutral projection instead of reaching into
+/// `InboundBus` or `BufferModel`, so Mailbox remains readable and its composer
+/// remains usable when no Buffer bridge is installed.
+struct MailboxInboundReviewProjection: Equatable {
+    let id: UUID
+    let isStreaming: Bool
+    let originalTargetIsStale: Bool
+}
+
+protocol MailboxInboundReviewRouting: AnyObject {
+    func review(threadID: UUID) -> MailboxInboundReviewProjection?
+    func canSendToBuffer(reviewID: UUID) -> Bool
+    func sendToBuffer(reviewID: UUID) -> Bool
+    func reject(reviewID: UUID) -> Bool
+}
+
+/// Production-only bridge from a Mailbox review to Buffer. Keeping the concrete
+/// `InboundBus` dependency here makes the integration explicit and optional;
+/// neither Mailbox pane controller knows about Buffer's model or plugin data.
+final class MailboxBufferReviewAdapter: MailboxInboundReviewRouting {
+    static let shared = MailboxBufferReviewAdapter()
+
+    private let bus: InboundBus
+    private let interactionBridge: MailboxInteractionBridge
+
+    init(bus: InboundBus = .shared,
+         interactionBridge: MailboxInteractionBridge = .shared) {
+        self.bus = bus
+        self.interactionBridge = interactionBridge
+    }
+
+    func review(threadID: UUID) -> MailboxInboundReviewProjection? {
+        let associatedID = interactionBridge.inboundReviewItemID(
+            threadID: threadID
+        )
+        let item = associatedID.flatMap { requestedID in
+            bus.pending.first(where: { $0.id == requestedID })
+        } ?? bus.pendingItem(mailboxThreadID: threadID)
+        guard let item else {
+            if associatedID != nil {
+                interactionBridge.clearInboundReview(threadID: threadID)
+            }
+            return nil
+        }
+        return MailboxInboundReviewProjection(
+            id: item.id,
+            isStreaming: item.streaming,
+            originalTargetIsStale: item.pluginMetadata?.stale == true
+        )
+    }
+
+    func canSendToBuffer(reviewID: UUID) -> Bool {
+        bus.canAccept(reviewID)
+    }
+
+    func sendToBuffer(reviewID: UUID) -> Bool {
+        bus.accept(reviewID)
+    }
+
+    func reject(reviewID: UUID) -> Bool {
+        bus.reject(reviewID)
     }
 }
 
@@ -116,6 +221,12 @@ enum MailboxPaneStateRules {
         incomingOtherPreviews.removeValue(forKey: progressedThreadID)
         return currentOtherPreviews != incomingOtherPreviews
     }
+
+    static func permitsConversationNavigation(
+        submissionInFlight: Bool
+    ) -> Bool {
+        !submissionInFlight
+    }
 }
 
 /// Reusable two-column Mailbox surface. The standalone window and Settings
@@ -133,16 +244,22 @@ final class MailboxPaneViewController: NSViewController {
     private var reviewAssociationObserver: NSObjectProtocol?
     private var currentSnapshot: MailboxStoreSnapshot
     private var markReadScheduleGeneration: UInt64 = 0
+    private var isCreatingNewConversation = false
 
     init(store: MailboxStore = .shared,
-         interactionBridge: MailboxInteractionBridge = .shared) {
+         interactionBridge: MailboxInteractionBridge = .shared,
+         reviewRouter: (any MailboxInboundReviewRouting)? = nil,
+         modelOptionsProvider: @escaping () -> [MailboxNewConversationModelOption]
+            = MailboxNewConversationModelCatalog.liveOptions) {
         self.store = store
         self.interactionBridge = interactionBridge
         currentSnapshot = store.snapshot
         threadIndexController = MailboxThreadIndexViewController()
         conversationController = MailboxConversationViewController(
             store: store,
-            interactionBridge: interactionBridge
+            interactionBridge: interactionBridge,
+            reviewRouter: reviewRouter,
+            modelOptionsProvider: modelOptionsProvider
         )
         super.init(nibName: nil, bundle: nil)
     }
@@ -207,8 +324,46 @@ final class MailboxPaneViewController: NSViewController {
 
         threadIndexController.onSelectThread = { [weak self] threadID in
             guard let self else { return }
+            guard MailboxPaneStateRules.permitsConversationNavigation(
+                submissionInFlight: self.conversationController
+                    .hasPendingSubmission
+            ) else {
+                self.threadIndexController.apply(
+                    snapshot: self.currentSnapshot,
+                    creatingNewConversation: self.isCreatingNewConversation
+                )
+                NSSound.beep()
+                return
+            }
+            self.isCreatingNewConversation = false
+            self.threadIndexController.setNewConversationActive(false)
             _ = self.store.selectThread(id: threadID)
+            self.apply(self.store.snapshot)
             self.scheduleMarkSelectedThreadReadIfActive()
+        }
+        threadIndexController.onNewConversation = { [weak self] in
+            guard let self else { return }
+            guard MailboxPaneStateRules.permitsConversationNavigation(
+                submissionInFlight: self.conversationController
+                    .hasPendingSubmission
+            ) else {
+                NSSound.beep()
+                return
+            }
+            self.beginNewConversation()
+        }
+        conversationController.onSubmissionStateChanged = { [weak self] pending in
+            self?.threadIndexController.setInteractionEnabled(!pending)
+        }
+        conversationController.onNewConversationStarted = { [weak self] handle in
+            guard let self else { return }
+            self.isCreatingNewConversation = false
+            self.threadIndexController.setNewConversationActive(false)
+            _ = self.store.selectThread(id: handle.threadID)
+            self.apply(self.store.snapshot)
+        }
+        conversationController.onCancelNewConversation = { [weak self] in
+            self?.cancelNewConversation()
         }
     }
 
@@ -286,7 +441,16 @@ final class MailboxPaneViewController: NSViewController {
             return
         }
         currentSnapshot = snapshot
-        threadIndexController.apply(snapshot: snapshot)
+        threadIndexController.apply(
+            snapshot: snapshot,
+            creatingNewConversation: isCreatingNewConversation
+        )
+        if isCreatingNewConversation {
+            conversationController.applyNewConversation(
+                persistence: snapshot.persistence
+            )
+            return
+        }
         let selectedThread = snapshot.selectedThreadID.flatMap(snapshot.thread(id:))
         conversationController.apply(
             thread: selectedThread,
@@ -331,6 +495,13 @@ final class MailboxPaneViewController: NSViewController {
             return
         }
         currentSnapshot = snapshot
+        if isCreatingNewConversation {
+            threadIndexController.apply(
+                snapshot: snapshot,
+                creatingNewConversation: true
+            )
+            return
+        }
         guard snapshot.selectedThreadID == threadID,
               let thread = snapshot.thread(id: threadID) else {
             return
@@ -340,6 +511,21 @@ final class MailboxPaneViewController: NSViewController {
             persistence: snapshot.persistence,
             preview: snapshot.generationPreview(threadID: threadID)
         )
+    }
+
+    fileprivate func beginNewConversation() {
+        isCreatingNewConversation = true
+        threadIndexController.setNewConversationActive(true)
+        conversationController.applyNewConversation(
+            persistence: currentSnapshot.persistence
+        )
+    }
+
+    private func cancelNewConversation() {
+        guard isCreatingNewConversation else { return }
+        isCreatingNewConversation = false
+        threadIndexController.setNewConversationActive(false)
+        apply(store.snapshot)
     }
 
     private func scheduleMarkSelectedThreadReadIfActive() {
@@ -430,9 +616,15 @@ private final class MailboxThreadIndexViewController: NSViewController,
                                                       NSTableViewDataSource,
                                                       NSTableViewDelegate {
     var onSelectThread: ((UUID) -> Void)?
+    var onNewConversation: (() -> Void)?
 
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
+    private let newConversationButton = RimePointingHandButton(
+        title: "+ 新建",
+        target: nil,
+        action: nil
+    )
     private var rows: [MailboxThreadListRow] = []
     private var threadsByID: [UUID: MailboxThread] = [:]
     private var selectedThreadID: UUID?
@@ -460,18 +652,61 @@ private final class MailboxThreadIndexViewController: NSViewController,
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "$ conversations")
+        titleLabel.font = MailboxTerminalTypography.font(
+            ofSize: 10,
+            weight: .semibold
+        )
+        titleLabel.textColor = RimeUI.textSecondary
+        newConversationButton.target = self
+        newConversationButton.action = #selector(newConversationTapped)
+        newConversationButton.bezelStyle = .inline
+        newConversationButton.font = MailboxTerminalTypography.font(
+            ofSize: 10,
+            weight: .semibold
+        )
+        newConversationButton.setAccessibilityLabel("新建 Mailbox 对话")
+        let header = NSStackView(views: [
+            titleLabel,
+            MailboxPresentation.spacer(),
+            newConversationButton,
+        ])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let separator = NSView()
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = RimeUI.border.cgColor
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(header)
+        root.addSubview(separator)
         root.addSubview(scrollView)
         NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -10),
+            header.topAnchor.constraint(equalTo: root.topAnchor),
+            header.heightAnchor.constraint(equalToConstant: 40),
+            separator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            separator.topAnchor.constraint(equalTo: header.bottomAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1),
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: root.topAnchor, constant: 4),
+            scrollView.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 4),
             scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
         view = root
     }
 
-    func apply(snapshot: MailboxStoreSnapshot) {
-        selectedThreadID = snapshot.selectedThreadID
+    func apply(
+        snapshot: MailboxStoreSnapshot,
+        creatingNewConversation: Bool = false
+    ) {
+        selectedThreadID = creatingNewConversation ? nil : snapshot.selectedThreadID
+        setNewConversationActive(creatingNewConversation)
         threadsByID = Dictionary(uniqueKeysWithValues: snapshot.threads.map { ($0.id, $0) })
         rows.removeAll(keepingCapacity: true)
         var lastDateLabel: String?
@@ -485,6 +720,32 @@ private final class MailboxThreadIndexViewController: NSViewController,
         }
         tableView.reloadData()
         synchronizeSelection()
+    }
+
+    func setNewConversationActive(_ active: Bool) {
+        guard isViewLoaded else { return }
+        newConversationButton.title = active ? "● 新对话" : "+ 新建"
+        newConversationButton.contentTintColor = active
+            ? RimeUI.accentTextColor
+            : RimeUI.textPrimary
+        if active {
+            applyingSelection = true
+            tableView.deselectAll(nil)
+            applyingSelection = false
+        }
+    }
+
+    func setInteractionEnabled(_ enabled: Bool) {
+        guard isViewLoaded else { return }
+        tableView.isEnabled = enabled
+        newConversationButton.isEnabled = enabled
+        for row in 0..<tableView.numberOfRows {
+            (tableView.view(
+                atColumn: 0,
+                row: row,
+                makeIfNecessary: false
+            ) as? MailboxThreadCellView)?.isPointingHandEnabled = enabled
+        }
     }
 
     func applyAppearance() {
@@ -522,6 +783,7 @@ private final class MailboxThreadIndexViewController: NSViewController,
         case let .thread(threadID):
             guard let thread = threadsByID[threadID] else { return nil }
             let cell = MailboxThreadCellView()
+            cell.isPointingHandEnabled = tableView.isEnabled
             cell.configure(thread: thread, selected: threadID == selectedThreadID)
             return cell
         }
@@ -532,6 +794,10 @@ private final class MailboxThreadIndexViewController: NSViewController,
         let row = tableView.selectedRow
         guard rows.indices.contains(row), case let .thread(id) = rows[row] else { return }
         onSelectThread?(id)
+    }
+
+    @objc private func newConversationTapped() {
+        onNewConversation?()
     }
 
     private func synchronizeSelection() {
@@ -575,10 +841,52 @@ private final class MailboxDateHeaderCellView: NSTableCellView {
 }
 
 private final class MailboxThreadCellView: NSTableCellView {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
     private let selectionRail = NSView()
     private let sequenceLabel = NSTextField(labelWithString: "")
     private let sourceLabel = NSTextField(labelWithString: "")
     private let unreadLabel = NSTextField(labelWithString: "NEW")
+
+    var isPointingHandEnabled = true {
+        didSet {
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isPointingHandEnabled
+            )
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isPointingHandEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(
+            enabled: isPointingHandEnabled
+        )
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -648,15 +956,26 @@ private final class MailboxThreadCellView: NSTableCellView {
         )
     }
 
+    fileprivate var pointingHandCursorKindForSmoke: RimePointingHandCursorKind {
+        RimePointingHandCursorRules.kind(enabled: isPointingHandEnabled)
+    }
+
     fileprivate var accessibilitySummaryForSmoke: String? { accessibilityLabel() }
     fileprivate var contentRowCountForSmoke: Int {
         subviews.filter { $0 !== selectionRail }.count
     }
 }
 
-private final class MailboxConversationViewController: NSViewController {
+private final class MailboxConversationViewController: NSViewController,
+                                                         NSTextFieldDelegate {
+    var onNewConversationStarted: ((MailboxGenerationHandle) -> Void)?
+    var onCancelNewConversation: (() -> Void)?
+    var onSubmissionStateChanged: ((Bool) -> Void)?
+
     private let store: MailboxStore
     private let interactionBridge: MailboxInteractionBridge
+    private let reviewRouter: (any MailboxInboundReviewRouting)?
+    private let modelOptionsProvider: () -> [MailboxNewConversationModelOption]
 
     private let sourceLabel = NSTextField(labelWithString: "")
     private let metadataLabel = NSTextField(labelWithString: "")
@@ -667,8 +986,28 @@ private final class MailboxConversationViewController: NSViewController {
     private let reviewBar = NSView()
     private let reviewSeparator = NSView()
     private let reviewLabel = NSTextField(labelWithString: "")
-    private let acceptButton = NSButton(title: "加入 Buffer", target: nil, action: nil)
-    private let rejectButton = NSButton(title: "拒绝", target: nil, action: nil)
+    private let acceptButton = RimePointingHandButton(
+        title: "加入 Buffer",
+        target: nil,
+        action: nil
+    )
+    private let rejectButton = RimePointingHandButton(
+        title: "拒绝",
+        target: nil,
+        action: nil
+    )
+    private let newConversationBar = NSView()
+    private let newConversationSeparator = NSView()
+    private let newConversationModelLabel = NSTextField(labelWithString: "MODEL")
+    private let newConversationModelPopup = RimeFixedAccentPopUpButton(
+        frame: .zero,
+        pullsDown: false
+    )
+    private let cancelNewConversationButton = RimePointingHandButton(
+        title: "取消",
+        target: nil,
+        action: nil
+    )
     private let composerContainer = NSView()
     private let composerSeparator = NSView()
     private let composerPromptLabel = NSTextField(labelWithString: ">")
@@ -680,18 +1019,40 @@ private final class MailboxConversationViewController: NSViewController {
     private var currentPreview: MailboxGenerationPreview?
     private weak var streamingPreviewRow: MailboxMessageRowView?
     private weak var transcriptTailSpacer: NSView?
-    private var drafts: [UUID: String] = [:]
-    private var isSendingReply = false
+    private var isSendingReply = false {
+        didSet {
+            guard isSendingReply != oldValue else { return }
+            onSubmissionStateChanged?(isSendingReply)
+        }
+    }
+    private var isCreatingNewConversation = false
+    private var newConversationSubmissionError: String?
+    private var newConversationModelOptions: [MailboxNewConversationModelOption] = []
     private var scheduledTailFollowGeneration: UInt64 = 0
+    private var connectorStateObservers: [NSObjectProtocol] = []
 
-    init(store: MailboxStore, interactionBridge: MailboxInteractionBridge) {
+    fileprivate var hasPendingSubmission: Bool { isSendingReply }
+
+    init(store: MailboxStore,
+         interactionBridge: MailboxInteractionBridge,
+         reviewRouter: (any MailboxInboundReviewRouting)? = nil,
+         modelOptionsProvider: @escaping () -> [MailboxNewConversationModelOption]
+            = MailboxNewConversationModelCatalog.liveOptions) {
         self.store = store
         self.interactionBridge = interactionBridge
+        self.reviewRouter = reviewRouter
+        self.modelOptionsProvider = modelOptionsProvider
         super.init(nibName: nil, bundle: nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        connectorStateObservers.forEach(
+            NotificationCenter.default.removeObserver
+        )
+    }
 
     override func loadView() {
         let root = NSView()
@@ -700,9 +1061,17 @@ private final class MailboxConversationViewController: NSViewController {
         let header = makeHeader()
         configureTranscript()
         configureReviewBar()
+        configureNewConversationBar()
         configureComposer()
+        observeConnectorState()
 
-        let vertical = NSStackView(views: [header, transcriptScrollView, reviewBar, composerContainer])
+        let vertical = NSStackView(views: [
+            header,
+            transcriptScrollView,
+            reviewBar,
+            newConversationBar,
+            composerContainer,
+        ])
         vertical.orientation = .vertical
         vertical.alignment = .width
         vertical.spacing = 0
@@ -715,9 +1084,11 @@ private final class MailboxConversationViewController: NSViewController {
             vertical.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             header.heightAnchor.constraint(equalToConstant: 48),
             transcriptScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            transcriptScrollView.widthAnchor.constraint(equalTo: vertical.widthAnchor),
         ])
         view = root
         reviewBar.isHidden = true
+        newConversationBar.isHidden = true
     }
 
     func apply(thread: MailboxThread?,
@@ -730,8 +1101,18 @@ private final class MailboxConversationViewController: NSViewController {
         let shouldFollowTail = changedThread
             || isTranscriptPinnedToBottom()
         if let previousThreadID, previousThreadID != thread?.id {
-            drafts[previousThreadID] = composerField.stringValue
+            interactionBridge.setComposerDraft(
+                composerField.stringValue,
+                threadID: previousThreadID
+            )
         }
+        if isCreatingNewConversation {
+            interactionBridge.setDraftForNewConversation(
+                composerField.stringValue
+            )
+        }
+        isCreatingNewConversation = false
+        newConversationBar.isHidden = true
         currentThread = thread
         currentPreview = preview
 
@@ -777,29 +1158,89 @@ private final class MailboxConversationViewController: NSViewController {
             )
         }
         if previousThreadID != thread.id {
-            composerField.stringValue = drafts[thread.id] ?? ""
+            composerField.stringValue = interactionBridge.composerDraft(
+                threadID: thread.id
+            ) ?? ""
         }
         refreshReviewState()
         configureComposerState(for: thread, persistence: persistence)
     }
 
+    func applyNewConversation(
+        persistence: MailboxPersistenceAvailability
+    ) {
+        let enteringDraft = !isCreatingNewConversation
+        if enteringDraft, let previousThreadID = currentThread?.id {
+            interactionBridge.setComposerDraft(
+                composerField.stringValue,
+                threadID: previousThreadID
+            )
+        }
+        currentThread = nil
+        currentPreview = nil
+        isCreatingNewConversation = true
+        if enteringDraft {
+            newConversationSubmissionError = nil
+        }
+        reviewBar.isHidden = true
+        newConversationBar.isHidden = false
+        sourceLabel.stringValue = "mailbox / new"
+        headerStateLabel.stringValue = "DRAFT · LOCAL"
+        rebuildMessages(
+            [],
+            emptyTitle: "新对话",
+            emptyDetail: "选择模型，然后在下方输入第一条消息。",
+            followTail: true
+        )
+        if enteringDraft {
+            composerField.stringValue = interactionBridge
+                .draftForNewConversation()
+        }
+        refreshNewConversationModelOptions()
+        configureNewConversationState(persistence: persistence)
+    }
+
+    private func observeConnectorState() {
+        let names: [Notification.Name] = [
+            .aiTextConnectorAvailabilityDidChange,
+            .aiTextConnectorDidChange,
+            .aiTextGenerationPreferencesDidChange,
+            .openAICompatibleConfigurationDidChange,
+        ]
+        connectorStateObservers = names.map { name in
+            NotificationCenter.default.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isCreatingNewConversation else { return }
+                self.refreshNewConversationModelOptions()
+                self.configureNewConversationState(
+                    persistence: self.store.snapshot.persistence
+                )
+            }
+        }
+    }
+
     func refreshReviewState() {
         guard isViewLoaded, let thread = currentThread,
               !thread.source.kind.isAIConnector,
-              let pending = interactionBridge.pendingInboundItem(threadID: thread.id) else {
+              let review = reviewRouter?.review(threadID: thread.id) else {
             reviewBar.isHidden = true
             return
         }
         reviewBar.isHidden = false
-        if pending.streaming {
+        if review.isStreaming {
             reviewLabel.stringValue = "! review · 外部内容仍在接收，完成后才可加入 Buffer。"
-        } else if pending.pluginMetadata?.stale == true {
+        } else if review.originalTargetIsStale {
             reviewLabel.stringValue = "! review · 原目标已变化；加入后将作为普通文本处理。"
         } else {
             reviewLabel.stringValue = "! review · 外部推送需要你明确审核。"
         }
-        acceptButton.isEnabled = InboundBus.shared.canAccept(pending.id)
-        acceptButton.toolTip = pending.streaming ? "等待外部来源结束推送" : nil
+        acceptButton.isEnabled = reviewRouter?.canSendToBuffer(
+            reviewID: review.id
+        ) == true
+        acceptButton.toolTip = review.isStreaming ? "等待外部来源结束推送" : nil
     }
 
     func applyAppearance() {
@@ -813,6 +1254,10 @@ private final class MailboxConversationViewController: NSViewController {
         reviewBar.layer?.backgroundColor = RimeUI.surface2.cgColor
         reviewSeparator.layer?.backgroundColor = RimeUI.border.cgColor
         reviewLabel.textColor = RimeUI.textSecondary
+        newConversationBar.layer?.backgroundColor = RimeUI.surface2.cgColor
+        newConversationSeparator.layer?.backgroundColor = RimeUI.border.cgColor
+        newConversationModelLabel.textColor = RimeUI.textSecondary
+        cancelNewConversationButton.contentTintColor = RimeUI.textSecondary
         composerContainer.layer?.backgroundColor = RimeUI.surface2.cgColor
         composerSeparator.layer?.backgroundColor = RimeUI.border.cgColor
         composerPromptLabel.textColor = RimeUI.accentTextColor
@@ -820,11 +1265,20 @@ private final class MailboxConversationViewController: NSViewController {
         composerField.textColor = RimeUI.textPrimary
         acceptButton.bezelColor = RimeUI.accentGreen
         acceptButton.contentTintColor = RimeUI.accentForegroundColor
-        rebuildMessages(
-            currentThread?.messages ?? [],
-            preview: currentPreview,
-            followTail: isTranscriptPinnedToBottom()
-        )
+        if isCreatingNewConversation {
+            rebuildMessages(
+                [],
+                emptyTitle: "新对话",
+                emptyDetail: "选择模型，然后在下方输入第一条消息。",
+                followTail: true
+            )
+        } else {
+            rebuildMessages(
+                currentThread?.messages ?? [],
+                preview: currentPreview,
+                followTail: isTranscriptPinnedToBottom()
+            )
+        }
     }
 
     private func makeHeader() -> NSView {
@@ -870,6 +1324,12 @@ private final class MailboxConversationViewController: NSViewController {
         Self.configureMessageStack(messageStack)
         transcriptScrollView.documentView = messageStack
         NSLayoutConstraint.activate([
+            messageStack.leadingAnchor.constraint(
+                equalTo: transcriptScrollView.contentView.leadingAnchor
+            ),
+            messageStack.topAnchor.constraint(
+                equalTo: transcriptScrollView.contentView.topAnchor
+            ),
             messageStack.widthAnchor.constraint(equalTo: transcriptScrollView.contentView.widthAnchor),
             messageStack.heightAnchor.constraint(greaterThanOrEqualTo: transcriptScrollView.contentView.heightAnchor),
         ])
@@ -910,6 +1370,76 @@ private final class MailboxConversationViewController: NSViewController {
         ])
     }
 
+    private func configureNewConversationBar() {
+        newConversationBar.wantsLayer = true
+        newConversationSeparator.wantsLayer = true
+        newConversationSeparator.translatesAutoresizingMaskIntoConstraints = false
+        newConversationModelLabel.font = MailboxTerminalTypography.font(
+            ofSize: 9,
+            weight: .semibold
+        )
+        newConversationModelLabel.setContentHuggingPriority(
+            .required,
+            for: .horizontal
+        )
+        newConversationModelPopup.controlSize = .small
+        newConversationModelPopup.font = MailboxTerminalTypography.font(
+            ofSize: 10,
+            weight: .medium
+        )
+        newConversationModelPopup.focusRingType = .none
+        newConversationModelPopup.target = self
+        newConversationModelPopup.action = #selector(newConversationModelChanged)
+        newConversationModelPopup.setAccessibilityLabel("新对话模型")
+        newConversationModelPopup.translatesAutoresizingMaskIntoConstraints = false
+        newConversationModelPopup.widthAnchor.constraint(
+            greaterThanOrEqualToConstant: 220
+        ).isActive = true
+        cancelNewConversationButton.target = self
+        cancelNewConversationButton.action = #selector(cancelNewConversationTapped)
+        cancelNewConversationButton.bezelStyle = .inline
+        cancelNewConversationButton.font = MailboxTerminalTypography.font(
+            ofSize: 10,
+            weight: .medium
+        )
+        cancelNewConversationButton.setAccessibilityLabel("取消新建 Mailbox 对话")
+
+        let row = NSStackView(views: [
+            newConversationModelLabel,
+            newConversationModelPopup,
+            MailboxPresentation.spacer(),
+            cancelNewConversationButton,
+        ])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        newConversationBar.addSubview(newConversationSeparator)
+        newConversationBar.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(
+                equalTo: newConversationBar.leadingAnchor,
+                constant: MailboxTerminalLayout.bodyLeading
+            ),
+            row.trailingAnchor.constraint(
+                equalTo: newConversationBar.trailingAnchor,
+                constant: -MailboxTerminalLayout.bodyTrailing
+            ),
+            row.topAnchor.constraint(equalTo: newConversationBar.topAnchor, constant: 7),
+            row.bottomAnchor.constraint(equalTo: newConversationBar.bottomAnchor, constant: -7),
+            newConversationSeparator.leadingAnchor.constraint(
+                equalTo: newConversationBar.leadingAnchor
+            ),
+            newConversationSeparator.trailingAnchor.constraint(
+                equalTo: newConversationBar.trailingAnchor
+            ),
+            newConversationSeparator.topAnchor.constraint(
+                equalTo: newConversationBar.topAnchor
+            ),
+            newConversationSeparator.heightAnchor.constraint(equalToConstant: 1),
+        ])
+    }
+
     private func configureComposer() {
         composerContainer.wantsLayer = true
         composerSeparator.wantsLayer = true
@@ -929,6 +1459,7 @@ private final class MailboxConversationViewController: NSViewController {
         composerField.usesSingleLineMode = true
         composerField.target = self
         composerField.action = #selector(sendTapped)
+        composerField.delegate = self
         composerField.setAccessibilityLabel("Mailbox 命令行输入，按 Return 提交")
         composerField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         composerField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1054,6 +1585,98 @@ private final class MailboxConversationViewController: NSViewController {
         }
     }
 
+    private func refreshNewConversationModelOptions() {
+        newConversationModelOptions = modelOptionsProvider()
+        newConversationModelPopup.removeAllItems()
+        for option in newConversationModelOptions {
+            newConversationModelPopup.addItem(withTitle: option.title)
+            let item = newConversationModelPopup.lastItem
+            item?.isEnabled = option.isAvailable
+            item?.toolTip = option.unavailableReason
+        }
+        let saved = interactionBridge.selectionForNewConversation()
+        let selectedIndex = saved.flatMap { saved in
+            newConversationModelOptions.firstIndex(where: {
+                $0.selection == saved && $0.isAvailable
+            })
+        } ?? newConversationModelOptions.firstIndex(where: {
+            $0.isPreferred && $0.isAvailable
+        }) ?? newConversationModelOptions.firstIndex(where: \.isAvailable)
+        if let selectedIndex {
+            newConversationModelPopup.selectItem(at: selectedIndex)
+            interactionBridge.setSelectionForNewConversation(
+                newConversationModelOptions[selectedIndex].selection
+            )
+        } else if !newConversationModelOptions.isEmpty {
+            newConversationModelPopup.selectItem(at: 0)
+            interactionBridge.setSelectionForNewConversation(nil)
+        }
+        updateNewConversationMetadata()
+    }
+
+    private func configureNewConversationState(
+        persistence: MailboxPersistenceAvailability
+    ) {
+        composerPromptLabel.stringValue = ">"
+        composerField.placeholderString = "start a new conversation… · Return 发送"
+        composerField.toolTip = "第一条消息发送后才创建并保存会话。"
+        composerField.setAccessibilityLabel("新对话第一条消息，按 Return 发送")
+        let persistenceAvailable: Bool
+        var statusMessage: String?
+        switch persistence {
+        case .available:
+            persistenceAvailable = true
+        case let .unavailable(reason):
+            persistenceAvailable = false
+            statusMessage = reason
+        }
+        let selected = selectedNewConversationModelOption
+        let coordinatorAvailable = interactionBridge.aiReplyCoordinator != nil
+        composerField.isEnabled = persistenceAvailable
+            && coordinatorAvailable
+            && selected?.isAvailable == true
+            && !isSendingReply
+        newConversationModelPopup.isEnabled = !isSendingReply
+            && newConversationModelOptions.contains(where: \.isAvailable)
+        cancelNewConversationButton.isEnabled = !isSendingReply
+        if persistenceAvailable {
+            if let newConversationSubmissionError {
+                statusMessage = newConversationSubmissionError
+            } else if !coordinatorAvailable {
+                statusMessage = "AI 连接器尚未接入 Mailbox。"
+            } else if let reason = selected?.unavailableReason {
+                statusMessage = reason
+            } else if selected == nil {
+                statusMessage = "请先在“设置 › 连接器 › AI 模型”完成连接。"
+            }
+        }
+        if let statusMessage {
+            composerStatusLabel.stringValue = statusMessage
+            composerStatusLabel.textColor = .systemRed
+            composerStatusRow.isHidden = false
+        } else {
+            composerStatusLabel.stringValue = ""
+            composerStatusRow.isHidden = true
+        }
+    }
+
+    private var selectedNewConversationModelOption: MailboxNewConversationModelOption? {
+        let index = newConversationModelPopup.indexOfSelectedItem
+        guard newConversationModelOptions.indices.contains(index) else {
+            return nil
+        }
+        return newConversationModelOptions[index]
+    }
+
+    private func updateNewConversationMetadata() {
+        guard isCreatingNewConversation else { return }
+        if let option = selectedNewConversationModelOption {
+            metadataLabel.stringValue = "\(option.title) · 首条消息发送后保存"
+        } else {
+            metadataLabel.stringValue = "选择一个已连接的模型"
+        }
+    }
+
     /// Updates only the process-local row when durable transcript content is
     /// unchanged. Returning false asks the caller for a full rebuild because
     /// the current view tree cannot safely represent the requested transition.
@@ -1120,15 +1743,33 @@ private final class MailboxConversationViewController: NSViewController {
             let title = NSTextField(labelWithString: "> \(emptyTitle)")
             title.font = MailboxTerminalTypography.font(ofSize: 12, weight: .semibold)
             title.textColor = RimeUI.textSecondary
+            title.alignment = .left
+            title.translatesAutoresizingMaskIntoConstraints = false
             let detail = NSTextField(wrappingLabelWithString: emptyDetail)
             detail.font = MailboxTerminalTypography.font(ofSize: 10)
             detail.textColor = RimeUI.textMuted
-            let empty = NSStackView(views: [title, detail, MailboxPresentation.verticalSpacer()])
-            empty.orientation = .vertical
-            empty.alignment = .leading
-            empty.spacing = 6
-            empty.edgeInsets = NSEdgeInsets(top: 18, left: 16, bottom: 16, right: 16)
+            detail.alignment = .left
+            detail.translatesAutoresizingMaskIntoConstraints = false
+
+            // Keep the empty state out of a nested stack. A wrapping label has
+            // no useful intrinsic width, and AppKit can otherwise satisfy the
+            // nested stack's hugging priorities by moving the short title to
+            // the trailing edge of the transcript.
+            let empty = NSView()
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            empty.addSubview(title)
+            empty.addSubview(detail)
             messageStack.addArrangedSubview(empty)
+            NSLayoutConstraint.activate([
+                empty.widthAnchor.constraint(equalTo: messageStack.widthAnchor),
+                title.leadingAnchor.constraint(equalTo: empty.leadingAnchor, constant: 16),
+                title.trailingAnchor.constraint(equalTo: empty.trailingAnchor, constant: -16),
+                title.topAnchor.constraint(equalTo: empty.topAnchor, constant: 18),
+                detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+                detail.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+                detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
+                detail.bottomAnchor.constraint(lessThanOrEqualTo: empty.bottomAnchor, constant: -16),
+            ])
         } else {
             for message in messages {
                 messageStack.addArrangedSubview(MailboxMessageRowView(message: message))
@@ -1215,6 +1856,398 @@ private final class MailboxConversationViewController: NSViewController {
     fileprivate static func validateComposerLayoutForSmoke() -> Bool {
         validateComposerLayoutForSmoke(width: 600)
             && validateComposerLayoutForSmoke(width: 360)
+    }
+
+    fileprivate static func validateWithoutBufferReviewBridgeForSmoke() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-pane-decoupling-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        do {
+            let store = try MailboxStore(storageRoot: root)
+            let interactionBridge = MailboxInteractionBridge()
+            let replyCoordinator = MailboxAIReplyCoordinatorSmokeStub()
+            interactionBridge.aiReplyCoordinator = replyCoordinator
+            let controller = MailboxConversationViewController(
+                store: store,
+                interactionBridge: interactionBridge,
+                reviewRouter: nil
+            )
+            _ = controller.view
+
+            let inbound = try store.createInboundThread(
+                source: .http(source: "Smoke HTTP"),
+                body: "standalone readable"
+            )
+            controller.apply(thread: inbound, persistence: .available)
+            guard controller.reviewBar.isHidden,
+                  controller.composerField.isEnabled,
+                  controller.composerPromptLabel.stringValue == "#",
+                  controller.messageStack.arrangedSubviews.contains(where: {
+                    ($0 as? MailboxMessageRowView)?.transcriptBodyString
+                        == "standalone readable"
+                  }) else {
+                return false
+            }
+            controller.composerField.stringValue = "standalone note"
+            controller.sendTapped()
+            guard controller.composerField.stringValue.isEmpty,
+                  store.thread(id: inbound.id)?.messages.contains(where: {
+                    $0.kind == .localNote && $0.body == "standalone note"
+                  }) == true else {
+                return false
+            }
+
+            controller.composerField.stringValue = "draft survives route rebuild"
+            controller.controlTextDidChange(Notification(
+                name: NSControl.textDidChangeNotification,
+                object: controller.composerField
+            ))
+            let rebuiltController = MailboxConversationViewController(
+                store: store,
+                interactionBridge: interactionBridge,
+                reviewRouter: nil
+            )
+            _ = rebuiltController.view
+            rebuiltController.apply(
+                thread: store.thread(id: inbound.id),
+                persistence: .available
+            )
+            guard rebuiltController.composerField.stringValue
+                    == "draft survives route rebuild" else {
+                return false
+            }
+            interactionBridge.clearComposerDraft(threadID: inbound.id)
+
+            let handle = try store.beginAIConversation(
+                source: .codexCLI(model: "smoke"),
+                prompt: "first turn"
+            )
+            _ = try store.completeGeneration(
+                handle,
+                response: "first answer",
+                author: "Codex"
+            )
+            guard let aiThread = store.thread(id: handle.threadID) else {
+                return false
+            }
+            controller.apply(thread: aiThread, persistence: .available)
+            guard controller.reviewBar.isHidden,
+                  controller.composerField.isEnabled,
+                  controller.composerPromptLabel.stringValue == ">" else {
+                return false
+            }
+            controller.composerField.stringValue = "standalone follow-up"
+            controller.sendTapped()
+            return replyCoordinator.requests == [
+                MailboxAIReplyCoordinatorSmokeStub.Request(
+                    threadID: aiThread.id,
+                    body: "standalone follow-up"
+                ),
+            ]
+        } catch {
+            return false
+        }
+    }
+
+    fileprivate static func validateNewConversationForSmoke() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-new-conversation-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        do {
+            let store = try MailboxStore(storageRoot: root)
+            let interactionBridge = MailboxInteractionBridge()
+            let replyCoordinator = MailboxAIReplyCoordinatorSmokeStub()
+            interactionBridge.aiReplyCoordinator = replyCoordinator
+            let selection = MailboxNewConversationSelection(
+                connectorKind: .openAICompatible,
+                modelID: "smoke-chat-model"
+            )
+            let option = MailboxNewConversationModelOption(
+                selection: selection,
+                title: "OpenAI API · smoke-chat-model",
+                isPreferred: true,
+                unavailableReason: nil
+            )
+            let controller = MailboxConversationViewController(
+                store: store,
+                interactionBridge: interactionBridge,
+                reviewRouter: nil,
+                modelOptionsProvider: { [option] }
+            )
+            _ = controller.view
+            controller.applyNewConversation(persistence: .available)
+            guard controller.currentThread == nil,
+                  controller.isCreatingNewConversation,
+                  !controller.newConversationBar.isHidden,
+                  controller.newConversationModelPopup.titleOfSelectedItem
+                    == option.title,
+                  controller.composerField.isEnabled,
+                  controller.composerPromptLabel.stringValue == ">",
+                  controller.headerStateLabel.stringValue == "DRAFT · LOCAL" else {
+                return false
+            }
+
+            controller.composerField.stringValue = "draft survives pane rebuild"
+            controller.controlTextDidChange(Notification(
+                name: NSControl.textDidChangeNotification,
+                object: controller.composerField
+            ))
+            let rebuilt = MailboxConversationViewController(
+                store: store,
+                interactionBridge: interactionBridge,
+                reviewRouter: nil,
+                modelOptionsProvider: { [option] }
+            )
+            _ = rebuilt.view
+            rebuilt.applyNewConversation(persistence: .available)
+            guard rebuilt.composerField.stringValue
+                    == "draft survives pane rebuild",
+                  interactionBridge.selectionForNewConversation() == selection else {
+                return false
+            }
+
+            var startedHandle: MailboxGenerationHandle?
+            rebuilt.onNewConversationStarted = { startedHandle = $0 }
+            rebuilt.sendTapped()
+            guard waitForSmokeCondition({ startedHandle != nil }) else {
+                return false
+            }
+            guard replyCoordinator.newConversationRequests == [
+                MailboxAIReplyCoordinatorSmokeStub.NewConversationRequest(
+                    selection: selection,
+                    body: "draft survives pane rebuild"
+                ),
+            ], startedHandle != nil,
+                rebuilt.composerField.stringValue.isEmpty,
+                interactionBridge.draftForNewConversation().isEmpty,
+                interactionBridge.selectionForNewConversation() == nil else {
+                return false
+            }
+
+            let catalog = MailboxNewConversationModelCatalog.options(
+                selectedKind: .claudeCodeCLI,
+                selectionResolver: { kind in
+                    AITextGenerationSelection(
+                        connectorKind: kind,
+                        modelID: kind == .openAICompatible
+                            ? "configured-model"
+                            : "ignored-cli-model",
+                        mode: .summarize,
+                        destination: .inline,
+                        format: .json
+                    )
+                },
+                availabilityResolver: { kind in
+                    kind == .codexCLI
+                        ? .unavailable("not connected")
+                        : .ready
+                }
+            )
+            return catalog.count == 3
+                && catalog.first(where: {
+                    $0.selection.connectorKind == .claudeCodeCLI
+                })?.isPreferred == true
+                && catalog.first(where: {
+                    $0.selection.connectorKind == .claudeCodeCLI
+                })?.selection.modelID == nil
+                && catalog.first(where: {
+                    $0.selection.connectorKind == .codexCLI
+                })?.selection.modelID == nil
+                && catalog.first(where: {
+                    $0.selection.connectorKind == .openAICompatible
+                })?.selection.modelID == "configured-model"
+                && catalog.first(where: {
+                    $0.selection.connectorKind == .codexCLI
+                })?.isAvailable == false
+                && validateNewConversationAvailabilityRefreshForSmoke(
+                    selection: selection
+                )
+                && validateNewConversationFailureForSmoke(
+                    option: option
+                )
+                && validateDeferredSubmissionForSmoke(
+                    option: option
+                )
+        } catch {
+            return false
+        }
+    }
+
+    private static func validateNewConversationAvailabilityRefreshForSmoke(
+        selection: MailboxNewConversationSelection
+    ) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-availability-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let store = try? MailboxStore(storageRoot: root) else { return false }
+        let interactionBridge = MailboxInteractionBridge()
+        let coordinator = MailboxAIReplyCoordinatorSmokeStub()
+        interactionBridge.aiReplyCoordinator = coordinator
+        let initialOption = MailboxNewConversationModelOption(
+            selection: selection,
+            title: "OpenAI API · smoke-chat-model · 未连接",
+            isPreferred: true,
+            unavailableReason: "正在检查连接器…"
+        )
+        final class OptionBox {
+            var value: MailboxNewConversationModelOption
+            init(_ value: MailboxNewConversationModelOption) { self.value = value }
+        }
+        let box = OptionBox(initialOption)
+        let refreshedController = MailboxConversationViewController(
+            store: store,
+            interactionBridge: interactionBridge,
+            modelOptionsProvider: { [box] in [box.value] }
+        )
+        _ = refreshedController.view
+        refreshedController.applyNewConversation(persistence: .available)
+        guard refreshedController.newConversationModelPopup.item(at: 0)?.isEnabled == false,
+              !refreshedController.composerField.isEnabled else {
+            return false
+        }
+        box.value = MailboxNewConversationModelOption(
+            selection: selection,
+            title: "OpenAI API · smoke-chat-model",
+            isPreferred: true,
+            unavailableReason: nil
+        )
+        NotificationCenter.default.post(
+            name: .aiTextConnectorAvailabilityDidChange,
+            object: nil
+        )
+        guard refreshedController.newConversationModelPopup.item(at: 0)?.isEnabled == true,
+              refreshedController.composerField.isEnabled,
+              interactionBridge.selectionForNewConversation() == selection else {
+            return false
+        }
+        let replacementSelection = MailboxNewConversationSelection(
+            connectorKind: .openAICompatible,
+            modelID: "replacement-model"
+        )
+        box.value = MailboxNewConversationModelOption(
+            selection: replacementSelection,
+            title: "OpenAI API · replacement-model",
+            isPreferred: true,
+            unavailableReason: nil
+        )
+        NotificationCenter.default.post(
+            name: .openAICompatibleConfigurationDidChange,
+            object: nil
+        )
+        return refreshedController.newConversationModelPopup.titleOfSelectedItem
+                == "OpenAI API · replacement-model"
+            && interactionBridge.selectionForNewConversation()
+                == replacementSelection
+    }
+
+    private static func validateNewConversationFailureForSmoke(
+        option: MailboxNewConversationModelOption
+    ) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-new-failure-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let store = try? MailboxStore(storageRoot: root) else { return false }
+        let interactionBridge = MailboxInteractionBridge()
+        let coordinator = MailboxAIReplyCoordinatorSmokeStub()
+        coordinator.nextNewConversationResult = .failure(
+            MailboxStoreError.capacityExceeded
+        )
+        interactionBridge.aiReplyCoordinator = coordinator
+        let controller = MailboxConversationViewController(
+            store: store,
+            interactionBridge: interactionBridge,
+            modelOptionsProvider: { [option] }
+        )
+        _ = controller.view
+        controller.applyNewConversation(persistence: .available)
+        controller.composerField.stringValue = "must remain after failure"
+        controller.controlTextDidChange(Notification(
+            name: NSControl.textDidChangeNotification,
+            object: controller.composerField
+        ))
+        controller.sendTapped()
+        guard waitForSmokeCondition({ !controller.hasPendingSubmission }),
+              !controller.composerStatusRow.isHidden,
+              controller.composerStatusLabel.stringValue
+                == MailboxStoreError.capacityExceeded.localizedDescription,
+              controller.composerField.stringValue == "must remain after failure",
+              interactionBridge.draftForNewConversation()
+                == "must remain after failure" else {
+            return false
+        }
+        controller.applyNewConversation(persistence: .available)
+        guard !controller.composerStatusRow.isHidden,
+              controller.composerStatusLabel.stringValue
+                == MailboxStoreError.capacityExceeded.localizedDescription else {
+            return false
+        }
+        controller.composerField.stringValue += " edited"
+        controller.controlTextDidChange(Notification(
+            name: NSControl.textDidChangeNotification,
+            object: controller.composerField
+        ))
+        return controller.composerStatusRow.isHidden
+    }
+
+    private static func validateDeferredSubmissionForSmoke(
+        option: MailboxNewConversationModelOption
+    ) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-new-deferred-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let store = try? MailboxStore(storageRoot: root) else { return false }
+        let interactionBridge = MailboxInteractionBridge()
+        let coordinator = MailboxAIReplyCoordinatorSmokeStub()
+        coordinator.defersNewConversationCompletion = true
+        interactionBridge.aiReplyCoordinator = coordinator
+        let controller = MailboxConversationViewController(
+            store: store,
+            interactionBridge: interactionBridge,
+            modelOptionsProvider: { [option] }
+        )
+        _ = controller.view
+        controller.applyNewConversation(persistence: .available)
+        controller.composerField.stringValue = "delayed first turn"
+        var started = false
+        controller.onNewConversationStarted = { _ in started = true }
+        controller.sendTapped()
+        guard controller.hasPendingSubmission,
+              !MailboxPaneStateRules.permitsConversationNavigation(
+                submissionInFlight: controller.hasPendingSubmission
+              ), !controller.newConversationModelPopup.isEnabled else {
+            return false
+        }
+        coordinator.completeDeferredNewConversation()
+        return waitForSmokeCondition({ started && !controller.hasPendingSubmission })
+            && MailboxPaneStateRules.permitsConversationNavigation(
+                submissionInFlight: controller.hasPendingSubmission
+            )
+    }
+
+    private static func waitForSmokeCondition(
+        _ condition: () -> Bool,
+        timeout: TimeInterval = 0.5
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: Date().addingTimeInterval(0.005)
+            )
+        }
+        return condition()
     }
 
     fileprivate static func validateStreamingPreviewForSmoke() -> Bool {
@@ -1485,6 +2518,10 @@ private final class MailboxConversationViewController: NSViewController {
     }
 
     @objc private func sendTapped() {
+        if isCreatingNewConversation {
+            sendNewConversation()
+            return
+        }
         guard let thread = currentThread else { return }
         let body = composerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else {
@@ -1496,7 +2533,7 @@ private final class MailboxConversationViewController: NSViewController {
         case .localNotesOnly:
             do {
                 _ = try store.addLocalNote(threadID: thread.id, body: body)
-                drafts.removeValue(forKey: thread.id)
+                interactionBridge.clearComposerDraft(threadID: thread.id)
                 composerField.stringValue = ""
             } catch {
                 showComposerError(error.localizedDescription)
@@ -1512,33 +2549,138 @@ private final class MailboxConversationViewController: NSViewController {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.isSendingReply = false
+                    let stillShowingSubmittedThread = !self.isCreatingNewConversation
+                        && self.currentThread?.id == thread.id
+                        && self.store.snapshot.selectedThreadID == thread.id
+                    var failureMessage: String?
                     switch result {
                     case .success:
-                        self.drafts.removeValue(forKey: thread.id)
-                        if self.currentThread?.id == thread.id {
+                        self.interactionBridge.clearComposerDraft(
+                            threadID: thread.id
+                        )
+                        if stillShowingSubmittedThread {
                             self.composerField.stringValue = ""
                         }
                     case let .failure(error):
-                        self.showComposerError(error.localizedDescription)
+                        failureMessage = error.localizedDescription
                     }
+                    guard stillShowingSubmittedThread else { return }
                     let snapshot = self.store.snapshot
                     self.apply(
-                        thread: snapshot.selectedThreadID.flatMap(snapshot.thread(id:)),
+                        thread: snapshot.thread(id: thread.id),
                         persistence: snapshot.persistence,
-                        preview: snapshot.selectedThreadID.flatMap(
-                            snapshot.generationPreview(threadID:)
-                        )
+                        preview: snapshot.generationPreview(threadID: thread.id)
                     )
+                    if let failureMessage {
+                        self.showComposerError(failureMessage)
+                    }
                 }
             }
         }
     }
 
+    private func sendNewConversation() {
+        let body = composerField.stringValue.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !body.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        guard let option = selectedNewConversationModelOption else {
+            showComposerError("请先选择一个已连接的模型。")
+            return
+        }
+        guard option.isAvailable else {
+            showComposerError(
+                option.unavailableReason ?? "当前模型尚不可用。"
+            )
+            return
+        }
+        guard let coordinator = interactionBridge.aiReplyCoordinator else {
+            showComposerError("AI 连接器尚未接入 Mailbox。")
+            return
+        }
+        newConversationSubmissionError = nil
+        hideComposerError()
+        isSendingReply = true
+        configureNewConversationState(persistence: store.snapshot.persistence)
+        let frozenSelection = option.selection
+        let sharedDraftState = interactionBridge
+        coordinator.startMailboxConversation(
+            selection: frozenSelection,
+            body: body
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case let .success(handle):
+                    // The Store already owns the first turn at this point.
+                    // Clear the process-local draft even if a Settings route
+                    // rebuild released this particular pane meanwhile.
+                    sharedDraftState.clearNewConversationDraft()
+                    guard let self else { return }
+                    self.isSendingReply = false
+                    self.newConversationSubmissionError = nil
+                    guard self.isCreatingNewConversation else { return }
+                    self.composerField.stringValue = ""
+                    self.onNewConversationStarted?(handle)
+                case let .failure(error):
+                    guard let self else { return }
+                    self.isSendingReply = false
+                    guard self.isCreatingNewConversation else { return }
+                    self.newConversationSubmissionError = error.localizedDescription
+                    self.configureNewConversationState(
+                        persistence: self.store.snapshot.persistence
+                    )
+                    self.showComposerError(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @objc private func newConversationModelChanged() {
+        guard isCreatingNewConversation else { return }
+        newConversationSubmissionError = nil
+        let selection = selectedNewConversationModelOption.flatMap {
+            $0.isAvailable ? $0.selection : nil
+        }
+        interactionBridge.setSelectionForNewConversation(selection)
+        updateNewConversationMetadata()
+        configureNewConversationState(persistence: store.snapshot.persistence)
+    }
+
+    @objc private func cancelNewConversationTapped() {
+        guard isCreatingNewConversation, !isSendingReply else { return }
+        interactionBridge.setDraftForNewConversation(composerField.stringValue)
+        onCancelNewConversation?()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let changedField = notification.object as? NSTextField,
+              changedField === composerField else { return }
+        if isCreatingNewConversation {
+            newConversationSubmissionError = nil
+            interactionBridge.setDraftForNewConversation(
+                composerField.stringValue
+            )
+            configureNewConversationState(
+                persistence: store.snapshot.persistence
+            )
+            return
+        }
+        guard let threadID = currentThread?.id else { return }
+        interactionBridge.setComposerDraft(
+            composerField.stringValue,
+            threadID: threadID
+        )
+    }
+
     @objc private func acceptInboundTapped() {
         guard let thread = currentThread,
-              let pending = interactionBridge.pendingInboundItem(threadID: thread.id),
-              InboundBus.shared.canAccept(pending.id),
-              InboundBus.shared.accept(pending.id) else {
+              let reviewRouter,
+              let review = reviewRouter.review(threadID: thread.id),
+              reviewRouter.canSendToBuffer(reviewID: review.id),
+              reviewRouter.sendToBuffer(reviewID: review.id) else {
             refreshReviewState()
             NSSound.beep()
             return
@@ -1548,11 +2690,12 @@ private final class MailboxConversationViewController: NSViewController {
 
     @objc private func rejectInboundTapped() {
         guard let thread = currentThread,
-              let pending = interactionBridge.pendingInboundItem(threadID: thread.id) else {
+              let reviewRouter,
+              let review = reviewRouter.review(threadID: thread.id) else {
             refreshReviewState()
             return
         }
-        guard InboundBus.shared.reject(pending.id) else {
+        guard reviewRouter.reject(reviewID: review.id) else {
             refreshReviewState()
             NSSound.beep()
             return
@@ -1570,6 +2713,70 @@ private final class MailboxConversationViewController: NSViewController {
     private func hideComposerError() {
         composerStatusLabel.stringValue = ""
         composerStatusRow.isHidden = true
+    }
+}
+
+private final class MailboxAIReplyCoordinatorSmokeStub: MailboxAIReplyCoordinating {
+    struct NewConversationRequest: Equatable {
+        let selection: MailboxNewConversationSelection
+        let body: String
+    }
+
+    struct Request: Equatable {
+        let threadID: UUID
+        let body: String
+    }
+
+    private(set) var requests: [Request] = []
+    private(set) var newConversationRequests: [NewConversationRequest] = []
+    var nextNewConversationResult: Result<MailboxGenerationHandle, Error>?
+    var defersNewConversationCompletion = false
+    private var deferredNewConversationCompletion: ((
+        Result<MailboxGenerationHandle, Error>
+    ) -> Void)?
+    private var deferredNewConversationResult: Result<
+        MailboxGenerationHandle,
+        Error
+    >?
+
+    func startMailboxConversation(
+        selection: MailboxNewConversationSelection,
+        body: String,
+        completion: @escaping (Result<MailboxGenerationHandle, Error>) -> Void
+    ) {
+        newConversationRequests.append(NewConversationRequest(
+            selection: selection,
+            body: body
+        ))
+        let result = nextNewConversationResult ?? .success(MailboxGenerationHandle(
+            threadID: UUID(),
+            generationID: UUID(),
+            sequence: 1
+        ))
+        nextNewConversationResult = nil
+        if defersNewConversationCompletion {
+            deferredNewConversationCompletion = completion
+            deferredNewConversationResult = result
+        } else {
+            completion(result)
+        }
+    }
+
+    func completeDeferredNewConversation() {
+        guard let completion = deferredNewConversationCompletion,
+              let result = deferredNewConversationResult else { return }
+        deferredNewConversationCompletion = nil
+        deferredNewConversationResult = nil
+        completion(result)
+    }
+
+    func sendMailboxReply(
+        threadID: UUID,
+        body: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        requests.append(Request(threadID: threadID, body: body))
+        completion(.success(()))
     }
 }
 
@@ -1891,6 +3098,60 @@ private enum MailboxPresentation {
 }
 
 enum MailboxPaneVisualSmoke {
+    static func renderNewConversationPreview(to path: String) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "rimebuffer-mailbox-preview-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let store = try MailboxStore(storageRoot: root)
+            let bridge = MailboxInteractionBridge()
+            let coordinator = MailboxAIReplyCoordinatorSmokeStub()
+            bridge.aiReplyCoordinator = coordinator
+            let option = MailboxNewConversationModelOption(
+                selection: MailboxNewConversationSelection(
+                    connectorKind: .openAICompatible,
+                    modelID: "gpt-example-local"
+                ),
+                title: "OpenAI API · gpt-example-local",
+                isPreferred: true,
+                unavailableReason: nil
+            )
+            let controller = MailboxPaneViewController(
+                store: store,
+                interactionBridge: bridge,
+                reviewRouter: nil,
+                modelOptionsProvider: { [option] }
+            )
+            let view = controller.view
+            view.appearance = RimeUI.appKitAppearance
+            view.frame = NSRect(x: 0, y: 0, width: 828, height: 520)
+            controller.beginNewConversation()
+            view.layoutSubtreeIfNeeded()
+            view.displayIfNeeded()
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(
+                in: view.bounds
+            ) else {
+                return false
+            }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let data = bitmap.representation(
+                using: .png,
+                properties: [:]
+            ) else {
+                return false
+            }
+            try data.write(
+                to: URL(fileURLWithPath: path),
+                options: .atomic
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
     static func validate() -> Bool {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let oldDate = Date(timeIntervalSince1970: 0)
@@ -1900,6 +3161,11 @@ enum MailboxPaneVisualSmoke {
             .validateComposerLayoutForSmoke()
         let streaming = MailboxConversationViewController
             .validateStreamingPreviewForSmoke()
+        let standalone = MailboxConversationViewController
+            .validateWithoutBufferReviewBridgeForSmoke()
+        let newConversation = MailboxConversationViewController
+            .validateNewConversationForSmoke()
+        let pointingHandControls = validatePointingHandControls()
         let compactThreads = validateCompactThreadRows(now: now)
         let progressProjection = validateProgressProjectionRules(now: now)
         let formatting = validateMessageFormatting()
@@ -1908,13 +3174,61 @@ enum MailboxPaneVisualSmoke {
         if !transcript { fputs("mailbox visual smoke: transcript layout\n", stderr) }
         if !composer { fputs("mailbox visual smoke: composer layout\n", stderr) }
         if !streaming { fputs("mailbox visual smoke: streaming preview\n", stderr) }
+        if !standalone { fputs("mailbox visual smoke: standalone without Buffer bridge\n", stderr) }
+        if !newConversation { fputs("mailbox visual smoke: new conversation\n", stderr) }
+        if !pointingHandControls {
+            fputs("mailbox visual smoke: pointing-hand controls\n", stderr)
+        }
         if !compactThreads { fputs("mailbox visual smoke: compact thread rows\n", stderr) }
         if !progressProjection { fputs("mailbox visual smoke: progress projection\n", stderr) }
         if !formatting { fputs("mailbox visual smoke: message formatting\n", stderr) }
         if !relativeDate { fputs("mailbox visual smoke: relative date\n", stderr) }
-        return transcript && composer && streaming && compactThreads
+        return transcript && composer && streaming && standalone
+            && newConversation && pointingHandControls && compactThreads
             && progressProjection
             && formatting && relativeDate
+    }
+
+    private static func validatePointingHandControls() -> Bool {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "rimebuffer-mailbox-pointer-smoke-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        guard let store = try? MailboxStore(storageRoot: storageRoot) else {
+            return false
+        }
+        let controller = MailboxPaneViewController(
+            store: store,
+            interactionBridge: MailboxInteractionBridge(),
+            reviewRouter: nil,
+            modelOptionsProvider: { [] }
+        )
+        let controls = descendants(in: controller.view)
+        let buttons = controls.compactMap { $0 as? NSButton }
+        let segmentedControls = controls.compactMap {
+            $0 as? NSSegmentedControl
+        }
+        let popUpButtons = controls.compactMap { $0 as? NSPopUpButton }
+        return !buttons.isEmpty
+            && !popUpButtons.isEmpty
+            && buttons.allSatisfy {
+                $0 is RimePointingHandButton
+                    || $0 is RimeFixedAccentPopUpButton
+            }
+            && segmentedControls.allSatisfy {
+                $0 is RimePointingHandSegmentedControl
+            }
+            && popUpButtons.allSatisfy {
+                $0 is RimeFixedAccentPopUpButton
+            }
+    }
+
+    private static func descendants(in root: NSView) -> [NSView] {
+        root.subviews.flatMap { child in
+            [child] + descendants(in: child)
+        }
     }
 
     private static func validateProgressProjectionRules(now: Date) -> Bool {
@@ -2018,8 +3332,13 @@ enum MailboxPaneVisualSmoke {
         selected.configure(thread: thread, selected: true)
         let standard = MailboxThreadCellView()
         standard.configure(thread: thread, selected: false)
+        let enabledCursor = selected.pointingHandCursorKindForSmoke
+        selected.isPointingHandEnabled = false
+        let disabledCursor = selected.pointingHandCursorKindForSmoke
         let expectedAccessibility = "#05，Codex，未读"
         return MailboxThreadListLayout.rowHeight == 40
+            && enabledCursor == .pointingHand
+            && disabledCursor == .arrow
             && selected.contentRowCountForSmoke == 1
             && standard.contentRowCountForSmoke == 1
             && selected.accessibilitySummaryForSmoke == expectedAccessibility

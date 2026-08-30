@@ -143,6 +143,8 @@ private final class FlyChordCardStackView: NSStackView {
 
 private final class FlyChordModeCardView: NSView {
     private let choice: RimeFixedAccentChoiceButton
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
 
     init(choice: RimeFixedAccentChoiceButton,
          title: String,
@@ -150,6 +152,7 @@ private final class FlyChordModeCardView: NSView {
          symbolName: String) {
         self.choice = choice
         super.init(frame: .zero)
+        choice.managesPointingHandCursor = false
         choice.showsTitle = false
         choice.removeFromSuperview()
 
@@ -200,6 +203,42 @@ private final class FlyChordModeCardView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
+    func choiceEnabledDidChange() {
+        RimePointingHandCursorRules.enabledDidChange(
+            for: self,
+            pointerInside: pointerInside,
+            enabled: choice.isEnabled
+        )
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: choice.isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: choice.isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard choice.isEnabled else { return }
         choice.performClick(self)
@@ -240,9 +279,14 @@ private final class FlyChordModeCardView: NSView {
 
 private final class FlyChordConfigurationPageView: NSView, NSTextFieldDelegate {
     private var modeButtons: [ChordExtensionMode: RimeFixedAccentChoiceButton] = [:]
+    private var modeCards: [ChordExtensionMode: FlyChordModeCardView] = [:]
     private let availabilityLabel = NSTextField(labelWithString: "")
     private let availabilityDetail = NSTextField(wrappingLabelWithString: "")
-    private let makeCurrentButton = NSButton(title: "设为当前输入方案", target: nil, action: nil)
+    private let makeCurrentButton = RimePointingHandButton(
+        title: "设为当前输入方案",
+        target: nil,
+        action: nil
+    )
     private let durationField = NSTextField(string: "")
     private let durationStepper = NSStepper()
     private var extensionObserver: NSObjectProtocol?
@@ -290,12 +334,14 @@ private final class FlyChordConfigurationPageView: NSView, NSTextFieldDelegate {
                 detail = "允许左右手相邻击跨批配对"
                 symbol = "arrow.left.arrow.right"
             }
-            return FlyChordModeCardView(
+            let card = FlyChordModeCardView(
                 choice: button,
                 title: mode.implementationName,
                 detail: detail,
                 symbolName: symbol
             )
+            modeCards[mode] = card
+            return card
         }
         let modeGrid = NSStackView(views: cards)
         modeGrid.orientation = .horizontal
@@ -355,7 +401,11 @@ private final class FlyChordConfigurationPageView: NSView, NSTextFieldDelegate {
         let unit = NSTextField(labelWithString: "秒")
         unit.font = .systemFont(ofSize: 10)
         unit.textColor = RimeUI.textMuted
-        let reset = NSButton(title: "恢复默认", target: self, action: #selector(resetDuration))
+        let reset = RimePointingHandButton(
+            title: "恢复默认",
+            target: self,
+            action: #selector(resetDuration)
+        )
         reset.controlSize = .small
         let durationRow = NSStackView(
             views: [durationField, durationStepper, unit, reset, flexibleSpacer()]
@@ -405,6 +455,7 @@ private final class FlyChordConfigurationPageView: NSView, NSTextFieldDelegate {
         for mode in ChordExtensionMode.allCases {
             modeButtons[mode]?.state = store.mode == mode ? .on : .off
             modeButtons[mode]?.isEnabled = store.isEnabled
+            modeCards[mode]?.choiceEnabledDidChange()
         }
         durationField.stringValue = String(format: "%.2f", store.duration)
         durationField.isEnabled = store.isEnabled
@@ -557,7 +608,11 @@ private final class FlyChordProgressPageView: NSView {
             )
             rows.addArrangedSubview(FlyChordPageStyle.card([name, detail]))
         }
-        let clear = NSButton(title: "清空学习进度…", target: self, action: #selector(clearProgress))
+        let clear = RimePointingHandButton(
+            title: "清空学习进度…",
+            target: self,
+            action: #selector(clearProgress)
+        )
         rows.addArrangedSubview(clear)
     }
 
@@ -588,8 +643,16 @@ private final class FlyChordPracticePageView: NSView {
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let progressLabel = NSTextField(labelWithString: "")
     private let captureView: FlyChordPracticeCaptureView
-    private let captureButton = NSButton(title: "开始练习", target: nil, action: nil)
-    private let nextButton = NSButton(title: "换一题", target: nil, action: nil)
+    private let captureButton = RimePointingHandButton(
+        title: "开始练习",
+        target: nil,
+        action: nil
+    )
+    private let nextButton = RimePointingHandButton(
+        title: "换一题",
+        target: nil,
+        action: nil
+    )
     private var exercises: [FlyChordExercise] = []
     private var exerciseIndex = 0
     private var streak = 0
@@ -787,9 +850,16 @@ private final class FlyChordPracticeCaptureView: NSView {
     private let alphabetOrder: [Character]
     private var keysDown: Set<Character> = []
     private var chordKeys: Set<Character> = []
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
     private(set) var isCapturing = false {
         didSet {
             needsDisplay = true
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isCapturing
+            )
             onActivationChanged?(isCapturing)
         }
     }
@@ -806,6 +876,34 @@ private final class FlyChordPracticeCaptureView: NSView {
     required init?(coder: NSCoder) { nil }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isCapturing
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isCapturing)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
 
     func activate() {
         isCapturing = true

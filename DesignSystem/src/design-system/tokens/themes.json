@@ -15,11 +15,26 @@
     "settingsWidth": 980,
     "settingsHeight": 680
   },
+  "themeFamilies": {
+    "classic": {
+      "title": "经典",
+      "description": "沿用 RIMES 既有视觉语言，可在墨竹、翡翠与静谧三种配色间切换。",
+      "colorways": ["night", "day", "quiet"]
+    },
+    "rasta": {
+      "title": "拉斯塔",
+      "description": "更强的层次、光泽与状态表达，以红、黄、绿三色共同构成界面节奏。",
+      "colorways": ["rasta"]
+    }
+  },
   "themes": {
     "night": {
       "title": "墨竹",
       "description": "深色表面与清晰层级，适合长时间输入。",
       "dark": true,
+      "brandRed": "#E34B3F",
+      "brandYellow": "#F2C94C",
+      "brandGreen": "#22C55E",
       "accent": "#22C55E",
       "accentForeground": "#000000",
       "accentText": "#22C55E",
@@ -59,6 +74,9 @@
       "title": "翡翠",
       "description": "浅色表面与柔和边界，保持固定产品绿。",
       "dark": false,
+      "brandRed": "#C73C32",
+      "brandYellow": "#B77900",
+      "brandGreen": "#16864A",
       "accent": "#22C55E",
       "accentForeground": "#000000",
       "accentText": "#0F6A3F",
@@ -98,6 +116,9 @@
       "title": "静谧",
       "description": "去色深色主题，降低视觉刺激。",
       "dark": true,
+      "brandRed": "#B5B5B5",
+      "brandYellow": "#C8C8C8",
+      "brandGreen": "#A3A3A3",
       "accent": "#A3A3A3",
       "accentForeground": "#000000",
       "accentText": "#A3A3A3",
@@ -132,6 +153,48 @@
       "dangerFill": "#A63A3A",
       "dangerForeground": "#FFFFFF",
       "dangerBorder": "#8E2E2E"
+    },
+    "rasta": {
+      "title": "拉斯塔",
+      "description": "红黄绿三色协同的精致深色主题，强调层级、操作与结果状态。",
+      "dark": true,
+      "brandRed": "#E95043",
+      "brandYellow": "#F2C94C",
+      "brandGreen": "#39C96B",
+      "accent": "#39C96B",
+      "accentForeground": "#07110A",
+      "accentText": "#6DDE8F",
+      "settingsBackground": "#1B1A15",
+      "settingsSeparator": "#45412F",
+      "buffer": "#11120E",
+      "bufferSecondary": "#202118",
+      "bufferBorder": "#746B3A",
+      "bufferDivider": "#4B4731",
+      "bufferSourceRail": "#211C12",
+      "bufferTargetRail": "#14251A",
+      "bufferChip": "#183923",
+      "bufferChipSelected": "#21532F",
+      "bufferPreedit": "#4C3A16",
+      "bufferMuted": "#B7AE91",
+      "clipboardSelected": "#2C3F24",
+      "surface": "#11110E",
+      "surfaceSecondary": "#1D1C16",
+      "surfaceTertiary": "#28261B",
+      "border": "#3B382A",
+      "borderStrong": "#81765A",
+      "textPrimary": "#FFF8E1",
+      "textSecondary": "#D8CFB5",
+      "textMuted": "#ADA58E",
+      "selection": "#287B42",
+      "selectionText": "#FFFFFF",
+      "candidate": "#11110E",
+      "warningText": "#F7D36A",
+      "warningSurface": "#352C16",
+      "warningBorder": "#9B7B24",
+      "dangerText": "#FF786E",
+      "dangerFill": "#9D332D",
+      "dangerForeground": "#FFFFFF",
+      "dangerBorder": "#C84B42"
     }
   }
 }

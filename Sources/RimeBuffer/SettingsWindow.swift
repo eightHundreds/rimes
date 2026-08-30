@@ -37,45 +37,38 @@ private enum SettingsPluginSwitchMode {
     case bufferEnablement
 }
 
+/// Keep the Settings-local names for the existing hierarchy while sharing the
+/// exact same cursor implementation with views embedded by other modules.
+private typealias SettingsPointingButton = RimePointingHandButton
+private typealias SettingsPointingSegmentedControl =
+    RimePointingHandSegmentedControl
+
 private final class SettingsPluginSwitch: RimeFixedAccentSwitch {
     var pluginKey = PluginKey(domain: .builtIn, rawID: "")
     var mode: SettingsPluginSwitchMode = .enablement
 }
 
-private final class SettingsPluginConfigurationButton: NSButton {
+private final class SettingsPluginConfigurationButton: SettingsPointingButton {
     var pluginKey = PluginKey(domain: .builtIn, rawID: "")
 }
 
-private final class SettingsPluginDownloadButton: NSButton {
+private final class SettingsPluginDownloadButton: SettingsPointingButton {
     var pluginKey = PluginKey(domain: .builtIn, rawID: "")
 }
 
-private final class SettingsLexiconButton: NSButton {
+private final class SettingsLexiconButton: SettingsPointingButton {
     var lexiconKind: UserLexiconKind = .chinese
 }
 
-private final class SettingsRouteButton: NSButton {
+private final class SettingsRouteButton: SettingsPointingButton {
     var routeID = SettingsCoreRoute.inputMethod.id
     var isRouteSelected = false {
         didSet { updateVisualState() }
     }
-    private var trackingAreaRef: NSTrackingArea?
     private var pointerInside = false
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
-        let next = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(next)
-        trackingAreaRef = next
-    }
-
     override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
         pointerInside = true
         updateVisualState()
     }
@@ -83,6 +76,7 @@ private final class SettingsRouteButton: NSButton {
     override func mouseExited(with event: NSEvent) {
         pointerInside = false
         updateVisualState()
+        super.mouseExited(with: event)
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -265,6 +259,7 @@ private final class SettingsChoiceCardView: NSView {
         self.choice = choice
         super.init(frame: .zero)
         choice.showsTitle = false
+        choice.managesPointingHandCursor = false
         choice.removeFromSuperview()
 
         let icon = NSImageView()
@@ -309,7 +304,7 @@ private final class SettingsChoiceCardView: NSView {
             row.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         choice.onVisualStateChange = { [weak self] in
-            self?.needsDisplay = true
+            self?.choiceVisualStateDidChange()
         }
         setAccessibilityElement(false)
     }
@@ -331,12 +326,22 @@ private final class SettingsChoiceCardView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: choice.isEnabled)
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
         needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: choice.isEnabled
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -372,6 +377,10 @@ private final class SettingsChoiceCardView: NSView {
         needsDisplay = true
     }
 
+    var pointingHandCursorKindForSmoke: RimePointingHandCursorKind {
+        RimePointingHandCursorRules.kind(enabled: choice.isEnabled)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let path = NSBezierPath(
@@ -399,9 +408,17 @@ private final class SettingsChoiceCardView: NSView {
         }
         path.stroke()
     }
+
+    private func choiceVisualStateDidChange() {
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+        if pointerInside {
+            RimePointingHandCursorRules.mouseEntered(enabled: choice.isEnabled)
+        }
+    }
 }
 
-private final class SettingsThemeCardButton: NSButton {
+private final class SettingsThemeCardButton: SettingsPointingButton {
     let mode: RimeAppearanceMode
 
     init(mode: RimeAppearanceMode, selected: Bool, target: AnyObject, action: Selector) {
@@ -418,12 +435,7 @@ private final class SettingsThemeCardButton: NSButton {
         heightAnchor.constraint(equalToConstant: 64).isActive = true
 
         let palette = mode.palette
-        let detailText: String
-        switch mode {
-        case .night: detailText = "深色表面与清晰层级，适合长时间输入。"
-        case .day: detailText = "浅色表面与柔和边界，保持固定产品绿。"
-        case .quiet: detailText = "去色深色主题，降低视觉刺激。"
-        }
+        let detailText = mode.detailText
         let icon = SettingsIconTileView(
             symbolName: "paintpalette",
             accessibilityDescription: mode.title,
@@ -510,6 +522,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private var navButtons: [SettingsRouteID: NSButton] = [:]
     private var activePluginSettingsController: NSViewController?
     private var activeMailboxController: MailboxPaneViewController?
+    private var activeCapsuleController: CapsulePaneViewController?
     private var statsObserver: NSObjectProtocol?
     private var pluginObserver: NSObjectProtocol?
     private var registryObserver: NSObjectProtocol?
@@ -527,26 +540,46 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private let clipboardHistoryCheck = RimeFixedAccentSwitch(frame: .zero)
     private let closeAfterLastDeliveryCheck = RimeFixedAccentSwitch(frame: .zero)
     private let bufferPinnedCheck = RimeFixedAccentSwitch(frame: .zero)
-    private let moveBufferWindowButton = NSButton(title: "移到当前屏幕", target: nil, action: nil)
+    private let moveBufferWindowButton = SettingsPointingButton(
+        title: "移到当前屏幕",
+        target: nil,
+        action: nil
+    )
     private let resetOnAppSwitchCheck = RimeFixedAccentSwitch(frame: .zero)
     private let gatewayEnableCheck = RimeFixedAccentSwitch(frame: .zero)
     private let gatewayConfigField = NSTextField(string: "")
-    private let gatewayCopyConfigButton = NSButton(title: "复制配置", target: nil, action: nil)
-    private let gatewayClaudeDisclosureButton = NSButton(
+    private let gatewayCopyConfigButton = SettingsPointingButton(
+        title: "复制配置",
+        target: nil,
+        action: nil
+    )
+    private let gatewayClaudeDisclosureButton = SettingsPointingButton(
         title: "Claude Code 一键注册（可选）",
         target: nil,
         action: nil
     )
     private let gatewayCommandField = NSTextField(string: "")
-    private let gatewayCopyButton = NSButton(title: "复制 Claude Code 命令", target: nil, action: nil)
+    private let gatewayCopyButton = SettingsPointingButton(
+        title: "复制 Claude Code 命令",
+        target: nil,
+        action: nil
+    )
     private var gatewayClaudeDisclosureOpen = false
     private let aiBaseURLField = NSTextField(string: "")
     private let aiModelField = NSTextField(string: "")
     private let aiAPIKeyField = NSSecureTextField(string: "")
     private let aiConfigurationStatus = NSTextField(labelWithString: "")
     private var aiConnectorRadios: [AITextProviderKind: RimeFixedAccentChoiceButton] = [:]
-    private let codexLoginButton = NSButton(title: "登录 Codex", target: nil, action: nil)
-    private let codexCopyLoginLinkButton = NSButton(title: "复制登录链接", target: nil, action: nil)
+    private let codexLoginButton = SettingsPointingButton(
+        title: "登录 Codex",
+        target: nil,
+        action: nil
+    )
+    private let codexCopyLoginLinkButton = SettingsPointingButton(
+        title: "复制登录链接",
+        target: nil,
+        action: nil
+    )
     private let codexLoginSpinner = NSProgressIndicator()
     private let codexLoginStatusLabel = NSTextField(wrappingLabelWithString: "")
     private var codexLoginOperation: AITextCodexLoginOperation?
@@ -555,7 +588,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private var codexAuthorizationURL: URL?
     private var codexLoginFeedback: String?
     private var codexLoginFeedbackIsError = false
-    private let claudeLoginButton = NSButton(title: "登录 Claude", target: nil, action: nil)
+    private let claudeLoginButton = SettingsPointingButton(
+        title: "登录 Claude",
+        target: nil,
+        action: nil
+    )
     private let claudeLoginSpinner = NSProgressIndicator()
     private let claudeLoginStatusLabel = NSTextField(wrappingLabelWithString: "")
     private var claudeLoginOperation: AITextClaudeLoginOperation?
@@ -617,6 +654,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             NSApp.finishLaunching()
         }
         if window == nil { build() }
+        if window?.isVisible == true {
+            NSApp.activate(ignoringOtherApps: true)
+            window?.makeKeyAndOrderFront(nil)
+            return
+        }
         rebuildRouteCatalog()
         reload()
         showCurrentRoute()
@@ -625,6 +667,28 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         window?.makeKeyAndOrderFront(nil)
         window?.contentView?.layoutSubtreeIfNeeded()
         window?.contentView?.display()
+    }
+
+    func showBufferSettings() {
+        show()
+        _ = navigation.selectRoute(SettingsCoreRoute.buffer.id,
+                                   catalog: routeCatalog)
+        _ = navigation.selectSubpage(
+            SettingsSubpageID(rawValue: "buffer"),
+            catalog: routeCatalog
+        )
+        showCurrentRoute()
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func showPluginConfiguration(pluginKey: PluginKey) {
+        show()
+        _ = navigation.selectRoute(SettingsCoreRoute.plugins.id,
+                                   catalog: routeCatalog)
+        _ = navigation.selectSubpage(PluginManagementSubpage.bufferPlugins.id,
+                                     catalog: routeCatalog)
+        showCurrentRoute()
+        presentPluginConfiguration(pluginKey: pluginKey)
     }
 
     /// Dev-only: render one settings page to a PNG by drawing the window's own
@@ -726,6 +790,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         window.setContentSize(Self.previewContentSize)
 
+        var pointerPolicyOK = RimePointingHandCursorRules.kind(enabled: true)
+                == .pointingHand
+            && RimePointingHandCursorRules.kind(enabled: false) == .arrow
+            && navButtons.values.allSatisfy { $0 is SettingsPointingButton }
+
         func descendants<T: NSView>(of type: T.Type, in root: NSView) -> [T] {
             root.subviews.flatMap { child -> [T] in
                 let own = (child as? T).map { [$0] } ?? []
@@ -764,6 +833,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         )
         window.contentView?.layoutSubtreeIfNeeded()
         let themeCards = descendants(of: SettingsThemeCardButton.self, in: contentHost)
+        pointerPolicyOK = pointerPolicyOK
+            && descendants(of: NSButton.self, in: contentHost).allSatisfy {
+                $0 is SettingsPointingButton
+            }
+            && descendants(of: NSSegmentedControl.self, in: contentHost)
+                .allSatisfy { $0 is SettingsPointingSegmentedControl }
         var themeOK = exactCenterHits(
             themeCards,
             expectedCount: RimeAppearanceMode.allCases.count,
@@ -799,6 +874,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         )
         window.contentView?.layoutSubtreeIfNeeded()
         let encodingCards = descendants(of: SettingsChoiceCardView.self, in: contentHost)
+        pointerPolicyOK = pointerPolicyOK
+            && !encodingCards.isEmpty
+            && descendants(of: NSButton.self, in: contentHost).allSatisfy {
+                $0 is SettingsPointingButton
+            }
+            && descendants(of: NSSegmentedControl.self, in: contentHost)
+                .allSatisfy { $0 is SettingsPointingSegmentedControl }
         var encodingOK = exactCenterHits(
             encodingCards,
             expectedCount: InputEncoding.allCases.count,
@@ -856,6 +938,28 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             && Set(actionProbe.choiceTags) == Set(InputEncoding.allCases.indices)
 
         taggedCards.sort { $0.tag < $1.tag }
+        var cursorOwnershipOK = taggedCards.allSatisfy {
+            !$0.choice.managesPointingHandCursor
+                && $0.card.pointingHandCursorKindForSmoke == .pointingHand
+        }
+        if let probe = taggedCards.first {
+            probe.card.setPointerInsideForSmoke(true)
+            probe.card.needsDisplay = false
+            probe.choice.isEnabled = false
+            cursorOwnershipOK = cursorOwnershipOK
+                && probe.card.pointingHandCursorKindForSmoke == .arrow
+                && probe.card.needsDisplay
+            probe.card.needsDisplay = false
+            probe.choice.isEnabled = true
+            cursorOwnershipOK = cursorOwnershipOK
+                && probe.card.pointingHandCursorKindForSmoke == .pointingHand
+                && probe.card.needsDisplay
+            probe.card.setPointerInsideForSmoke(false)
+        }
+        if !cursorOwnershipOK {
+            print("settings card cursor smoke: child/parent ownership or disabled state drifted")
+        }
+
         var visualStateOK = taggedCards.count >= 3
         if visualStateOK {
             taggedCards.forEach { $0.choice.state = .off }
@@ -902,6 +1006,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         window.contentView?.layoutSubtreeIfNeeded()
         let lexiconButtons = descendants(of: SettingsLexiconButton.self,
                                          in: contentHost)
+        pointerPolicyOK = pointerPolicyOK
+            && descendants(of: NSButton.self, in: contentHost).allSatisfy {
+                $0 is SettingsPointingButton
+            }
+            && descendants(of: NSSegmentedControl.self, in: contentHost)
+                .allSatisfy { $0 is SettingsPointingSegmentedControl }
         let lexiconLabels = Set(
             descendants(of: NSTextField.self, in: contentHost).map(\.stringValue)
         )
@@ -919,11 +1029,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         if !lexiconOK {
             print("settings lexicon card smoke: missing or misrouted dictionary actions")
         }
+        if !pointerPolicyOK {
+            print("settings pointing-hand smoke: missing enabled-aware cursor owner")
+        }
 
-        if themeOK && encodingOK && visualStateOK && lexiconOK {
+        if themeOK && encodingOK && cursorOwnershipOK && visualStateOK && lexiconOK
+            && pointerPolicyOK {
             print("settings card hit-test smoke: OK")
         }
-        return themeOK && encodingOK && visualStateOK && lexiconOK
+        return themeOK && encodingOK && cursorOwnershipOK && visualStateOK && lexiconOK
+            && pointerPolicyOK
     }
 
     @discardableResult
@@ -1324,8 +1439,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         window.contentView?.needsDisplay = true
         refreshSidebarSelection()
         guard rebuildVisibleRoute, window.isVisible else { return }
+        if activeCapsuleController?.hasUnsavedChanges == true {
+            activeCapsuleController?.applyAppearance()
+            return
+        }
         reload()
         showCurrentRoute()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        activeCapsuleController?.confirmDiscardChangesIfNeeded() ?? true
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -1355,6 +1478,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         contentHost.subviews.forEach { $0.removeFromSuperview() }
         activePluginSettingsController = nil
         activeMailboxController = nil
+        activeCapsuleController?.discardEditorForClose()
+        activeCapsuleController = nil
         candidatePreview = nil
     }
 
@@ -1416,7 +1541,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         bufferWindowVisibleCheck.setAccessibilityLabel("显示独立缓冲工作台")
         clipboardHistoryCheck.target = self
         clipboardHistoryCheck.action = #selector(clipboardHistoryToggled)
-        clipboardHistoryCheck.setAccessibilityLabel("启用剪贴板历史")
+        clipboardHistoryCheck.setAccessibilityLabel("允许独立 Clipboard History 收录剪贴板内容")
         closeAfterLastDeliveryCheck.target = self
         closeAfterLastDeliveryCheck.action = #selector(closeAfterLastDeliveryToggled)
         closeAfterLastDeliveryCheck.setAccessibilityLabel("最后一块上屏后关闭工作台")
@@ -1482,7 +1607,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         appearancePopUp.removeAllItems()
         for mode in RimeAppearanceMode.allCases {
-            appearancePopUp.addItem(withTitle: mode.title)
+            appearancePopUp.addItem(withTitle: mode.selectionTitle)
             appearancePopUp.lastItem?.representedObject = mode.rawValue
         }
         appearancePopUp.target = self
@@ -1689,9 +1814,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
     private func showCurrentRoute() {
         guard let route = selectedRoute else { return }
+        if activeCapsuleController?.hasUnsavedChanges == true,
+           route.id == SettingsCoreRoute.capsule.id {
+            activeCapsuleController?.applyAppearance()
+            refreshSidebarSelection()
+            return
+        }
         refreshSidebarSelection()
         activePluginSettingsController = nil
         activeMailboxController = nil
+        activeCapsuleController?.discardEditorForClose()
+        activeCapsuleController = nil
         contentHost.subviews.forEach { $0.removeFromSuperview() }
 
         let subpageID = navigation.selectedSubpage()?.rawValue
@@ -1740,6 +1873,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         case .inputMethod: return inputPage(subpageID: subpageID ?? "encoding")
         case .appearance: return appearancePage(subpageID: subpageID ?? "theme")
         case .buffer: return bufferPage(subpageID: subpageID ?? "buffer")
+        case .clipboard: return clipSettingsPage()
+        case .mailbox: return mailboxPage()
+        case .capsule: return capsulePage()
         case .connectors: return connectionsPage(subpageID: subpageID ?? "ai-model")
         case .plugins: return pluginsPage(subpageID: subpageID ?? "all")
         case .maintenance: return maintenancePage(subpageID: subpageID ?? "update-restart")
@@ -1747,7 +1883,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func pageShell(route: SettingsRouteDescriptor, body: NSView) -> NSView {
-        let tabs = NSSegmentedControl(
+        let tabs = SettingsPointingSegmentedControl(
             labels: route.subpages.map(\.title),
             trackingMode: .selectOne,
             target: self,
@@ -1819,7 +1955,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         let bodyHost: NSView
         if body is NSScrollView
-            || body.identifier?.rawValue == "settings.mailbox-pane" {
+            || body.identifier?.rawValue == "settings.mailbox-pane"
+            || body.identifier?.rawValue == "settings.capsule-pane" {
             // Page-owned controllers may preserve their own scroll positions;
             // do not nest them in another scroll view with zero intrinsic height.
             bodyHost = body
@@ -1902,7 +2039,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             case .appearance:
                 return "主题同时作用于候选框、缓冲工作台与设置页预览。"
             case .buffer:
-                return "管理 Buffer、Clip 与跨重启保存在本机的 Mailbox。"
+                return "管理缓冲输入工作台。"
+            case .clipboard:
+                return "管理独立、仅在本机持久保存的 Clipboard History。"
+            case .mailbox:
+                return "独立管理本地保存的 AI 会话与待审核外部推送。"
+            case .capsule:
+                return "独立管理本机 Prompt、Memory、Password 与 Skill。"
             case .connectors:
                 return "管理 AI 模型与本地网关。"
             case .plugins:
@@ -1961,7 +2104,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func inputPage(subpageID: String) -> NSView {
-        let openDirBtn = NSButton(title: "打开配置目录", target: self, action: #selector(openDir))
+        let openDirBtn = SettingsPointingButton(
+            title: "打开配置目录",
+            target: self,
+            action: #selector(openDir)
+        )
         let note = NSTextField(wrappingLabelWithString:
             "配置目录是 ~/Library/RimeBuffer。未显示的方案文件仅作为词典或反查依赖保留，不会出现在 F4。")
         note.font = .systemFont(ofSize: 11)
@@ -2300,10 +2447,15 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             appearancePopUp.removeFromSuperview()
             return contentColumn([
                 title("主题"),
-                caption("主题固定使用产品色，不再跟随 macOS 外观与系统强调色。"),
+                caption("经典主题提供三种配色；拉斯塔主题同时使用红、黄、绿建立层级。"),
+                spacer(8),
+                sectionLabel("经典 · 配色"),
                 themePreviewCard(.night),
                 themePreviewCard(.day),
                 themePreviewCard(.quiet),
+                spacer(16),
+                sectionLabel("拉斯塔 · 主题"),
+                themePreviewCard(.rasta),
             ])
         }
         let preview = CandidatePreviewView(maxWidth: 620)
@@ -2325,20 +2477,30 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func bufferPage(subpageID: String) -> NSView {
-        switch subpageID {
-        case "clip":
-            return clipSettingsPage()
-        case "mailbox":
-            let controller = MailboxPaneViewController()
-            activeMailboxController = controller
-            let pane = controller.view
-            pane.identifier = NSUserInterfaceItemIdentifier(
-                "settings.mailbox-pane"
-            )
-            return pane
-        default:
-            return bufferSettingsPage()
-        }
+        _ = subpageID
+        return bufferSettingsPage()
+    }
+
+    private func mailboxPage() -> NSView {
+        let controller = MailboxPaneViewController(
+            reviewRouter: MailboxBufferReviewAdapter.shared
+        )
+        activeMailboxController = controller
+        let pane = controller.view
+        pane.identifier = NSUserInterfaceItemIdentifier(
+            "settings.mailbox-pane"
+        )
+        return pane
+    }
+
+    private func capsulePage() -> NSView {
+        let controller = CapsulePaneViewController()
+        activeCapsuleController = controller
+        let pane = controller.view
+        pane.identifier = NSUserInterfaceItemIdentifier(
+            "settings.capsule-pane"
+        )
+        return pane
     }
 
     private func bufferSettingsPage() -> NSView {
@@ -2400,16 +2562,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
     private func clipSettingsPage() -> NSView {
         contentColumn([
-            title("Clip"),
-            caption("剪贴板历史只在工作台显示时读取，并且只保留在当前输入法进程。"),
+            title("Clipboard History"),
+            caption("在本机私有数据库中保存文本、链接、图片、文件与颜色；窗口关闭后历史仍会保留。"),
             settingsRow(
-                title: "启用剪贴板历史",
-                detail: "通过工作台或快捷键临时查看最近复制的文本。",
+                title: "允许收录剪贴板内容",
+                detail: "RIMES 运行时后台收录；安全输入、锁屏和休眠期间不会读取。",
                 symbolName: "clipboard",
                 control: clipboardHistoryCheck
             ),
             secondaryLabel(
-                "Mailbox 会话使用独立的本地持久化；关闭 Clip 或重启输入法不会把剪贴板历史写入 Mailbox。"
+                "⌘⇧P 呼出独立窗口。历史与 Buffer、Mailbox、Capsule 隔离，保存在 ~/Library/Application Support/RIMES/clipboard。"
             ),
         ])
     }
@@ -2602,12 +2764,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             aiModelField.removeFromSuperview()
             aiAPIKeyField.removeFromSuperview()
             aiConfigurationStatus.removeFromSuperview()
-            let save = NSButton(title: "保存配置",
-                                target: self,
-                                action: #selector(saveAIModelConfiguration))
-            let clearKey = NSButton(title: "清除密钥",
-                                    target: self,
-                                    action: #selector(clearAIModelAPIKey))
+            let save = SettingsPointingButton(
+                title: "保存配置",
+                target: self,
+                action: #selector(saveAIModelConfiguration)
+            )
+            let clearKey = SettingsPointingButton(
+                title: "清除密钥",
+                target: self,
+                action: #selector(clearAIModelAPIKey)
+            )
             let actions = NSStackView(views: [save, clearKey, flexSpacer()])
             actions.orientation = .horizontal
             actions.alignment = .centerY
@@ -2778,15 +2944,21 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func pluginsPage(subpageID: String) -> NSView {
-        let installButton = NSButton(title: "安装…",
-                                     target: self,
-                                     action: #selector(showPluginInstallDialog))
-        let uninstallButton = NSButton(title: "卸载…",
-                                       target: self,
-                                       action: #selector(showPluginUninstallDialog))
-        let manageButton = NSButton(title: "管理…",
-                                    target: self,
-                                    action: #selector(showPluginManagementDialog))
+        let installButton = SettingsPointingButton(
+            title: "安装…",
+            target: self,
+            action: #selector(showPluginInstallDialog)
+        )
+        let uninstallButton = SettingsPointingButton(
+            title: "卸载…",
+            target: self,
+            action: #selector(showPluginUninstallDialog)
+        )
+        let manageButton = SettingsPointingButton(
+            title: "管理…",
+            target: self,
+            action: #selector(showPluginManagementDialog)
+        )
         for button in [installButton, uninstallButton, manageButton] {
             button.controlSize = .small
         }
@@ -3015,15 +3187,35 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func maintenancePage(subpageID: String) -> NSView {
-        let checkUpdateBtn = NSButton(title: "检查更新…", target: self, action: #selector(checkUpdate))
-        let openLogBtn = NSButton(title: "打开运行日志", target: self, action: #selector(openRuntimeLog))
-        let restartBtn = NSButton(title: "重启输入法进程", target: self, action: #selector(restartInputMethod))
+        let checkUpdateBtn = SettingsPointingButton(
+            title: "检查更新…",
+            target: self,
+            action: #selector(checkUpdate)
+        )
+        let openLogBtn = SettingsPointingButton(
+            title: "打开运行日志",
+            target: self,
+            action: #selector(openRuntimeLog)
+        )
+        let restartBtn = SettingsPointingButton(
+            title: "重启输入法进程",
+            target: self,
+            action: #selector(restartInputMethod)
+        )
         let runtimeButtons = NSStackView(views: [checkUpdateBtn, openLogBtn, restartBtn])
         runtimeButtons.orientation = .horizontal
         runtimeButtons.spacing = 8
 
-        let reinstallBtn = NSButton(title: "重新安装输入法", target: self, action: #selector(reinstallInputMethod))
-        let openInstallLogBtn = NSButton(title: "打开安装日志", target: self, action: #selector(openInstallLog))
+        let reinstallBtn = SettingsPointingButton(
+            title: "重新安装输入法",
+            target: self,
+            action: #selector(reinstallInputMethod)
+        )
+        let openInstallLogBtn = SettingsPointingButton(
+            title: "打开安装日志",
+            target: self,
+            action: #selector(openInstallLog)
+        )
         let installButtons = NSStackView(views: [reinstallBtn, openInstallLogBtn])
         installButtons.orientation = .horizontal
         installButtons.spacing = 8
@@ -3033,11 +3225,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         installNote.textColor = RimeUI.textMuted
 
         if subpageID == "logs-data" {
-            let openConfigBtn = NSButton(title: "打开 \(ProductIdentity.displayName) 数据目录",
-                                         target: self,
-                                         action: #selector(openDir))
+            let openConfigBtn = SettingsPointingButton(
+                title: "打开 \(ProductIdentity.displayName) 数据目录",
+                target: self,
+                action: #selector(openDir)
+            )
             let dataNote = NSTextField(wrappingLabelWithString:
-                "配置、词库学习、插件、统计和练习进度都只保存在 ~/Library/RimeBuffer。缓冲区正文、发送历史和剪贴板历史都不会持久化。")
+                "配置、词库学习、插件、统计和练习进度保存在 ~/Library/RimeBuffer；Clipboard History 单独保存在 ~/Library/Application Support/RIMES/clipboard。缓冲区正文与发送历史不会持久化。")
             dataNote.font = .systemFont(ofSize: 11)
             dataNote.textColor = RimeUI.textMuted
             let logButtons = NSStackView(views: [openLogBtn, openInstallLogBtn])
@@ -3126,11 +3320,19 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
     private func candidateMetricsView() -> NSView {
         let rows = CandidateWindowMetric.allCases.map(candidateMetricRow)
-        let applyBtn = NSButton(title: "应用修改", target: self, action: #selector(applyCandidateMetrics))
+        let applyBtn = SettingsPointingButton(
+            title: "应用修改",
+            target: self,
+            action: #selector(applyCandidateMetrics)
+        )
         applyBtn.bezelStyle = .rounded
         applyBtn.bezelColor = RimeUI.accentGreen
 
-        let resetBtn = NSButton(title: "恢复默认", target: self, action: #selector(resetCandidateMetrics))
+        let resetBtn = SettingsPointingButton(
+            title: "恢复默认",
+            target: self,
+            action: #selector(resetCandidateMetrics)
+        )
         resetBtn.bezelStyle = .rounded
         let actions = NSStackView(views: [applyBtn, resetBtn])
         actions.orientation = .horizontal
@@ -3159,7 +3361,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         unit.font = .systemFont(ofSize: 11)
         unit.textColor = RimeUI.textMuted
 
-        let reset = NSButton(
+        let reset = SettingsPointingButton(
             title: "恢复默认",
             target: self,
             action: #selector(resetBufferWidth)
@@ -3230,7 +3432,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             return row
         }
 
-        let reset = NSButton(
+        let reset = SettingsPointingButton(
             title: "恢复全部默认快捷键",
             target: self,
             action: #selector(resetAllShortcuts)
@@ -3286,7 +3488,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         refreshInputConfigurationSelection()
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
         bufferWindowVisibleCheck.state = BufferWindowController.shared.isVisible ? .on : .off
-        clipboardHistoryCheck.state = BufferWindowController.shared.clipboardRailEnabled
+        clipboardHistoryCheck.state = ClipboardHistoryWindowController.shared.captureEnabled
             ? .on
             : .off
         closeAfterLastDeliveryCheck.state = BufferWindowController.shared
@@ -3609,6 +3811,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     // MARK: Actions
 
     @objc private func routeChosen(_ sender: SettingsRouteButton) {
+        if sender.routeID == navigation.currentRouteID {
+            refreshSidebarSelection()
+            return
+        }
+        guard activeCapsuleController?.confirmDiscardChangesIfNeeded() != false else {
+            refreshSidebarSelection()
+            return
+        }
         guard navigation.selectRoute(sender.routeID, catalog: routeCatalog) else { return }
         if let route = routeCatalog.route(for: sender.routeID) {
             settingsStatusLabel.stringValue = "已打开\(route.title)"
@@ -3622,6 +3832,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         guard let route = selectedRoute,
               route.subpages.indices.contains(sender.selectedSegment) else { return }
         let subpage = route.subpages[sender.selectedSegment].id
+        if subpage == navigation.selectedSubpage() { return }
+        guard activeCapsuleController?.confirmDiscardChangesIfNeeded() != false else {
+            if let selected = navigation.selectedSubpage(),
+               let index = route.subpages.firstIndex(where: { $0.id == selected }) {
+                sender.selectedSegment = index
+            }
+            return
+        }
         guard navigation.selectSubpage(subpage, catalog: routeCatalog) else { return }
         settingsStatusLabel.stringValue = "已打开\(route.subpages[sender.selectedSegment].title)"
         settingsStatusLabel.textColor = RimeUI.textMuted
@@ -3988,15 +4206,19 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     @objc private func configureBufferPlugin(
         _ sender: SettingsPluginConfigurationButton
     ) {
+        presentPluginConfiguration(pluginKey: sender.pluginKey)
+    }
+
+    private func presentPluginConfiguration(pluginKey: PluginKey) {
         guard let parentWindow = window,
               pluginConfigurationSheet == nil else { return }
         let plugin = PluginRegistry.shared.allPlugins().first {
-            $0.descriptor.key == sender.pluginKey
+            $0.descriptor.key == pluginKey
         }
         do {
             guard let controller = try PluginRegistry.shared
                 .makePluginConfigurationViewController(
-                    pluginKey: sender.pluginKey
+                    pluginKey: pluginKey
                 ) else {
                 setPluginStatus("这个插件当前没有可配置项", isError: true)
                 return
@@ -4336,7 +4558,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     @objc private func clipboardHistoryToggled() {
-        BufferWindowController.shared.clipboardRailEnabled =
+        ClipboardHistoryWindowController.shared.captureEnabled =
             clipboardHistoryCheck.state == .on
         reload()
     }

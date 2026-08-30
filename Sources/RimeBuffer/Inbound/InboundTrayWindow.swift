@@ -11,8 +11,8 @@ enum MailboxWindowVisibilityRules {
     }
 }
 
-/// Standalone, key-capable Mailbox window. The historical type name remains a
-/// source-compatible alias below while menu/hot-key integration migrates.
+/// Standalone, key-capable Mailbox window. Its lifecycle is independent from
+/// Buffer capture and the workbench window.
 final class MailboxWindowController: NSObject, NSWindowDelegate {
     static let shared = MailboxWindowController()
 
@@ -96,7 +96,9 @@ final class MailboxWindowController: NSObject, NSWindowDelegate {
         win.animationBehavior = .documentWindow
         win.delegate = self
 
-        let paneController = MailboxPaneViewController()
+        let paneController = MailboxPaneViewController(
+            reviewRouter: MailboxBufferReviewAdapter.shared
+        )
         let contentController = MailboxStandaloneViewController(
             paneController: paneController
         )
@@ -132,10 +134,6 @@ func runMailboxWindowSmokeTest() -> Bool {
     print("mailbox-window-smoke: ok")
     return true
 }
-
-/// Compatibility for existing selectors and launch wiring. New call sites may
-/// use MailboxWindowController directly.
-typealias InboundTrayWindow = MailboxWindowController
 
 private final class MailboxStandaloneViewController: NSViewController {
     let paneController: MailboxPaneViewController

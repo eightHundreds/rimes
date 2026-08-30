@@ -1,6 +1,6 @@
 # Capsule
 
-Capsule 是 RIMES 的本机内容库。当前支持 `Prompt`、`Memory`、`Password` 与 `Skill` 四类 Markdown 条目；可以在 Buffer 中搜索，普通条目走标准上屏，密码走独立的并击授权通道。
+Capsule 是与 Buffer、Mailbox 同级的 RIMES 本机内容库。当前支持 `Prompt`、`Memory`、`Password` 与 `Skill` 四类条目，并在独立 Capsule 窗口中提供搜索和增删改查。Capsule 不属于 Buffer 插件目录，也不受 Buffer 插件启停或工作台生命周期控制。
 
 ## 本机数据
 
@@ -22,18 +22,14 @@ Capsule 是 RIMES 的本机内容库。当前支持 `Prompt`、`Memory`、`Passw
 - Capsule 根目录和子目录权限为 `0700`，主密钥、seed marker 与 Markdown 文档为 `0600`。整个目录位于用户资料目录，不进入仓库。
 - 当前开发版以同一 macOS 用户为信任边界；同用户权限下的恶意进程不在防护范围内。
 
-## Buffer 使用
+## 独立窗口
 
-1. 打开 Buffer，选择 `Capsule`，再从工具栏下拉框选择 `Prompt`、`Memory`、`Password` 或 `Skill`。
-2. Capsule 只搜索当前选择的类型：Prompt、Memory、Skill 搜索标题与正文；Password 只搜索可见标题。最多显示五个结果。
-3. 普通条目选中后，通过工作台纸飞机或 Return 走 `BufferDeliveryCoordinator -> Delivery.insert` 上屏。
-4. 如果没有匹配结果，Prompt 或 Memory 会原地显示对应的新增动作；Skill 仅在输入本身是绝对路径时允许原地新增。点击后立即保存为本机 Markdown，并把新条目变成当前可上屏结果。Password 继续由 CLI 管理完整字段。
-
-### Password
-
-密码结果固定显示八位圆点，不泄露真实长度。选中结果本身不会捕获任何特殊按键；点击纸飞机或按 Return 后，RIMES 才显示非激活的“输入访问密钥”弹窗，并在最长 60 秒内接收四段本地并击验证。验证完成后，RIMES 重新确认精确 `FocusToken` 与 IMK client，签发两秒内有效的一次性许可，解密并插入当前密码。密钥契约不会出现在界面、提示、日志或文档中。
-
-普通 Buffer 在 macOS Secure Input 下仍拒绝投递。密码例外必须同时满足“本机密文记录 + 显式上屏请求 + 弹窗仍有效 + 完整本地验证 + 当前精确目标 + 一次性许可”。弹窗出现前，包含 F/J 在内的普通打字不会被 Capsule 捕获。宿主若停用第三方输入法或不向 RIMES 发送并击，本版本会失败关闭，不回退到剪贴板或 Accessibility 注入。
+- `⌘⇧C` 全局打开或关闭 Capsule；也可以从输入法菜单或「设置 → Capsule」进入。
+- 窗口按 `Prompt`、`Memory`、`Password`、`Skill` 分类搜索，并提供新增、查看、修改和删除。它是可输入的普通 AppKit 管理窗口，不是 Buffer，也不是上屏目标。
+- Prompt 与 Memory 编辑 Markdown 正文；Skill 保存本机文件或文件夹的绝对路径；Password 编辑网址、App、用户名、当前密码与曾用密码。
+- Password 列表只显示标题与固定长度掩码；网址、App、用户名始终使用安全文本控件。当前密码与曾用密码可通过「查看明文」短时查看，15 秒后自动恢复掩码；窗口失焦、应用失活、锁屏/睡眠/会话退出，以及切换条目或类型、新建、保存、删除、重载和关闭都会立即隐藏。明文视图不可选择、不可复制，也不会写入日志、tooltip、辅助功能标签或 UserDefaults。
+- 未保存草稿在切换条目、类型、页面或关闭窗口前会要求确认；保存与删除携带已加载文件的 SHA-256 revision，并在 Store 文件锁内比较，另一窗口或 CLI 已更新时拒绝覆盖。直接在 Obsidian 修改普通 Markdown 后，旧窗口也必须重新载入才能保存。
+- 当前独立管理窗口只负责内容管理，不直接向外部输入框上屏。原先依附 Buffer workspace 的 Capsule 搜索、保护投递和并击拦截已经移除，因此 Capsule 不参与普通输入按键路径。后续若增加独立上屏，应采用 Capsule 自己的非激活快速面板和外部焦点授权协议，不能重新依附 Buffer，也不能退化为剪贴板或 Accessibility 注入。
 
 ## CLI 管理
 
@@ -77,6 +73,7 @@ RimeBuffer capsule password remove <uuid>
 
 ```bash
 .build/debug/RimeBuffer capsule-smoke
+.build/debug/RimeBuffer capsule-window-smoke
 ```
 
-Smoke 使用临时目录和测试凭据，覆盖默认词条的一次性预设、普通 Markdown 往返、四类下拉隔离、按当前类型原地添加、标准上屏租约、目录/文件权限、密码明文边界、加解密、标题篡改拒绝、固定脱敏、四段并击形状，以及弹窗开启前绝不接管普通按键。
+Smoke 使用临时目录和测试凭据，覆盖默认词条的一次性预设、普通 Markdown 往返、四类筛选、独立窗口 CRUD 与并发 revision 规则、目录/文件权限、密码明文边界、加解密、标题篡改拒绝和固定脱敏。测试不会读写用户真实 Capsule 目录。

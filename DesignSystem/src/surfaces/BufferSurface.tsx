@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ReactNode,
 } from "react";
 import { Icon, type IconName } from "../design-system/Icon";
 import { initialPlugins } from "../design-system/data";
@@ -23,6 +24,25 @@ export type BufferLanguage = {
 };
 
 export type BufferSendAcknowledgement = boolean;
+export type BufferAIConnector = "codex" | "claude" | "openai";
+
+export type BufferPluginConfiguration =
+  | {
+    mode: "ai";
+    connector: BufferAIConnector;
+  }
+  | {
+    mode: "translation";
+    sourceLanguage: string;
+    targetLanguage: string;
+    provider: "apple" | "ai";
+    translateContinuously: boolean;
+  }
+  | {
+    mode: "stream";
+    candidateCount: number;
+    latency: "fast" | "balanced" | "stable";
+  };
 
 export type BufferTargetContext = {
   requestID: string | number;
@@ -60,6 +80,7 @@ export type BufferSurfaceProps = {
   defaultTargetLanguage?: string;
   translationContinuously?: boolean;
   translationProvider?: "apple" | "ai";
+  aiConnector?: BufferAIConnector;
   streamCandidateCount?: number;
   streamLatency?: "fast" | "balanced" | "stable";
   externalSource?: BufferExternalSource;
@@ -73,6 +94,8 @@ export type BufferSurfaceProps = {
   onTargetsChange?: (targets: readonly string[]) => void;
   onTargetSelect?: (index: number, target: string) => void;
   onLanguageChange?: (sourceLanguage: string, targetLanguage: string) => void;
+  onPluginConfigurationChange?: (configuration: BufferPluginConfiguration) => void;
+  onOpenPluginSettings?: (pluginID: string) => void;
   onGenerate?: (
     mode: BufferMode,
     sourceText: string,
@@ -89,10 +112,6 @@ export type BufferSurfaceProps = {
 type ModeDescriptor = {
   label: string;
   icon: IconName;
-  sourceRole: string;
-  sourceIcon: IconName;
-  targetRole?: string;
-  targetIcon?: IconName;
   action: string;
   loadingAction: string;
 };
@@ -119,38 +138,24 @@ const MODE_DESCRIPTORS: Record<BufferMode, ModeDescriptor> = {
   normal: {
     label: "Default",
     icon: "grid",
-    sourceRole: "文",
-    sourceIcon: "textbox",
     action: "发送",
     loadingAction: "发送中…",
   },
   translation: {
     label: translationPlugin?.name ?? "实时翻译",
     icon: translationPlugin?.icon ?? "globe",
-    sourceRole: "原",
-    sourceIcon: "textbox",
-    targetRole: "译",
-    targetIcon: "globe",
     action: "翻译",
     loadingAction: "翻译中…",
   },
   ai: {
     label: aiPlugin?.name ?? "AI 生成",
     icon: aiPlugin?.icon ?? "sparkle",
-    sourceRole: "原",
-    sourceIcon: "textbox",
-    targetRole: "答",
-    targetIcon: "sparkle",
     action: "生成",
     loadingAction: "生成中…",
   },
   stream: {
     label: streamPlugin?.name ?? "意识流输入",
     icon: streamPlugin?.icon ?? "waveform",
-    sourceRole: "拼",
-    sourceIcon: "keyboard",
-    targetRole: "文",
-    targetIcon: "waveform",
     action: "推测",
     loadingAction: "推测中…",
   },
@@ -199,6 +204,7 @@ export function bufferInputContextKey(
   translationProvider: "apple" | "ai",
   streamCandidateCount: number,
   streamLatency: "fast" | "balanced" | "stable",
+  aiConnector: BufferAIConnector = "codex",
 ): string {
   if (mode === "translation") {
     return JSON.stringify([
@@ -212,6 +218,7 @@ export function bufferInputContextKey(
   if (mode === "stream") {
     return JSON.stringify([mode, sourceText, streamCandidateCount, streamLatency]);
   }
+  if (mode === "ai") return JSON.stringify([mode, sourceText, aiConnector]);
   return JSON.stringify([mode, sourceText]);
 }
 
@@ -271,33 +278,49 @@ function statusFor(mode: BufferMode, phase: BufferPhase, _hasContent: boolean): 
   return null;
 }
 
+export async function copyBufferResult(text: string): Promise<boolean> {
+  if (!text || typeof navigator === "undefined" || !navigator.clipboard?.writeText) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function BufferTrack({
-  role,
-  icon,
   kind,
+  leadingControl,
   protectedContent,
   loading,
   loadingLabel,
+  status,
+  statusTone = "ready",
   sourceValue,
   targets,
   selectedTarget = 0,
   emptyLabel,
   onSourceChange,
   onTargetSelect,
+  onCopy,
+  copyDisabled = false,
   interactionDisabled = false,
 }: {
-  role: string;
-  icon: IconName;
   kind: "source" | "target";
+  leadingControl?: ReactNode;
   protectedContent: boolean;
   loading: boolean;
   loadingLabel?: string;
+  status?: string | null;
+  statusTone?: BufferPhase;
   sourceValue?: string;
   targets?: readonly string[];
   selectedTarget?: number;
   emptyLabel?: string;
   onSourceChange?: (text: string) => void;
   onTargetSelect?: (index: number) => void;
+  onCopy?: () => void;
+  copyDisabled?: boolean;
   interactionDisabled?: boolean;
 }) {
   const [sourceFocused, setSourceFocused] = useState(false);
@@ -316,10 +339,7 @@ function BufferTrack({
       aria-label={`${kind === "source" ? "源" : "目标"}缓冲轨道`}
       className={`buffer-track buffer-track--${kind}${protectedContent ? " is-protected" : ""}`}
     >
-      <span className="buffer-track__role" title={kind === "source" ? "源缓冲区" : "目标缓冲区"}>
-        <Icon name={protectedContent ? "lock" : icon} size={13} weight="bold" />
-        <span>{role}</span>
-      </span>
+      {leadingControl}
 
       <div className="buffer-track__content">
         {protectedContent ? (
@@ -384,6 +404,288 @@ function BufferTrack({
           <span className="buffer-track__empty">{emptyLabel ?? "等待结果"}</span>
         )}
       </div>
+      {status ? (
+        <span className={`buffer-track__status buffer-status--${statusTone}`}>
+          {protectedContent ? <Icon name="lock" size={12} weight="bold" /> : null}
+          {status}
+        </span>
+      ) : null}
+      {kind === "target" && targetCount > 0 && onCopy ? (
+        <IconButton
+          className="buffer-track__copy"
+          disabled={copyDisabled || interactionDisabled}
+          icon="copy"
+          label="复制当前结果并关闭 Buffer"
+          onClick={onCopy}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function BufferInputControl({
+  mode,
+  descriptor,
+  availableModes,
+  disabled,
+  expanded,
+  configurationDisabled,
+  protectedContent,
+  sourceLanguage,
+  targetLanguage,
+  languageOptions,
+  targetLanguageOptions,
+  translationProvider,
+  translationContinuously,
+  aiConnector,
+  streamCandidateCount,
+  streamLatency,
+  canReturnToSource,
+  canRetry,
+  onModeChange,
+  onSourceLanguageChange,
+  onTargetLanguageChange,
+  onSwapLanguages,
+  onTranslationProviderChange,
+  onTranslationContinuouslyChange,
+  onAIConnectorChange,
+  onStreamCandidateCountChange,
+  onStreamLatencyChange,
+  onReturnToSource,
+  onRetry,
+  onOpenSettings,
+  onClose,
+  onToggle,
+}: {
+  mode: BufferMode;
+  descriptor: ModeDescriptor;
+  availableModes: readonly BufferMode[];
+  disabled: boolean;
+  expanded: boolean;
+  configurationDisabled: boolean;
+  protectedContent: boolean;
+  sourceLanguage: string;
+  targetLanguage: string;
+  languageOptions: readonly BufferLanguage[];
+  targetLanguageOptions: readonly BufferLanguage[];
+  translationProvider: "apple" | "ai";
+  translationContinuously: boolean;
+  aiConnector: BufferAIConnector;
+  streamCandidateCount: number;
+  streamLatency: "fast" | "balanced" | "stable";
+  canReturnToSource: boolean;
+  canRetry: boolean;
+  onModeChange: (mode: BufferMode) => void;
+  onSourceLanguageChange: (event: ChangeEvent<HTMLSelectElement>) => void;
+  onTargetLanguageChange: (event: ChangeEvent<HTMLSelectElement>) => void;
+  onSwapLanguages: () => void;
+  onTranslationProviderChange: (provider: "apple" | "ai") => void;
+  onTranslationContinuouslyChange: (continuous: boolean) => void;
+  onAIConnectorChange: (connector: BufferAIConnector) => void;
+  onStreamCandidateCountChange: (count: number) => void;
+  onStreamLatencyChange: (latency: "fast" | "balanced" | "stable") => void;
+  onReturnToSource: () => void;
+  onRetry: () => void;
+  onOpenSettings?: () => void;
+  onClose?: () => void;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="buffer-input-control">
+      <button
+        aria-controls="buffer-toolbar"
+        aria-expanded={expanded}
+        aria-label={expanded ? "收起 Buffer 工具栏" : "展开 Buffer 工具栏"}
+        className={`buffer-input-control__trigger${expanded ? " is-open" : ""}`}
+        disabled={disabled}
+        onClick={onToggle}
+        title={`${descriptor.label} · 点击${expanded ? "收起" : "展开"}工具栏`}
+        type="button"
+      >
+        <Icon name={protectedContent ? "lock" : descriptor.icon} size={14} weight="bold" />
+      </button>
+
+      {expanded ? (
+        <section
+          aria-label="Buffer 工具栏"
+          className="buffer-toolbar"
+          data-native-window-drag-region="true"
+          id="buffer-toolbar"
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            onToggle();
+          }}
+          role="toolbar"
+        >
+          <header className="buffer-plugin-popover__header">
+            <span>
+              <strong>工作插件</strong>
+              <small>选择当前工作流，并直接调整对应配置。</small>
+            </span>
+          </header>
+
+          <label className="buffer-plugin-popover__field">
+            <span>当前插件</span>
+            <select
+              aria-label="工作台插件"
+              disabled={configurationDisabled}
+              onChange={(event) => onModeChange(event.target.value as BufferMode)}
+              value={mode}
+            >
+              {availableModes.map((pluginMode) => (
+                <option key={pluginMode} value={pluginMode}>
+                  {MODE_DESCRIPTORS[pluginMode].label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {mode === "normal" ? (
+            <p className="buffer-plugin-popover__empty">Default 没有额外配置。</p>
+          ) : null}
+
+          {mode === "translation" ? (
+            <div className="buffer-plugin-popover__configuration">
+              <div className="buffer-plugin-popover__language-row">
+                <label className="buffer-plugin-popover__field">
+                  <span>源语言</span>
+                  <select
+                    aria-label="源语言"
+                    disabled={configurationDisabled}
+                    onChange={onSourceLanguageChange}
+                    value={sourceLanguage}
+                  >
+                    {languageOptions.map((language) => (
+                      <option key={`source-${language.value}`} value={language.value}>{language.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  aria-label="交换源语言和目标语言"
+                  className="buffer-plugin-popover__swap"
+                  disabled={configurationDisabled}
+                  onClick={onSwapLanguages}
+                  type="button"
+                >
+                  交换
+                </button>
+                <label className="buffer-plugin-popover__field">
+                  <span>目标语言</span>
+                  <select
+                    aria-label="目标语言"
+                    disabled={configurationDisabled}
+                    onChange={onTargetLanguageChange}
+                    value={targetLanguage}
+                  >
+                    {targetLanguageOptions.map((language) => (
+                      <option key={`target-${language.value}`} value={language.value}>{language.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <label className="buffer-plugin-popover__field">
+                <span>翻译通道</span>
+                <select
+                  aria-label="翻译通道"
+                  disabled={configurationDisabled}
+                  onChange={(event) => onTranslationProviderChange(event.target.value as "apple" | "ai")}
+                  value={translationProvider}
+                >
+                  <option value="apple">Apple 本地</option>
+                  <option value="ai">当前 AI 连接器</option>
+                </select>
+              </label>
+              <label className="buffer-plugin-popover__check">
+                <input
+                  checked={translationContinuously}
+                  disabled={configurationDisabled}
+                  onChange={(event) => onTranslationContinuouslyChange(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>连续翻译</span>
+              </label>
+            </div>
+          ) : null}
+
+          {mode === "ai" ? (
+            <label className="buffer-plugin-popover__field">
+              <span>默认连接器</span>
+              <select
+                aria-label="AI 生成连接器"
+                disabled={configurationDisabled}
+                onChange={(event) => onAIConnectorChange(event.target.value as BufferAIConnector)}
+                value={aiConnector}
+              >
+                <option value="codex">Codex CLI</option>
+                <option value="claude">Claude Code CLI</option>
+                <option value="openai">OpenAI 兼容 API</option>
+              </select>
+            </label>
+          ) : null}
+
+          {mode === "stream" ? (
+            <div className="buffer-plugin-popover__configuration">
+              <label className="buffer-plugin-popover__field">
+                <span>候选数量</span>
+                <select
+                  aria-label="意识流候选数量"
+                  disabled={configurationDisabled}
+                  onChange={(event) => onStreamCandidateCountChange(Number(event.target.value))}
+                  value={streamCandidateCount}
+                >
+                  {[1, 2, 3, 4, 5].map((count) => (
+                    <option key={count} value={count}>{count} 个</option>
+                  ))}
+                </select>
+              </label>
+              <label className="buffer-plugin-popover__field">
+                <span>响应节奏</span>
+                <select
+                  aria-label="意识流响应节奏"
+                  disabled={configurationDisabled}
+                  onChange={(event) => onStreamLatencyChange(
+                    event.target.value as "fast" | "balanced" | "stable",
+                  )}
+                  value={streamLatency}
+                >
+                  <option value="fast">灵敏</option>
+                  <option value="balanced">平衡</option>
+                  <option value="stable">稳定</option>
+                </select>
+              </label>
+            </div>
+          ) : null}
+
+          <footer className="buffer-plugin-popover__actions">
+            {canReturnToSource ? (
+              <button onClick={onReturnToSource} type="button">编辑原文</button>
+            ) : null}
+            {canRetry ? (
+              <button aria-label="重新生成" onClick={onRetry} type="button">重试</button>
+            ) : null}
+            {mode !== "normal" && onOpenSettings ? (
+              <button
+                aria-label="在设置中打开完整配置"
+                onClick={onOpenSettings}
+                type="button"
+              >
+                插件设置
+              </button>
+            ) : null}
+            {onClose ? (
+              <button
+                aria-label="关闭并暂停缓冲（保留内容）"
+                className="is-danger"
+                onClick={onClose}
+                type="button"
+              >
+                关闭
+              </button>
+            ) : null}
+          </footer>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -410,10 +712,11 @@ export function BufferSurface({
   defaultSourceLanguage = "zh-Hans",
   targetLanguage: controlledTargetLanguage,
   defaultTargetLanguage = "en",
-  translationContinuously = true,
-  translationProvider = "apple",
-  streamCandidateCount = 5,
-  streamLatency = "balanced",
+  translationContinuously: requestedTranslationContinuously = true,
+  translationProvider: requestedTranslationProvider = "apple",
+  aiConnector: requestedAIConnector = "codex",
+  streamCandidateCount: requestedStreamCandidateCount = 5,
+  streamLatency: requestedStreamLatency = "balanced",
   externalSource,
   paused = false,
   languages = DEFAULT_LANGUAGES,
@@ -425,6 +728,8 @@ export function BufferSurface({
   onTargetsChange,
   onTargetSelect,
   onLanguageChange,
+  onPluginConfigurationChange,
+  onOpenPluginSettings,
   onGenerate,
   onSend,
   onClose,
@@ -458,9 +763,20 @@ export function BufferSurface({
     controlledTargetLanguage,
     defaultTargetLanguage,
   );
+  const [translationContinuously, setTranslationContinuously] = useState(
+    requestedTranslationContinuously,
+  );
+  const [translationProvider, setTranslationProvider] = useState(requestedTranslationProvider);
+  const [aiConnector, setAIConnector] = useState<BufferAIConnector>(requestedAIConnector);
+  const [streamCandidateCount, setStreamCandidateCount] = useState(
+    Math.min(5, Math.max(1, Math.trunc(requestedStreamCandidateCount))),
+  );
+  const [streamLatency, setStreamLatency] = useState(requestedStreamLatency);
   const [deliveryNote, setDeliveryNote] = useState("");
   const [deliveryTone, setDeliveryTone] = useState<BufferPhase>("ready");
   const [sending, setSending] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [toolbarExpanded, setToolbarExpanded] = useState(false);
   const [targetsAreCurrent, setTargetsAreCurrent] = useState(
     () => (controlledTargets ?? defaultTargets ?? []).length > 0,
   );
@@ -476,6 +792,7 @@ export function BufferSurface({
   >(null);
   const settledGenerationRequestRef = useRef<BufferTargetContext | null>(null);
   const deliveryRevision = useRef(0);
+  const copyRevision = useRef(0);
   const deliveryAbortController = useRef<AbortController | null>(null);
   const onGenerateRef = useRef(onGenerate);
   const onSendRef = useRef(onSend);
@@ -487,6 +804,32 @@ export function BufferSurface({
   onTargetSelectRef.current = onTargetSelect;
   controlledPhaseRef.current = controlledPhase;
   sendingRef.current = sending;
+
+  useEffect(() => {
+    setTranslationContinuously(requestedTranslationContinuously);
+  }, [requestedTranslationContinuously]);
+
+  useEffect(() => {
+    setTranslationProvider(requestedTranslationProvider);
+  }, [requestedTranslationProvider]);
+
+  useEffect(() => {
+    setAIConnector(requestedAIConnector);
+  }, [requestedAIConnector]);
+
+  useEffect(() => {
+    setStreamCandidateCount(
+      Math.min(5, Math.max(1, Math.trunc(requestedStreamCandidateCount))),
+    );
+  }, [requestedStreamCandidateCount]);
+
+  useEffect(() => {
+    setStreamLatency(requestedStreamLatency);
+  }, [requestedStreamLatency]);
+
+  useEffect(() => {
+    if (paused || phase === "protected") setToolbarExpanded(false);
+  }, [paused, phase]);
 
   const availableModes = useMemo<readonly BufferMode[]>(() => {
     if (availablePluginIDs === undefined) return MODE_ORDER;
@@ -517,6 +860,7 @@ export function BufferSurface({
     translationProvider,
     streamCandidateCount,
     streamLatency,
+    aiConnector,
   );
   const [internalTargetContextKey, setInternalTargetContextKey] = useState<string | null>(
     () => controlledTargets === undefined && targets.length > 0 ? inputContextKey : null,
@@ -554,10 +898,19 @@ export function BufferSurface({
     && !protectedContent
     && !loading
     && !sending
+    && !copying
     && (phase === "ready" || phase === "error")
     && outputIsCurrent
     && selectedOutput.trim().length > 0;
-  const canRequest = !paused && !protectedContent && !loading && !sending && hasSource;
+  const canRequest = !paused && !protectedContent && !loading && !sending && !copying && hasSource;
+  const canCopy = sendingTargetResult
+    && !paused
+    && !protectedContent
+    && !loading
+    && !sending
+    && !copying
+    && outputIsCurrent
+    && selectedOutput.trim().length > 0;
   const phaseStatus = effectiveMode === "translation" && phase === "loading"
     ? translationProvider === "ai" ? "正在通过 AI 通道翻译" : "正在使用 Apple 本地翻译"
     : statusFor(effectiveMode, phase, hasSource);
@@ -659,8 +1012,10 @@ export function BufferSurface({
     deliveryAbortController.current?.abort();
     deliveryAbortController.current = null;
     deliveryRevision.current += 1;
+    copyRevision.current += 1;
     sendingRef.current = false;
     setSending(false);
+    setCopying(false);
     setDeliveryNote("");
     setDeliveryTone("ready");
   }, []);
@@ -678,6 +1033,7 @@ export function BufferSurface({
       translationProvider,
       streamCandidateCount,
       streamLatency,
+      aiConnector,
     );
     clearDeliveryStatus();
     if (!preservesPriorResult) {
@@ -930,6 +1286,7 @@ export function BufferSurface({
     cancelGenerationWork();
     deliveryAbortController.current?.abort();
     deliveryRevision.current += 1;
+    copyRevision.current += 1;
   }, [cancelGenerationWork]);
 
   useEffect(() => {
@@ -968,9 +1325,8 @@ export function BufferSurface({
     sourceText,
   ]);
 
-  const changeMode = (event: ChangeEvent<HTMLSelectElement>) => {
-    if (paused || sending) return;
-    const nextMode = event.target.value as BufferMode;
+  const changeMode = (nextMode: BufferMode) => {
+    if (paused || sending || copying) return;
     if (!availableModeSet.has(nextMode)) return;
     cancelPendingGeneration();
     clearDeliveryStatus();
@@ -982,7 +1338,7 @@ export function BufferSurface({
   };
 
   const changeSourceLanguage = (event: ChangeEvent<HTMLSelectElement>) => {
-    if (paused || sending) return;
+    if (paused || sending || copying) return;
     const next = event.target.value;
     cancelPendingGeneration();
     clearDeliveryStatus();
@@ -993,10 +1349,17 @@ export function BufferSurface({
       setPhase(hasSource ? "ready" : "idle");
     }
     onLanguageChange?.(next, targetLanguage);
+    onPluginConfigurationChange?.({
+      mode: "translation",
+      sourceLanguage: next,
+      targetLanguage,
+      provider: translationProvider,
+      translateContinuously: translationContinuously,
+    });
   };
 
   const changeTargetLanguage = (event: ChangeEvent<HTMLSelectElement>) => {
-    if (paused || sending) return;
+    if (paused || sending || copying) return;
     const next = event.target.value;
     cancelPendingGeneration();
     clearDeliveryStatus();
@@ -1007,10 +1370,17 @@ export function BufferSurface({
       setPhase(hasSource ? "ready" : "idle");
     }
     onLanguageChange?.(sourceLanguage, next);
+    onPluginConfigurationChange?.({
+      mode: "translation",
+      sourceLanguage,
+      targetLanguage: next,
+      provider: translationProvider,
+      translateContinuously: translationContinuously,
+    });
   };
 
   const swapLanguages = () => {
-    if (paused || sending) return;
+    if (paused || sending || copying) return;
     const nextSource = targetLanguage;
     const nextTarget = sourceLanguage === "auto" ? "en" : sourceLanguage;
     cancelPendingGeneration();
@@ -1023,6 +1393,89 @@ export function BufferSurface({
       setPhase(hasSource ? "ready" : "idle");
     }
     onLanguageChange?.(nextSource, nextTarget);
+    onPluginConfigurationChange?.({
+      mode: "translation",
+      sourceLanguage: nextSource,
+      targetLanguage: nextTarget,
+      provider: translationProvider,
+      translateContinuously: translationContinuously,
+    });
+  };
+
+  const changeTranslationProvider = (provider: "apple" | "ai") => {
+    if (paused || protectedContent || loading || sending || copying) return;
+    cancelPendingGeneration();
+    clearDeliveryStatus();
+    setTargetsAreCurrent(false);
+    setTranslationProvider(provider);
+    setTargets([]);
+    setPhase(hasSource ? "ready" : "idle");
+    onPluginConfigurationChange?.({
+      mode: "translation",
+      sourceLanguage,
+      targetLanguage,
+      provider,
+      translateContinuously: translationContinuously,
+    });
+  };
+
+  const changeTranslationContinuously = (continuous: boolean) => {
+    if (paused || protectedContent || loading || sending || copying) return;
+    cancelPendingGeneration(true);
+    clearDeliveryStatus();
+    setTranslationContinuously(continuous);
+    onPluginConfigurationChange?.({
+      mode: "translation",
+      sourceLanguage,
+      targetLanguage,
+      provider: translationProvider,
+      translateContinuously: continuous,
+    });
+  };
+
+  const changeAIConnector = (connector: BufferAIConnector) => {
+    if (paused || protectedContent || loading || sending || copying) return;
+    cancelPendingGeneration();
+    clearDeliveryStatus();
+    setTargetsAreCurrent(false);
+    setAIConnector(connector);
+    setTargets([]);
+    setSelectedTarget(0);
+    setPhase(hasSource ? "ready" : "idle");
+    onPluginConfigurationChange?.({ mode: "ai", connector });
+  };
+
+  const changeStreamCandidateCount = (count: number) => {
+    if (paused || protectedContent || loading || sending || copying) return;
+    const next = Math.min(5, Math.max(1, Math.trunc(count)));
+    cancelPendingGeneration();
+    clearDeliveryStatus();
+    setTargetsAreCurrent(false);
+    setStreamCandidateCount(next);
+    setTargets([]);
+    setSelectedTarget(0);
+    setPhase(hasSource ? "ready" : "idle");
+    onPluginConfigurationChange?.({
+      mode: "stream",
+      candidateCount: next,
+      latency: streamLatency,
+    });
+  };
+
+  const changeStreamLatency = (latency: "fast" | "balanced" | "stable") => {
+    if (paused || protectedContent || loading || sending || copying) return;
+    cancelPendingGeneration();
+    clearDeliveryStatus();
+    setTargetsAreCurrent(false);
+    setStreamLatency(latency);
+    setTargets([]);
+    setSelectedTarget(0);
+    setPhase(hasSource ? "ready" : "idle");
+    onPluginConfigurationChange?.({
+      mode: "stream",
+      candidateCount: streamCandidateCount,
+      latency,
+    });
   };
 
   const generate = () => {
@@ -1035,7 +1488,7 @@ export function BufferSurface({
   };
 
   const selectTarget = (index: number) => {
-    if (paused || sending) return;
+    if (paused || sending || copying) return;
     const nextIndex = clampTargetIndex(index, targets.length);
     const target = targets[nextIndex];
     if (target === undefined) return;
@@ -1114,8 +1567,45 @@ export function BufferSurface({
     }
   };
 
+  const copyCurrentResult = async () => {
+    if (!canCopy) return;
+    const requestInputContextKey = inputContextKey;
+    const requestMode = effectiveMode;
+    const requestOutput = selectedOutput;
+    const requestRevision = copyRevision.current + 1;
+    copyRevision.current = requestRevision;
+    setCopying(true);
+    setDeliveryNote("正在复制");
+    setDeliveryTone("loading");
+
+    const copied = await copyBufferResult(requestOutput);
+    if (copyRevision.current !== requestRevision) return;
+
+    const latestContext = deliveryContext.current;
+    const contextChanged = latestContext.paused
+      || latestContext.protectedContent
+      || latestContext.inputContextKey !== requestInputContextKey
+      || latestContext.mode !== requestMode
+      || latestContext.output !== requestOutput;
+    setCopying(false);
+    if (!copied) {
+      setDeliveryNote("复制失败，请重试");
+      setDeliveryTone("error");
+      return;
+    }
+    if (contextChanged) {
+      setDeliveryNote("原结果已复制；当前内容已变化");
+      setDeliveryTone("error");
+      return;
+    }
+
+    setDeliveryNote("已复制到剪贴板");
+    setDeliveryTone("ready");
+    onClose?.();
+  };
+
   const returnToExchangeSource = () => {
-    if (!exchange || paused || sending) return;
+    if (!exchange || paused || sending || copying) return;
     cancelPendingGeneration();
     clearDeliveryStatus();
     setTargetsAreCurrent(false);
@@ -1154,7 +1644,7 @@ export function BufferSurface({
       : "send";
 
   const onSourceEdit = (text: string) => {
-    if (paused || sending) return;
+    if (paused || sending || copying) return;
     cancelPendingGeneration();
     clearDeliveryStatus();
     setTargetsAreCurrent(false);
@@ -1173,101 +1663,72 @@ export function BufferSurface({
     showLiveTargetRail ? "buffer-workbench--live-expand" : "",
     exchangeDecision ? "buffer-workbench--exchange-decision" : "",
   ].filter(Boolean).join(" ");
+  const canReturnToSource = exchange
+    && !loading
+    && !paused
+    && !sending
+    && !copying
+    && targets.length > 0;
+  const canRetry = (
+    (exchange && !loading && targets.length > 0)
+    || (liveExpand && phase === "error" && outputIsCurrent && targets.length > 0)
+  ) && !paused && canRequest;
+  const activePluginID = effectiveMode === "normal"
+    ? undefined
+    : BUFFER_MODE_PLUGIN_IDS[effectiveMode];
+  const inputControl = (
+    <BufferInputControl
+      aiConnector={aiConnector}
+      availableModes={availableModes}
+      canRetry={canRetry}
+      canReturnToSource={canReturnToSource}
+      configurationDisabled={paused || protectedContent || loading || sending || copying}
+      descriptor={descriptor}
+      disabled={protectedContent}
+      expanded={toolbarExpanded}
+      languageOptions={languageOptions}
+      mode={effectiveMode}
+      onAIConnectorChange={changeAIConnector}
+      onClose={onClose
+        ? () => {
+          setToolbarExpanded(false);
+          onClose();
+        }
+        : undefined}
+      onModeChange={changeMode}
+      onOpenSettings={activePluginID && onOpenPluginSettings
+        ? () => onOpenPluginSettings(activePluginID)
+        : undefined}
+      onRetry={exchange ? retryExchangeGeneration : generate}
+      onReturnToSource={returnToExchangeSource}
+      onSourceLanguageChange={changeSourceLanguage}
+      onStreamCandidateCountChange={changeStreamCandidateCount}
+      onStreamLatencyChange={changeStreamLatency}
+      onSwapLanguages={swapLanguages}
+      onTargetLanguageChange={changeTargetLanguage}
+      onTranslationContinuouslyChange={changeTranslationContinuously}
+      onTranslationProviderChange={changeTranslationProvider}
+      onToggle={() => setToolbarExpanded((expanded) => !expanded)}
+      protectedContent={protectedContent}
+      sourceLanguage={sourceLanguage}
+      streamCandidateCount={streamCandidateCount}
+      streamLatency={streamLatency}
+      targetLanguage={targetLanguage}
+      targetLanguageOptions={targetLanguageOptions}
+      translationContinuously={translationContinuously}
+      translationProvider={translationProvider}
+    />
+  );
 
   return (
     <section
       aria-label="缓冲工作台"
-      className={`buffer-surface buffer-surface--${effectiveMode}${className ? ` ${className}` : ""}`}
+      className={`buffer-surface buffer-surface--${effectiveMode}${toolbarExpanded ? " is-toolbar-expanded" : ""}${className ? ` ${className}` : ""}`}
+      data-base-height={(showLiveTargetRail ? 78 : 44) + (toolbarExpanded ? 34 : 0)}
       data-layout={layout}
       data-mode={effectiveMode}
       data-phase={phase}
     >
-      <header className="buffer-toolbar">
-        {status ? (
-          <span
-            className={`buffer-toolbar__status buffer-status--${statusTone}`}
-          >
-            {protectedContent ? <Icon name="lock" size={13} weight="bold" /> : null}
-            {status}
-          </span>
-        ) : null}
-
-        <label className="buffer-toolbar__plugin-select">
-          <Icon name={descriptor.icon} size={14} weight="bold" />
-          <span className="sr-only">工作台插件</span>
-          <select
-            aria-label="工作台插件"
-            disabled={paused || sending}
-            onChange={changeMode}
-            value={effectiveMode}
-          >
-            {availableModes.map((pluginMode) => (
-              <option key={pluginMode} value={pluginMode}>
-                {MODE_DESCRIPTORS[pluginMode].label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {effectiveMode === "translation" ? (
-          <div aria-label="翻译语言" className="buffer-toolbar__translation-controls" role="group">
-            <select
-              aria-label="源语言"
-              disabled={paused || protectedContent || loading || sending}
-              onChange={changeSourceLanguage}
-              value={sourceLanguage}
-            >
-              {languageOptions.map((language) => (
-                <option key={`source-${language.value}`} value={language.value}>{language.label}</option>
-              ))}
-            </select>
-            <IconButton
-              disabled={paused || protectedContent || loading || sending}
-              icon="swap"
-              label="交换源语言和目标语言"
-              onClick={swapLanguages}
-            />
-            <select
-              aria-label="目标语言"
-              disabled={paused || protectedContent || loading || sending}
-              onChange={changeTargetLanguage}
-              value={targetLanguage}
-            >
-              {targetLanguageOptions.map((language) => (
-                <option key={`target-${language.value}`} value={language.value}>{language.label}</option>
-              ))}
-            </select>
-          </div>
-        ) : null}
-
-        <span className="buffer-toolbar__spacer" />
-        {exchange && !loading && targets.length > 0 ? (
-          <>
-            <IconButton
-              disabled={paused || sending}
-              icon="textbox"
-              label="返回编辑原文"
-              onClick={returnToExchangeSource}
-            />
-            <IconButton
-              disabled={paused || !canRequest}
-              icon="refresh"
-              label="重新生成"
-              onClick={retryExchangeGeneration}
-            />
-          </>
-        ) : null}
-        {liveExpand && phase === "error" && outputIsCurrent && targets.length > 0 ? (
-          <IconButton
-            disabled={paused || !canRequest}
-            icon="refresh"
-            label="重新生成"
-            onClick={generate}
-          />
-        ) : null}
-        <IconButton icon="close" label="关闭并暂停缓冲（保留内容）" onClick={onClose} />
-      </header>
-
       <span aria-atomic="true" aria-live="polite" className="sr-only">
         {assistiveStatus}
       </span>
@@ -1276,58 +1737,65 @@ export function BufferSurface({
         <div className="buffer-workbench__rails">
           {exchangeDecision ? (
             <BufferTrack
+              copyDisabled={!canCopy}
               emptyLabel="等待返回结果"
-              icon={descriptor.targetIcon ?? "sparkle"}
               kind="target"
+              leadingControl={inputControl}
               loading={loading}
               loadingLabel={phaseStatus ?? undefined}
-              interactionDisabled={paused || sending}
+              interactionDisabled={paused || sending || copying}
+              onCopy={copyCurrentResult}
               onTargetSelect={selectTarget}
               protectedContent={protectedContent}
-              role={descriptor.targetRole ?? "答"}
               selectedTarget={resolvedSelectedTarget}
+              status={status}
+              statusTone={statusTone}
               targets={targets}
             />
           ) : (
             <BufferTrack
-              icon={descriptor.sourceIcon}
               kind="source"
+              leadingControl={inputControl}
               loading={false}
-              interactionDisabled={paused || sending}
+              interactionDisabled={paused || sending || copying}
               onSourceChange={onSourceEdit}
               protectedContent={protectedContent}
-              role={descriptor.sourceRole}
               sourceValue={sourceText}
+              status={showLiveTargetRail ? null : status}
+              statusTone={statusTone}
             />
           )}
           {showLiveTargetRail ? (
             <BufferTrack
+              copyDisabled={!canCopy}
               emptyLabel={
                 effectiveMode === "stream"
                   ? "等待推测结果"
                   : "等待译文"
               }
-              icon={descriptor.targetIcon ?? "sparkle"}
               kind="target"
               loading={loading}
               loadingLabel={phaseStatus ?? undefined}
-              interactionDisabled={paused || sending}
+              interactionDisabled={paused || sending || copying}
+              onCopy={copyCurrentResult}
               onTargetSelect={selectTarget}
               protectedContent={protectedContent}
-              role={descriptor.targetRole ?? "答"}
               selectedTarget={resolvedSelectedTarget}
+              status={status}
+              statusTone={statusTone}
               targets={targets}
             />
           ) : null}
         </div>
 
         <IconButton
-          aria-busy={loading || sending}
+          aria-busy={loading || sending || copying}
           className={`buffer-workbench__primary-action${effectiveMode === "normal" ? "" : " is-accented"}`}
           disabled={
             protectedContent
             || paused
             || loading
+            || copying
             || (primaryAction === send && !canSend)
             || (primaryAction === generate && !canRequest)
           }

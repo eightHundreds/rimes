@@ -19,6 +19,7 @@
     "double_pinyin.schema.yaml",
     "double_pinyin_flypy.schema.yaml",
     "rime_ice.schema.yaml",
+    "stream_input_local.schema.yaml",
     "wubi86.schema.yaml",
     "english.schema.yaml"
   ],
@@ -40,10 +41,12 @@
     "en_dicts/en.dict.yaml",
     "en_dicts/en_ext.dict.yaml",
     "english.schema.yaml",
+    "grammar.yaml",
     "licenses/GPL-3.0.txt",
     "licenses/rime-easy-en-LICENSE",
     "licenses/rime-easy-en-SOURCE.md",
     "licenses/rime-ice-SOURCE.md",
+    "licenses/rime-octagram-data-SOURCE.md",
     "licenses/rime-wubi-LICENSE",
     "licenses/rime-wubi-SOURCE.md",
     "lua/autocap_filter.lua",
@@ -71,16 +74,19 @@
     "radical_pinyin.schema.yaml",
     "rime_ice.dict.yaml",
     "rime_ice.schema.yaml",
+    "stream_input_local.schema.yaml",
     "symbols_caps_v.yaml",
     "symbols_v.yaml",
     "wubi86.dict.yaml",
     "wubi86.schema.yaml"
   ],
   "supplementalFiles": [
+    "grammar.yaml",
     "licenses/GPL-3.0.txt",
     "licenses/rime-easy-en-LICENSE",
     "licenses/rime-easy-en-SOURCE.md",
     "licenses/rime-ice-SOURCE.md",
+    "licenses/rime-octagram-data-SOURCE.md",
     "licenses/rime-wubi-LICENSE",
     "licenses/rime-wubi-SOURCE.md"
   ],
@@ -143,7 +149,8 @@
         "licenses/rime-easy-en-SOURCE.md",
         "licenses/rime-ice-SOURCE.md",
         "licenses/rime-wubi-SOURCE.md",
-        "my_combo.schema.yaml"
+        "my_combo.schema.yaml",
+        "stream_input_local.schema.yaml"
       ]
     },
     "rime-ice-derived": {
@@ -206,6 +213,14 @@
       "files": [
         "easy_en.dict.yaml",
         "licenses/rime-easy-en-LICENSE"
+      ]
+    },
+    "rime-octagram-data": {
+      "license": "LGPL-3.0-only",
+      "source": "https://github.com/lotem/rime-octagram-data (grammar 8ceef1b42eb77e86501382a52e85c309c0f2f04c; hans model f8ce3b534733e489a8470a7c2adf5a154e8ea069)",
+      "files": [
+        "grammar.yaml",
+        "licenses/rime-octagram-data-SOURCE.md"
       ]
     },
     "rime-radical-search": {

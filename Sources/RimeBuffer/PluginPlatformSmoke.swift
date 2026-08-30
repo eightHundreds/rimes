@@ -50,11 +50,15 @@ func runPluginPlatformSmokeTest() -> Bool {
         BuiltInPluginID.appleTranslation,
         BuiltInPluginID.streamInput,
         BuiltInPluginID.aiText,
-        BuiltInPluginID.capsule,
     ]) else {
         return fail("shipped buffer plugin registry")
     }
     let shippedDescriptors = BuiltInPlugins.makeAll().map(\.descriptor)
+    guard !shippedDescriptors.contains(where: {
+        $0.key.rawID == "builtin.capsule"
+    }) else {
+        return fail("standalone Capsule remained a Buffer plug-in")
+    }
     guard shippedDescriptors.allSatisfy({
         PluginVisualIdentity.resolvedSymbolName($0.symbolName) == $0.symbolName
     }) else {
@@ -104,6 +108,43 @@ func runPluginPlatformSmokeTest() -> Bool {
         !retiredBufferPluginIDs.contains($0.key.rawID)
     }) else {
         return fail("retired buffer plugin remained registered")
+    }
+
+    let legacyCapsuleDefaultsName =
+        "RimeBuffer.PluginPlatformLegacyCapsule.\(UUID().uuidString)"
+    guard let legacyCapsuleDefaults = UserDefaults(
+        suiteName: legacyCapsuleDefaultsName
+    ) else {
+        return fail("legacy Capsule defaults suite")
+    }
+    defer {
+        legacyCapsuleDefaults.removePersistentDomain(
+            forName: legacyCapsuleDefaultsName
+        )
+    }
+    legacyCapsuleDefaults.removePersistentDomain(
+        forName: legacyCapsuleDefaultsName
+    )
+    legacyCapsuleDefaults.set(
+        true,
+        forKey: "plugins.buffer.active.hasValue.v1"
+    )
+    legacyCapsuleDefaults.set(
+        PluginDomain.builtIn.rawValue,
+        forKey: "plugins.buffer.active.domain.v1"
+    )
+    legacyCapsuleDefaults.set(
+        "builtin.capsule",
+        forKey: "plugins.buffer.active.rawID.v1"
+    )
+    let legacyCapsuleSelection = BufferPluginSelectionStore(
+        defaults: legacyCapsuleDefaults
+    )
+    legacyCapsuleSelection.reconcile(with: shippedDescriptors.map {
+        RegisteredPlugin(descriptor: $0, isEnabled: true)
+    })
+    guard legacyCapsuleSelection.activeKey == nil else {
+        return fail("legacy Capsule Buffer selection was not retired")
     }
 
     let root = fileManager.temporaryDirectory.appendingPathComponent(

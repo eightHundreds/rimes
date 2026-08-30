@@ -40,6 +40,22 @@ enum CandidateKeyboardRoutingRules {
     }
 }
 
+/// A committed string becomes visible as soon as the synchronous IMK host
+/// insertion returns. Retire the old candidate projection before crossing that
+/// re-entrant boundary so the next host callback can never observe or operate
+/// on candidates belonging to text that is already on screen.
+enum CommitPresentationRetirement {
+    static func perform<Owner>(
+        owner: Owner?,
+        clearInline: (Owner) -> Void,
+        hideCandidates: (Owner) -> Void
+    ) {
+        guard let owner else { return }
+        clearInline(owner)
+        hideCandidates(owner)
+    }
+}
+
 enum BufferWorkbenchEscapeDisposition: Equatable {
     case passThrough
     case closeWorkbench
@@ -125,6 +141,7 @@ enum BufferLogicalNavigationRules {
 enum BufferClipboardShortcut: Equatable {
     case selectAll
     case paste
+    case copyGeneratedResult
 }
 
 /// `modifierFlags` is an aggregate bitset: pressing the second physical Shift,
@@ -138,8 +155,9 @@ enum StreamInputModifierBoundaryRules {
 }
 
 enum BufferClipboardShortcutRules {
-    /// RIMES accepts both the user's Control convention and native macOS
-    /// Command shortcuts. Extra Shift/Option or Control+Command combinations
+    /// Source editing accepts both the user's Control convention and native
+    /// macOS Command shortcuts. Generated-result Copy is intentionally exact
+    /// Command+C only. Extra Shift/Option or Control+Command combinations
     /// remain host shortcuts and are never reinterpreted.
     static func shortcut(keycode: Int32?, mask: Int32) -> BufferClipboardShortcut? {
         let primary = mask & (RimeKey.controlMask | RimeKey.superMask)
@@ -148,6 +166,8 @@ enum BufferClipboardShortcutRules {
         switch keycode {
         case 0x61: return .selectAll
         case 0x76: return .paste
+        case 0x63 where mask == RimeKey.superMask:
+            return .copyGeneratedResult
         default: return nil
         }
     }
@@ -156,12 +176,22 @@ enum BufferClipboardShortcutRules {
 enum BufferClipboardPhysicalShortcutRules {
     static func shortcut(aKeyDown: Bool,
                          vKeyDown: Bool,
+                         cKeyDown: Bool = false,
                          mask: Int32) -> BufferClipboardShortcut? {
-        // A simultaneous A+V snapshot is ambiguous and must never turn an
+        // A simultaneous A/V/C snapshot is ambiguous and must never turn an
         // unrelated Cocoa command into a workbench edit.
-        guard aKeyDown != vKeyDown else { return nil }
+        let keysDown = [aKeyDown, vKeyDown, cKeyDown].filter { $0 }
+        guard keysDown.count == 1 else { return nil }
+        let keycode: Int32
+        if aKeyDown {
+            keycode = 0x61
+        } else if vKeyDown {
+            keycode = 0x76
+        } else {
+            keycode = 0x63
+        }
         return BufferClipboardShortcutRules.shortcut(
-            keycode: aKeyDown ? 0x61 : 0x76,
+            keycode: keycode,
             mask: mask
         )
     }
@@ -176,6 +206,13 @@ enum BufferClipboardCommandRules {
             return .selectAll
         case "paste:":
             return .paste
+        case "copy:":
+            // Unlike Select All and Paste, generated-result copying is owned
+            // only by the exact physical Command+C gesture. A native Copy
+            // callback without that live chord remains the host's action.
+            return physicalShortcut == .copyGeneratedResult
+                ? .copyGeneratedResult
+                : nil
         // Cocoa's standard key-binding dictionary translates physical
         // Control+A/V before some native clients offer the event to IMK.
         // Require the matching live physical chord so real navigation keys
@@ -552,6 +589,7 @@ final class RimeBufferController: IMKInputController {
     private var lastModifiers: NSEvent.ModifierFlags = []
     private var shiftGesture: ShiftModifierGesture?
     private var focusToken: FocusToken?
+    private var clipboardSearchOwnerToken: FocusToken?
     private var lastBufferBackspaceKeyHandledAt: CFAbsoluteTime = 0
     private var lastBufferBackspaceCommandHandledAt: CFAbsoluteTime = 0
     private var lastBufferEnterKeyHandledAt: CFAbsoluteTime = 0
@@ -571,6 +609,7 @@ final class RimeBufferController: IMKInputController {
     private var bufferClipboardShortcutKeysDown = Set<UInt16>()
     private var lastBufferClipboardShortcutHandledAt: CFAbsoluteTime = 0
     private var lastBufferClipboardShortcutHandled: BufferClipboardShortcut?
+    private var lastBufferClipboardShortcutClientIdentity: ObjectIdentifier?
     private var lastWorkbenchEscapeHandledAt: CFAbsoluteTime = 0
     private var lastWorkbenchEscapeClientIdentity: ObjectIdentifier?
     private var bufferEnterPending = false
@@ -605,8 +644,7 @@ final class RimeBufferController: IMKInputController {
     private var pendingFlyChordBase: (context: RimeContextModel,
                                       policy: FlyChordSettlementPolicy,
                                       owner: FocusToken,
-                                      clientIdentity: ObjectIdentifier,
-                                      protectedDelivery: Bool)?
+                                      clientIdentity: ObjectIdentifier)?
     private var mutualPairingState = FlyChordMutualPairingState()
     private var chordDurationObserver: NSObjectProtocol?
     private var chordExtensionObserver: NSObjectProtocol?
@@ -761,6 +799,11 @@ final class RimeBufferController: IMKInputController {
         return bufferControlDisposition(client: client)
     }
 
+    private var generatedResultCopyAvailable: Bool {
+        !IsSecureEventInputEnabled()
+            && BufferWindowController.shared.canCopyGeneratedResult
+    }
+
     private func bufferPluginShortcutDisposition(client: IMKTextInput?)
         -> BufferControlDisposition {
         // A protected workbench must neither reveal nor activate a plugin;
@@ -777,6 +820,35 @@ final class RimeBufferController: IMKInputController {
             && (externalTarget ?? !isOwnClient(client))
     }
 
+    private func shouldCaptureClipboardSearchCommit(from client: IMKTextInput) -> Bool {
+        guard !IsSecureEventInputEnabled(), let focusToken else { return false }
+        let captures = ClipboardHistoryWindowController.shared.capturesSearchInput(
+            expected: focusToken,
+            client: client
+        )
+        if captures { clipboardSearchOwnerToken = focusToken }
+        return captures
+    }
+
+    @discardableResult
+    private func appendClipboardSearchCommit(
+        _ text: String,
+        client: IMKTextInput
+    ) -> Bool {
+        guard let focusToken,
+              ClipboardHistoryWindowController.shared.appendSearchText(
+                text,
+                expected: focusToken,
+                client: client
+              ) else { return false }
+        BufferWindowController.shared.clearInlineComposition(owner: focusToken)
+        candidateWindow.hide(owner: focusToken)
+        clearCompositionPresentation(client: client)
+        publishCompositionActive(false)
+        IMELog.write("clipboard search commit accepted characters=\(text.count)")
+        return true
+    }
+
     private func withForcedBufferCapture<T>(_ body: () -> T) -> T {
         forcedBufferCaptureDepth += 1
         defer { forcedBufferCaptureDepth -= 1 }
@@ -791,6 +863,7 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func clearCompositionPresentation(client: IMKTextInput) {
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
         if let focusToken {
             BufferWindowController.shared.clearInlineComposition(owner: focusToken)
         }
@@ -837,6 +910,21 @@ final class RimeBufferController: IMKInputController {
                 return false
             }
         }
+        // Keep the host marked-text transaction intact for `insertText`, but
+        // retire every auxiliary projection first. IMK client calls may
+        // synchronously re-enter this controller after the committed text is
+        // already visible; at that point the old candidate state must be gone.
+        CommitPresentationRetirement.perform(
+            owner: frozenLease?.token,
+            clearInline: { owner in
+                BufferWindowController.shared.clearInlineComposition(
+                    owner: owner
+                )
+            },
+            hideCandidates: { owner in
+                candidateWindow.hide(owner: owner)
+            }
+        )
         guard Delivery.insert(text, into: client) else {
             clearCompositionPresentation(client: client)
             return false
@@ -886,9 +974,10 @@ final class RimeBufferController: IMKInputController {
     }
 
     /// Native AppKit clients may send a command-only callback with a nil or
-    /// non-client sender after translating Control+A/V through the standard
-    /// key-binding dictionary. Recover only for a matching live physical chord
-    /// and a fully revalidated current lease/controller client identity.
+    /// non-client sender after translating Control+A/V or Command+C through
+    /// the standard key-binding dictionary. Recover only for a matching live
+    /// physical chord and a fully revalidated current lease/controller client
+    /// identity.
     private func currentClipboardCommandClient(
         _ sender: Any?,
         shortcut: BufferClipboardShortcut,
@@ -1162,6 +1251,7 @@ final class RimeBufferController: IMKInputController {
     /// librime session. If that session disappears, neither may outlive it.
     private func clearTransientCompositionAfterSessionFailure() {
         guard let focusToken else { return }
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
         BufferWindowController.shared.clearInlineComposition(owner: focusToken)
         candidateWindow.hide(owner: focusToken)
     }
@@ -1483,9 +1573,20 @@ final class RimeBufferController: IMKInputController {
                                     owner: FocusToken?,
                                     externalTarget: Bool? = nil,
                                     isolateChordClientRouting: Bool = false) {
-        if let owner {
-            BufferWindowController.shared.clearInlineComposition(owner: owner)
-        }
+        // `owner` may already be displaced from the coordinator. Retire that
+        // exact lease's projections before commit-on-blur can call the old
+        // client; owner-scoped cleanup cannot erase the replacement focus.
+        CommitPresentationRetirement.perform(
+            owner: owner,
+            clearInline: { owner in
+                BufferWindowController.shared.clearInlineComposition(
+                    owner: owner
+                )
+            },
+            hideCandidates: { owner in
+                candidateWindow.hide(owner: owner)
+            }
+        )
         if let client {
             let frozenLease = currentLease(matching: client)
             let requiresTransientSurfaceGate = frozenLease.map {
@@ -1591,6 +1692,105 @@ final class RimeBufferController: IMKInputController {
                            externalTarget: target.isExternalTarget)
     }
 
+    /// Exact-target delivery used by the standalone Clipboard History window.
+    /// The window retains only a FocusToken; this method resolves any remaining
+    /// composition, revalidates the same lease/client, then enters the sole
+    /// Delivery.insert path without mutating BufferModel.
+    @discardableResult
+    func deliverClipboardHistoryText(
+        _ text: String,
+        expected token: FocusToken
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !text.isEmpty,
+              !IsSecureEventInputEnabled(),
+              focusToken == token,
+              let initial = InputFocusCoordinator.shared.liveTarget(
+                expected: token,
+                forceOverlayVisibilityRefresh: true
+              ),
+              initial.controller === self,
+              initial.isExternalTarget,
+              let initialClient = initial.client,
+              ObjectIdentifier(initialClient as AnyObject)
+                == initial.clientIdentity else { return false }
+
+        if initial.compositionActive || composition.composing || chord.hasPending {
+            resolveCompositionForWorkbenchTransition(target: initial)
+        }
+
+        guard !IsSecureEventInputEnabled(),
+              focusToken == token,
+              let current = InputFocusCoordinator.shared.liveTarget(
+                expected: token,
+                forceOverlayVisibilityRefresh: true
+              ),
+              current === initial,
+              current.controller === self,
+              current.isExternalTarget,
+              let client = current.client,
+              ObjectIdentifier(client as AnyObject) == current.clientIdentity else {
+            return false
+        }
+        let delivered = deliverDirectText(
+            text,
+            client: client,
+            externalTarget: true
+        )
+        if delivered,
+           InputFocusCoordinator.shared.liveTarget(
+            expected: token,
+            forceOverlayVisibilityRefresh: true
+           ) === current {
+            updateUI(client: client)
+        }
+        return delivered
+    }
+
+    /// Clipboard History owns a logical search field while leaving the real
+    /// host client focused. These probes let the window defer editing keys to
+    /// librime only while that exact search composition is alive.
+    func clipboardSearchCompositionIsActive(
+        expected token: FocusToken,
+        client: IMKTextInput
+    ) -> Bool {
+        guard focusToken == token,
+              shouldCaptureClipboardSearchCommit(from: client) else {
+            return false
+        }
+        if chord.hasPending || composition.composing { return true }
+        guard session != 0, rimeEngine.isHealthy else { return false }
+        let context = rimeEngine.getContext(session: session)
+        return context.active || !context.input.isEmpty || !context.preedit.isEmpty
+    }
+
+    /// Closing/protecting the standalone search surface discards its unfinished
+    /// query composition. It never commits that text into the external field.
+    func cancelClipboardSearchComposition(expected token: FocusToken) {
+        guard clipboardSearchOwnerToken == token else { return }
+        clipboardSearchOwnerToken = nil
+        chord.invalidate()
+        pendingFlyChordBase = nil
+        mutualPairingState.reset()
+        if session != 0 {
+            rimeEngine.clearComposition(session: session)
+        }
+        if !IsSecureEventInputEnabled(),
+           let lease = InputFocusCoordinator.shared.interactionTarget(
+                expected: token
+           ),
+           lease.controller === self,
+           let client = lease.client,
+           ObjectIdentifier(client as AnyObject) == lease.clientIdentity {
+            clearCompositionPresentation(client: client)
+        } else {
+            composition.markCleared()
+        }
+        InputFocusCoordinator.shared.setCompositionActive(false, token: token)
+        candidateWindow.hide(owner: token)
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
+    }
+
     // MARK: Key routing
 
     override func recognizedEvents(_ sender: Any!) -> Int {
@@ -1599,6 +1799,56 @@ final class RimeBufferController: IMKInputController {
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, let client = sender as? IMKTextInput else { return false }
+        if ClipboardHistoryHostPasteRules.isTaggedPasteEvent(event) {
+            let focusAdopted = adoptEventFocus(
+                client: client,
+                eventTimestamp: event.timestamp,
+                eventType: event.type
+            )
+            return ClipboardHistoryWindowController.shared
+                .routeSyntheticHostPaste(
+                    event,
+                    client: client,
+                    controller: self,
+                    focusAdopted: focusAdopted
+                ) ?? true
+        }
+        if event.type == .keyDown,
+           !event.isARepeat {
+            // Any fresh physical press retires missing-release debt for that
+            // key before another logical surface gets first refusal.
+            bufferClipboardShortcutKeysDown.remove(event.keyCode)
+            if lastBufferClipboardShortcutHandled == .copyGeneratedResult {
+                lastBufferClipboardShortcutHandled = nil
+                lastBufferClipboardShortcutHandledAt = 0
+                lastBufferClipboardShortcutClientIdentity = nil
+            }
+        }
+        if event.type == .keyDown,
+           event.isARepeat,
+           bufferClipboardShortcutKeysDown.contains(event.keyCode) {
+            IMELog.write("buffer clipboard owned repeat consumed before routing")
+            return true
+        }
+        if event.type == .keyUp,
+           bufferClipboardShortcutKeysDown.remove(event.keyCode) != nil {
+            // Copy closes Buffer synchronously. Consume its already-owned
+            // release before focus adoption or a newly visible surface can
+            // reinterpret it.
+            IMELog.write("buffer clipboard owned keyUp consumed before routing")
+            return true
+        }
+        if event.type == .keyUp {
+            switch ClipboardHistoryWindowController.shared.route(
+                event,
+                client: client
+            ) {
+            case .handledBySurface:
+                return true
+            case .routeToRime, .passThrough:
+                break
+            }
+        }
         guard adoptEventFocus(client: client,
                               eventTimestamp: event.timestamp,
                               eventType: event.type) else {
@@ -1644,15 +1894,28 @@ final class RimeBufferController: IMKInputController {
                 }
             }
             if event.type == .keyDown || event.type == .keyUp {
-                if BufferClipboardShortcutRules.shortcut(
+                if event.type == .keyUp,
+                   bufferClipboardShortcutKeysDown.remove(event.keyCode) != nil {
+                    IMELog.write("buffer clipboard keyUp consumed after stale event")
+                    return true
+                }
+                if let shortcut = BufferClipboardShortcutRules.shortcut(
                     keycode: keysym(for: event),
                     mask: RimeKey.modifierMask(from: event.modifierFlags)
-                ) != nil,
+                ), (shortcut != .copyGeneratedResult
+                    || generatedResultCopyAvailable),
                    bufferClipboardDisposition(client: client) != .passThrough {
-                    bufferClipboardShortcutKeysDown.remove(event.keyCode)
-                    BufferModel.shared.clearAllContentSelection()
-                    if streamInputModeSelected {
-                        StreamInputWorkspace.shared.authorityRejected()
+                    if shortcut == .copyGeneratedResult {
+                        if event.type == .keyDown {
+                            bufferClipboardShortcutKeysDown.insert(event.keyCode)
+                            noteGeneratedResultCopyHandled(client: client)
+                        }
+                    } else {
+                        bufferClipboardShortcutKeysDown.remove(event.keyCode)
+                        BufferModel.shared.clearAllContentSelection()
+                        if streamInputModeSelected {
+                            StreamInputWorkspace.shared.authorityRejected()
+                        }
                     }
                     IMELog.write("buffer clipboard shortcut consumed after stale event")
                     return true
@@ -1736,6 +1999,19 @@ final class RimeBufferController: IMKInputController {
                 return true
             }
             return false
+        }
+        if event.type == .keyDown {
+            switch ClipboardHistoryWindowController.shared.route(
+                event,
+                client: client
+            ) {
+            case .handledBySurface:
+                return true
+            case .routeToRime:
+                return handleClipboardSearchKeyDown(event, client: client)
+            case .passThrough:
+                break
+            }
         }
         if event.type == .keyDown,
            isBufferDeliveryShortcut(event),
@@ -1846,10 +2122,11 @@ final class RimeBufferController: IMKInputController {
         if bufferClipboardShortcutKeysDown.remove(event.keyCode) != nil {
             return true
         }
-        if BufferClipboardShortcutRules.shortcut(
+        if let shortcut = BufferClipboardShortcutRules.shortcut(
             keycode: keycode,
             mask: RimeKey.modifierMask(from: event.modifierFlags)
-        ) != nil,
+        ), (shortcut != .copyGeneratedResult
+            || generatedResultCopyAvailable),
            bufferClipboardDisposition(client: client) != .passThrough {
             return true
         }
@@ -1942,6 +2219,101 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
+    /// Dedicated logical-search route for the standalone Clipboard window.
+    /// It intentionally bypasses every Buffer plug-in, stream-input, delivery,
+    /// and workbench-navigation branch while reusing the current Rime session,
+    /// candidate selection, and exact focus lease.
+    private func handleClipboardSearchKeyDown(
+        _ event: NSEvent,
+        client: IMKTextInput
+    ) -> Bool {
+        guard let eventLease = currentLease(matching: client),
+              ClipboardHistoryWindowController.shared.capturesSearchInput(
+                expected: eventLease.token,
+                client: client
+              ) else {
+            IMELog.write("clipboard search key consumed after authority changed")
+            return true
+        }
+
+        if event.modifierFlags.contains(.shift) {
+            shiftGesture?.noteModifierUse()
+        }
+        publishTelemetryKey(event, client: client)
+
+        if let shiftedText = shiftedDirectText(for: event) {
+            _ = rimeEngine.start()
+            _ = ensureSessionReady()
+            return insertDirectText(
+                shiftedText,
+                client: client,
+                source: "clipboard search shift",
+                expectedLease: eventLease
+            )
+        }
+
+        guard rimeEngine.start(), ensureSessionReady() else {
+            // Only literal text has a meaningful engine-down fallback in the
+            // logical search field. Cocoa function-key characters must remain
+            // navigation commands rather than invisible query content.
+            if ClipboardHistoryWindowController.isPlainSearchInputEvent(event) {
+                _ = rawFallback(
+                    event,
+                    client: client,
+                    expectedLease: eventLease
+                )
+            }
+            return true
+        }
+        guard let keycode = keysym(for: event) else {
+            if let text = event.characters,
+               ClipboardHistoryWindowController.isPlainSearchInputEvent(event),
+               ClipboardHistoryWindowController.isLiteralSearchText(text) {
+                _ = insertDirectText(
+                    text,
+                    client: client,
+                    source: "clipboard search unmapped",
+                    expectedLease: eventLease
+                )
+            }
+            return true
+        }
+        let mask = RimeKey.modifierMask(from: event.modifierFlags)
+        let commandMask = RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask
+
+        if keycode == RimeKey.return,
+           mask & commandMask == 0,
+           commitRawInput(client: client) {
+            return true
+        }
+        if mask == 0, handleCandidateKey(keycode, client: client) {
+            return true
+        }
+
+        let handled = processRimeKey(keycode, mask: mask, client: client)
+        if handled { return true }
+        if captureUnhandledPrintableIfNeeded(
+            event,
+            client: client,
+            expectedLease: eventLease
+        ) {
+            return true
+        }
+        if let text = event.characters,
+           ClipboardHistoryWindowController.isPlainSearchInputEvent(event),
+           ClipboardHistoryWindowController.isLiteralSearchText(text) {
+            _ = insertDirectText(
+                text,
+                client: client,
+                source: "clipboard search printable fallback",
+                expectedLease: eventLease
+            )
+        }
+        // A key routed to the logical search field never falls through to the
+        // still-focused host, even if the engine rejects it during a race.
+        return true
+    }
+
     private func handleKeyDown(_ event: NSEvent, client: IMKTextInput) -> Bool {
         // Freeze the lease adopted for this physical event before any Rime/UI
         // callback can synchronously reenter and move the same IMK proxy to a
@@ -1971,33 +2343,63 @@ final class RimeBufferController: IMKInputController {
             keycode: routedKeycode,
             mask: routedMask
         ) {
+            if event.isARepeat,
+               bufferClipboardShortcutKeysDown.contains(event.keyCode) {
+                IMELog.write("buffer clipboard shortcut repeat consumed")
+                return true
+            }
+            if !event.isARepeat {
+                // A definite new press retires key-up ownership from a host
+                // that omitted the preceding release callback.
+                bufferClipboardShortcutKeysDown.remove(event.keyCode)
+            }
+            if shortcut == .copyGeneratedResult,
+               !generatedResultCopyAvailable {
+                // A normal source rail has no generated target to copy. Leave
+                // the exact Command+C entirely to the host without settling or
+                // otherwise mutating Buffer composition.
+                return false
+            }
             switch bufferClipboardDisposition(client: client) {
             case .passThrough:
-                if IsSecureEventInputEnabled() || isOwnClient(client) {
+                if shortcut == .copyGeneratedResult
+                    || IsSecureEventInputEnabled()
+                    || isOwnClient(client) {
                     return false
                 }
                 break
             case .consumeOnly:
                 bufferClipboardShortcutKeysDown.insert(event.keyCode)
-                BufferModel.shared.clearAllContentSelection()
-                if streamInputModeSelected {
-                    StreamInputWorkspace.shared.authorityRejected()
+                if shortcut == .copyGeneratedResult {
+                    noteGeneratedResultCopyHandled(client: client)
+                } else {
+                    BufferModel.shared.clearAllContentSelection()
+                    if streamInputModeSelected {
+                        StreamInputWorkspace.shared.authorityRejected()
+                    }
                 }
                 IMELog.write("buffer clipboard shortcut consumed without authority")
                 return true
             case .executeBufferAction:
                 bufferClipboardShortcutKeysDown.insert(event.keyCode)
-                if event.isARepeat {
-                    IMELog.write("buffer clipboard shortcut repeat consumed")
-                    return true
+                if shortcut == .copyGeneratedResult {
+                    // Arm duplicate-command suppression before the copy.
+                    // A successful action closes Buffer synchronously, so
+                    // recording ownership afterward would be too late for
+                    // a re-entrant `copy:` callback from the host.
+                    noteGeneratedResultCopyHandled(client: client)
                 }
                 _ = performBufferClipboardShortcut(
                     shortcut,
                     client: client,
                     expectedLease: eventLease
                 )
-                lastBufferClipboardShortcutHandledAt = CFAbsoluteTimeGetCurrent()
-                lastBufferClipboardShortcutHandled = shortcut
+                if shortcut != .copyGeneratedResult {
+                    lastBufferClipboardShortcutHandledAt =
+                        CFAbsoluteTimeGetCurrent()
+                    lastBufferClipboardShortcutHandled = shortcut
+                    lastBufferClipboardShortcutClientIdentity = nil
+                }
                 return true
             }
         }
@@ -2297,8 +2699,12 @@ final class RimeBufferController: IMKInputController {
                     expected: lease.token
                 ) === lease
         } ?? false
-        let captureAuthorized = expectedLease.map {
-            BufferModel.shared.capturesInput(for: $0.token)
+        let captureAuthorized = expectedLease.map { lease in
+            BufferModel.shared.capturesInput(for: lease.token)
+                || ClipboardHistoryWindowController.shared.capturesSearchInput(
+                    expected: lease.token,
+                    client: client
+                )
         } ?? false
         if BufferModel.shared.active,
            expectedLease?.isExternalTarget == true,
@@ -2452,12 +2858,6 @@ final class RimeBufferController: IMKInputController {
                                                 hardwareKeyCode: hardwareKeyCode)
             return true
         }
-        if handleWorkbenchProtectedDeliveryBufferEnterIfNeeded(
-            client: client,
-            hardwareKeyCode: hardwareKeyCode
-        ) {
-            return true
-        }
         if handleWorkbenchManualGenerationBufferEnterIfNeeded(
             client: client,
             hardwareKeyCode: hardwareKeyCode
@@ -2466,45 +2866,6 @@ final class RimeBufferController: IMKInputController {
         }
         beginBufferEnterGesture(client: client,
                                 hardwareKeyCode: hardwareKeyCode)
-        return true
-    }
-
-    /// Protected Capsule results use the ordinary Return gesture, but Return
-    /// starts only the local authorization prompt. No password plaintext is
-    /// exposed to the shared delivery coordinator before that prompt succeeds.
-    private func handleWorkbenchProtectedDeliveryBufferEnterIfNeeded(
-        client: IMKTextInput,
-        hardwareKeyCode: UInt16
-    ) -> Bool {
-        guard let controls = WorkbenchProtectedDeliveryRouter.selectedControls,
-              controls.canRequestProtectedDelivery
-                || controls.protectedDeliveryPromptActive else {
-            return false
-        }
-        suppressBufferEnterForImmediateAction(
-            client: client,
-            hardwareKeyCode: hardwareKeyCode
-        )
-        if controls.protectedDeliveryPromptActive {
-            updateUI(client: client)
-            BufferWindowController.shared.refresh()
-            return true
-        }
-        guard let lease = currentLease(matching: client),
-              InputFocusCoordinator.shared.liveTarget(
-                expected: lease.token,
-                forceOverlayVisibilityRefresh: true
-              ) === lease,
-              controls.requestProtectedDelivery(target: lease) else {
-            NSSound.beep()
-            IMELog.write("capsule protected delivery prompt rejected")
-            updateUI(client: client)
-            BufferWindowController.shared.refresh()
-            return true
-        }
-        IMELog.write("capsule protected delivery prompt opened")
-        updateUI(client: client)
-        BufferWindowController.shared.refresh()
         return true
     }
 
@@ -2560,10 +2921,6 @@ final class RimeBufferController: IMKInputController {
             switch result {
             case .inlineStarted:
                 IMELog.write("buffer enter requested inline AI generation")
-            case .mailboxStarted:
-                IMELog.write("buffer enter handed AI generation to Mailbox")
-                BufferWindowController.shared.closeAndPause()
-                return true
             case .rejected:
                 NSSound.beep()
                 IMELog.write("buffer enter AI generation rejected")
@@ -2714,6 +3071,20 @@ final class RimeBufferController: IMKInputController {
 
     override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
         guard let selector else { return false }
+        if let handled = ClipboardHistoryWindowController.shared
+            .routeSyntheticHostPasteCommand(
+                selector,
+                client: sender as? IMKTextInput,
+                controller: self
+            ) {
+            return handled
+        }
+        if ClipboardHistoryWindowController.shared.consumeCommandIfRecentlyHandled(
+            selector,
+            client: sender as? IMKTextInput
+        ) {
+            return true
+        }
         let newlineCommand = isInsertNewlineSelector(selector)
         let callbackClient = currentCallbackClient(sender)
         let explicitClientMismatch = sender is IMKTextInput && callbackClient == nil
@@ -2748,18 +3119,31 @@ final class RimeBufferController: IMKInputController {
                 return true
             }
         }
+        if recentlyHandledGeneratedResultCopyCommand(selector, sender: sender) {
+            IMELog.write("buffer generated-result copy command consumed after owned keyDown")
+            return true
+        }
         let physicalClipboardShortcut = physicalBufferClipboardShortcut()
         if let shortcut = bufferClipboardShortcut(
             for: selector,
             physicalShortcut: physicalClipboardShortcut
         ) {
+            if shortcut == .copyGeneratedResult,
+               !generatedResultCopyAvailable {
+                return false
+            }
             let clipboardClient = callbackClient
                 ?? currentClipboardCommandClient(
                     sender,
                     shortcut: shortcut,
                     physicalShortcut: physicalClipboardShortcut
                 )
-            if !bufferClipboardShortcutKeysDown.isEmpty {
+            let hasOwnedKeyDown = shortcut == .copyGeneratedResult
+                ? bufferClipboardShortcutKeysDown.contains(
+                    UInt16(kVK_ANSI_C)
+                  )
+                : !bufferClipboardShortcutKeysDown.isEmpty
+            if hasOwnedKeyDown {
                 IMELog.write("buffer clipboard command consumed after owned keyDown")
                 return true
             }
@@ -2767,25 +3151,48 @@ final class RimeBufferController: IMKInputController {
             case .passThrough:
                 return false
             case .consumeOnly:
-                BufferModel.shared.clearAllContentSelection()
-                if streamInputModeSelected {
-                    StreamInputWorkspace.shared.authorityRejected()
+                if shortcut == .copyGeneratedResult {
+                    bufferClipboardShortcutKeysDown.insert(
+                        UInt16(kVK_ANSI_C)
+                    )
+                    noteGeneratedResultCopyHandled(client: clipboardClient)
+                } else {
+                    BufferModel.shared.clearAllContentSelection()
+                    if streamInputModeSelected {
+                        StreamInputWorkspace.shared.authorityRejected()
+                    }
                 }
                 IMELog.write("buffer clipboard command consumed without authority")
                 return true
             case .executeBufferAction:
-                let duplicate = lastBufferClipboardShortcutHandled == shortcut
-                    && CFAbsoluteTimeGetCurrent()
-                        - lastBufferClipboardShortcutHandledAt
-                            < Self.duplicateClipboardCommandWindow
+                // A command-only Command+C fallback has no owned keyDown yet.
+                // `recentlyHandledGeneratedResultCopyCommand` already removes
+                // the true late callback above, so a live physical chord here
+                // is a fresh press even when the user copies twice rapidly.
+                let duplicate = shortcut == .copyGeneratedResult
+                    ? false
+                    : lastBufferClipboardShortcutHandled == shortcut
+                        && CFAbsoluteTimeGetCurrent()
+                            - lastBufferClipboardShortcutHandledAt
+                                < Self.duplicateClipboardCommandWindow
                 if !duplicate, let client = clipboardClient {
+                    if shortcut == .copyGeneratedResult {
+                        bufferClipboardShortcutKeysDown.insert(
+                            UInt16(kVK_ANSI_C)
+                        )
+                        noteGeneratedResultCopyHandled(client: client)
+                    }
                     _ = performBufferClipboardShortcut(
                         shortcut,
                         client: client,
                         expectedLease: currentLease(matching: client)
                     )
-                    lastBufferClipboardShortcutHandledAt = CFAbsoluteTimeGetCurrent()
-                    lastBufferClipboardShortcutHandled = shortcut
+                    if shortcut != .copyGeneratedResult {
+                        lastBufferClipboardShortcutHandledAt =
+                            CFAbsoluteTimeGetCurrent()
+                        lastBufferClipboardShortcutHandled = shortcut
+                        lastBufferClipboardShortcutClientIdentity = nil
+                    }
                 }
                 return true
             }
@@ -3057,6 +3464,7 @@ final class RimeBufferController: IMKInputController {
         if flags.contains(.maskControl) { mask |= RimeKey.controlMask }
         if flags.contains(.maskAlternate) { mask |= RimeKey.altMask }
         if flags.contains(.maskCommand) { mask |= RimeKey.superMask }
+        if flags.contains(.maskAlphaShift) { mask |= RimeKey.lockMask }
         return BufferClipboardPhysicalShortcutRules.shortcut(
             aKeyDown: CGEventSource.keyState(
                 .combinedSessionState,
@@ -3066,8 +3474,49 @@ final class RimeBufferController: IMKInputController {
                 .combinedSessionState,
                 key: CGKeyCode(9)
             ),
+            cKeyDown: CGEventSource.keyState(
+                .combinedSessionState,
+                key: CGKeyCode(kVK_ANSI_C)
+            ),
             mask: mask
         )
+    }
+
+    private func recentlyHandledGeneratedResultCopyCommand(
+        _ selector: Selector,
+        sender: Any?
+    ) -> Bool {
+        guard NSStringFromSelector(selector) == "copy:",
+              lastBufferClipboardShortcutHandled == .copyGeneratedResult,
+              CFAbsoluteTimeGetCurrent()
+                - lastBufferClipboardShortcutHandledAt
+                    < Self.duplicateClipboardCommandWindow else {
+            return false
+        }
+        if let expectedIdentity = lastBufferClipboardShortcutClientIdentity,
+           let client = sender as? IMKTextInput,
+           expectedIdentity != ObjectIdentifier(client as AnyObject) {
+            return false
+        }
+        // If C is physically down but this controller does not own its keyDown,
+        // this is a fresh command-only fallback rather than a late callback
+        // from the copied-and-closed press.
+        let cKeyCode = UInt16(kVK_ANSI_C)
+        if CGEventSource.keyState(
+            .combinedSessionState,
+            key: CGKeyCode(kVK_ANSI_C)
+        ), !bufferClipboardShortcutKeysDown.contains(cKeyCode) {
+            return false
+        }
+        return true
+    }
+
+    private func noteGeneratedResultCopyHandled(client: IMKTextInput?) {
+        lastBufferClipboardShortcutHandledAt = CFAbsoluteTimeGetCurrent()
+        lastBufferClipboardShortcutHandled = .copyGeneratedResult
+        lastBufferClipboardShortcutClientIdentity = client.map {
+            ObjectIdentifier($0 as AnyObject)
+        }
     }
 
     private func physicalBufferPluginSwitchDirection() -> Int? {
@@ -3200,7 +3649,16 @@ final class RimeBufferController: IMKInputController {
         streamAlternativeNavigationKeysDown.removeAll()
         derivedResultNavigationKeysDown.removeAll()
         bufferPluginNavigationKeysDown.removeAll()
+        let copyKeyCode = UInt16(kVK_ANSI_C)
+        let preservesGeneratedCopyRelease =
+            bufferClipboardShortcutKeysDown.contains(copyKeyCode)
         bufferClipboardShortcutKeysDown.removeAll()
+        if preservesGeneratedCopyRelease {
+            // Copy may synchronously close Buffer and revoke its capture lease.
+            // The already-owned physical release must still not leak into the
+            // newly direct host route.
+            bufferClipboardShortcutKeysDown.insert(copyKeyCode)
+        }
     }
 
     /// End delivery/hold tracking only. Callback ownership is intentionally not
@@ -3514,8 +3972,16 @@ final class RimeBufferController: IMKInputController {
             rimeEngine.clearComposition(session: session)
         }
 
+        let capturesInClipboardSearch = shouldCaptureClipboardSearchCommit(
+            from: resolvedClient
+        )
         let capturesInBuffer = shouldCaptureCommit(from: resolvedClient)
-        if capturesInBuffer {
+        if capturesInClipboardSearch {
+            guard appendClipboardSearchCommit(text, client: resolvedClient) else {
+                IMELog.write("candidate single-character clipboard search commit rejected")
+                return true
+            }
+        } else if capturesInBuffer {
             if let focusToken {
                 BufferWindowController.shared.clearInlineComposition(owner: focusToken)
                 candidateWindow.hide(owner: focusToken)
@@ -3673,12 +4139,20 @@ final class RimeBufferController: IMKInputController {
                 expected: lease.token
               ) === lease,
               focusToken == lease.token else {
-            BufferModel.shared.clearAllContentSelection()
-            if streamInputModeSelected {
-                StreamInputWorkspace.shared.authorityRejected()
+            if shortcut != .copyGeneratedResult {
+                BufferModel.shared.clearAllContentSelection()
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
             }
             IMELog.write("buffer clipboard shortcut rejected before source access")
             return true
+        }
+
+        if shortcut == .copyGeneratedResult {
+            return BufferWindowController.shared.copyGeneratedResultAndClose(
+                expectedToken: lease.token
+            )
         }
 
         cancelBufferEnterActionForSourceEditing()
@@ -3784,6 +4258,9 @@ final class RimeBufferController: IMKInputController {
             } else {
                 _ = BufferModel.shared.insertPastedText(text)
             }
+        case .copyGeneratedResult:
+            // Handled above before any source-editing or pasteboard-read path.
+            break
         }
 
         IMELog.write("buffer clipboard shortcut handled action=\(shortcut)")
@@ -3888,17 +4365,21 @@ final class RimeBufferController: IMKInputController {
         // Secure fields keep native host handling. If secure input appears
         // later in this transaction, fail closed instead of retaining text.
         guard !IsSecureEventInputEnabled() else { return false }
+        let capturesInClipboardSearch = shouldCaptureClipboardSearchCommit(
+            from: client
+        )
         let capturesInBuffer = expectedLease.map {
             $0.isExternalTarget
                 && BufferModel.shared.capturesInput(for: $0.token)
         } ?? false
         if BufferModel.shared.enabled,
            !capturesInBuffer,
+           !capturesInClipboardSearch,
            !isOwnClient(client) {
             IMELog.write("\(source) text consumed; no adopted external buffer lease")
             return true
         }
-        if capturesInBuffer {
+        if capturesInBuffer || capturesInClipboardSearch {
             guard let expectedLease,
                   expectedLease.controller === self,
                   expectedLease.clientIdentity == ObjectIdentifier(client as AnyObject),
@@ -3906,7 +4387,7 @@ final class RimeBufferController: IMKInputController {
                     expected: expectedLease.token
                   ) === expectedLease,
                   focusToken == expectedLease.token else {
-                IMELog.write("\(source) text consumed; adopted buffer lease changed")
+                IMELog.write("\(source) text consumed; adopted logical-input lease changed")
                 return true
             }
         }
@@ -3918,7 +4399,18 @@ final class RimeBufferController: IMKInputController {
             }
         }
 
-        if capturesInBuffer {
+        if capturesInClipboardSearch {
+            guard !IsSecureEventInputEnabled(),
+                  let expectedLease,
+                  InputFocusCoordinator.shared.interactionTarget(
+                    expected: expectedLease.token
+                  ) === expectedLease,
+                  focusToken == expectedLease.token,
+                  appendClipboardSearchCommit(text, client: client) else {
+                IMELog.write("\(source) text consumed; clipboard search lease changed")
+                return true
+            }
+        } else if capturesInBuffer {
             guard let expectedLease,
                   !IsSecureEventInputEnabled(),
                   InputFocusCoordinator.shared.interactionTarget(
@@ -4006,30 +4498,15 @@ final class RimeBufferController: IMKInputController {
         let hasCommandModifier = mask & (
             RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask
         ) != 0
-        let capsuleUnlockChordKey = isPress
-            && !hasCommandModifier
-            && CapsuleWorkspace.shared.acceptsUnlockChordKey(keycode)
-        let capsulePromptActive = CapsuleWorkspace.shared
-            .protectedDeliveryPromptActive
         let isChordKey = isPress
             && !hasCommandModifier
             && RimeKey.isChordingKey(keycode)
-            && (capsulePromptActive
-                ? capsuleUnlockChordKey
-                : chordGated)
+            && chordGated
         // Prototype semantics: a PRESS of a non-chord key resolves the pending
         // chord before processing; release events never pre-flush.
         if isPress, !isChordKey {
             chord.flush()
             mutualPairingState.reset()
-            if capsulePromptActive, !hasCommandModifier,
-               CapsuleWorkspace.shared.rejectProtectedDeliveryInput() {
-                IMELog.write("capsule protected delivery input rejected")
-                NSSound.beep()
-                updateUI(client: client)
-                BufferWindowController.shared.refresh()
-                return true
-            }
         }
 
         if isChordKey {
@@ -4039,15 +4516,12 @@ final class RimeBufferController: IMKInputController {
                     IMELog.write("FlyYao press rejected without a focus owner")
                     return false
                 }
-                let policy: FlyChordSettlementPolicy = capsuleUnlockChordKey
-                    ? .sameBatchOnly
-                    : flyChordSettlementPolicy
+                let policy = flyChordSettlementPolicy
                 pendingFlyChordBase = (
                     context: rimeEngine.getContext(session: session),
                     policy: policy,
                     owner: focusToken,
-                    clientIdentity: ObjectIdentifier(client as AnyObject),
-                    protectedDelivery: capsuleUnlockChordKey
+                    clientIdentity: ObjectIdentifier(client as AnyObject)
                 )
                 batchPolicy = pendingFlyChordBase?.policy ?? policy
             } else {
@@ -4363,40 +4837,9 @@ final class RimeBufferController: IMKInputController {
         } else {
             // A synchronous displaced/protected-focus cleanup intentionally
             // replaces the global owner before asking the old controller to
-            // settle.  The routing gate guarantees this replay can touch only
-            // the old private Rime session; resolve/abandon then decides
-            // whether to recover it into the buffer or discard it safely.
+            // settle. The routing gate guarantees this replay can touch only
+            // the old private Rime session.
             initialTarget = nil
-        }
-        if let initialTarget {
-            switch CapsuleWorkspace.shared.handleUnlockChord(
-                keys,
-                target: initialTarget
-            ) {
-            case .notMatched:
-                if base.protectedDelivery {
-                    mutualPairingState.reset()
-                    NSSound.beep()
-                    if let client { updateUI(client: client) }
-                    BufferWindowController.shared.refresh()
-                    return
-                }
-            case .progressed:
-                mutualPairingState.reset()
-                if let client { updateUI(client: client) }
-                BufferWindowController.shared.refresh()
-                return
-            case .delivered:
-                mutualPairingState.reset()
-                if let client { updateUI(client: client) }
-                return
-            case .rejected, .deliveryFailed:
-                mutualPairingState.reset()
-                NSSound.beep()
-                if let client { updateUI(client: client) }
-                BufferWindowController.shared.refresh()
-                return
-            }
         }
         guard let shape = FlyChordBatchShape(keys: keys) else {
             IMELog.write("FlyYao batch rejected unknown keyboard-half shape")
@@ -4804,8 +5247,14 @@ final class RimeBufferController: IMKInputController {
         guard !raw.isEmpty else { return false }
 
         rimeEngine.clearComposition(session: session)
+        let capturesInClipboardSearch = shouldCaptureClipboardSearchCommit(from: client)
         let capturesInBuffer = shouldCaptureCommit(from: client)
-        if capturesInBuffer {
+        if capturesInClipboardSearch {
+            guard appendClipboardSearchCommit(raw, client: client) else {
+                IMELog.write("raw clipboard search commit rejected")
+                return true
+            }
+        } else if capturesInBuffer {
             if let focusToken {
                 BufferWindowController.shared.clearInlineComposition(owner: focusToken)
                 candidateWindow.hide(owner: focusToken)
@@ -4839,9 +5288,15 @@ final class RimeBufferController: IMKInputController {
     private func drainCommit(_ client: IMKTextInput,
                              externalTarget: Bool? = nil) -> String? {
         guard let commit = rimeEngine.takeCommit(session: session) else { return nil }
+        let capturesInClipboardSearch = shouldCaptureClipboardSearchCommit(from: client)
         let capturesInBuffer = shouldCaptureCommit(from: client,
                                                    externalTarget: externalTarget)
-        if capturesInBuffer {
+        if capturesInClipboardSearch {
+            if !appendClipboardSearchCommit(commit, client: client) {
+                IMELog.write("clipboard search commit rejected after Rime drain")
+                clearCompositionPresentation(client: client)
+            }
+        } else if capturesInBuffer {
             if let focusToken {
                 BufferWindowController.shared.clearInlineComposition(owner: focusToken)
                 candidateWindow.hide(owner: focusToken)
@@ -4953,39 +5408,6 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         composition.commitDidInsert()
-        return true
-    }
-
-    /// Capsule passwords never enter BufferModel. The selected record is
-    /// decrypted only after a physical chord and arrives here with a one-shot,
-    /// record/focus/client-bound permit. This is the only path allowed to use
-    /// Delivery.insert while macOS secure event input is active.
-    func deliverCapsulePassword(
-        _ password: String,
-        recordID: UUID,
-        permit: CapsulePasswordDeliveryPermit,
-        target: FocusLease
-    ) -> Bool {
-        guard target.controller === self,
-              focusToken == target.token,
-              !target.compositionActive,
-              InputFocusCoordinator.shared.liveTarget(
-                expected: target.token,
-                forceOverlayVisibilityRefresh: true
-              ) === target,
-              let client = target.client,
-              ObjectIdentifier(client as AnyObject) == target.clientIdentity,
-              Delivery.insert(
-                password,
-                into: client,
-                capsulePasswordRecordID: recordID,
-                targetToken: target.token,
-                permit: permit
-              ) else {
-            return false
-        }
-        composition.commitDidInsert()
-        updateUI(client: client)
         return true
     }
 
@@ -5126,7 +5548,10 @@ final class RimeBufferController: IMKInputController {
         }
 
         let bufferControlsActive = shouldUseBufferCommands(client: client)
+        let clipboardSearchActive = shouldCaptureClipboardSearchCommit(from: client)
+        let logicalControlsActive = bufferControlsActive || clipboardSearchActive
         let capturesRimeCommits = shouldCaptureCommit(from: client)
+            || clipboardSearchActive
         let secureInput = IsSecureEventInputEnabled()
 
         // Host isolation cannot depend on a healthy Rime session. In fallback
@@ -5135,7 +5560,7 @@ final class RimeBufferController: IMKInputController {
         guard session != 0, rimeEngine.isHealthy else {
             BufferWindowController.shared.clearInlineComposition(owner: focusToken)
             let presentation = HostMarkedTextPresentationRules.presentation(
-                bufferControlsActive: bufferControlsActive,
+                bufferControlsActive: logicalControlsActive,
                 capturesRimeCommits: capturesRimeCommits,
                 rimeComposing: false,
                 secureInput: secureInput
@@ -5168,6 +5593,9 @@ final class RimeBufferController: IMKInputController {
                 candidateWindow.hide(owner: focusToken)
                 IMELog.write("updateUI fallback ownership changed while publishing token=\(focusToken)")
                 return
+            }
+            if clipboardSearchActive {
+                ClipboardHistoryWindowController.shared.clearSearchComposition()
             }
             candidateWindow.hide(owner: focusToken)
             return
@@ -5214,7 +5642,7 @@ final class RimeBufferController: IMKInputController {
         let compositionActive = chord.hasPending || rimeContextActive
         let stagedChordGuardActive = chord.hasPending && !rimeContextActive
         let presentation = HostMarkedTextPresentationRules.presentation(
-            bufferControlsActive: bufferControlsActive,
+            bufferControlsActive: logicalControlsActive,
             capturesRimeCommits: capturesRimeCommits,
             rimeComposing: compositionActive,
             secureInput: secureInput,
@@ -5266,6 +5694,42 @@ final class RimeBufferController: IMKInputController {
         if presentation == .none {
             BufferWindowController.shared.clearInlineComposition(owner: focusToken)
             candidateWindow.hide(owner: focusToken)
+            return
+        }
+
+        if clipboardSearchActive {
+            BufferWindowController.shared.clearInlineComposition(owner: focusToken)
+            let inlinePreedit = ctx.preedit.isEmpty ? ctx.input : ctx.preedit
+            let anchor = ClipboardHistoryWindowController.shared
+                .updateSearchComposition(
+                    inlinePreedit,
+                    expected: focusToken,
+                    client: client
+                )
+            guard uiTransactionStillCurrent(
+                lease: lease,
+                client: client,
+                secureInput: secureInput
+            ) else {
+                ClipboardHistoryWindowController.shared.clearSearchComposition()
+                candidateWindow.hide(owner: focusToken)
+                IMELog.write(
+                    "clipboard search candidate anchor abandoned after focus change token=\(focusToken)"
+                )
+                return
+            }
+            if !ctx.candidates.isEmpty, let anchor {
+                candidateWindow.update(
+                    ctx,
+                    caretRect: anchor,
+                    bundleId: bid,
+                    showPreedit: false,
+                    owner: focusToken,
+                    presentation: .clipboardCaret
+                )
+            } else {
+                candidateWindow.hide(owner: focusToken)
+            }
             return
         }
 
@@ -5440,8 +5904,12 @@ final class RimeBufferController: IMKInputController {
         StatusMenu.shared.moveBufferWindowToCurrentScreen()
     }
 
-    @objc func openInboundTrayFromInputMenu(_ sender: Any?) {
-        StatusMenu.shared.openInboundTray()
+    @objc func openMailboxFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.openMailbox()
+    }
+
+    @objc func openCapsuleFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.openCapsule()
     }
 
     @objc func checkUpdateFromInputMenu(_ sender: Any?) {

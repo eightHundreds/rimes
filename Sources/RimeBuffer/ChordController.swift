@@ -14,29 +14,155 @@ enum ChordSettings {
     static let defaultDuration: TimeInterval = 0.10
     static let range: ClosedRange<TimeInterval> = 0.02...0.50
     private static let key = "chord.duration"
+    private static let legacyMigrationKey = "chord.duration.legacyConfigMigrated.v1"
 
     private static func clamp(_ value: TimeInterval) -> TimeInterval {
-        min(max(value, range.lowerBound), range.upperBound)
+        guard value.isFinite else { return defaultDuration }
+        return min(max(value, range.lowerBound), range.upperBound)
     }
 
     static var duration: TimeInterval {
         get {
             let defaults = UserDefaults.standard
-            guard defaults.object(forKey: key) != nil else { return defaultDuration }
-            return clamp(defaults.double(forKey: key))
+            if defaults.object(forKey: key) != nil {
+                let raw = defaults.double(forKey: key)
+                let stored = clamp(raw)
+                if stored != raw {
+                    defaults.set(stored, forKey: key)
+                }
+                if !defaults.bool(forKey: legacyMigrationKey) {
+                    defaults.set(true, forKey: legacyMigrationKey)
+                }
+                return stored
+            }
+            guard !defaults.bool(forKey: legacyMigrationKey) else {
+                return defaultDuration
+            }
+
+            // Directory probing belongs only to the one-time migration path;
+            // this getter is also read from the ordinary per-key session gate.
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let userDirectory = ProcessInfo.processInfo.environment[
+                "RIMEBUFFER_USER_DIR"
+            ].map {
+                URL(fileURLWithPath: $0, isDirectory: true)
+            } ?? home.appendingPathComponent(
+                "Library/RimeBuffer",
+                isDirectory: true
+            )
+            return resolvedDuration(
+                defaults: defaults,
+                userDirectory: userDirectory,
+                squirrelDirectory: home.appendingPathComponent(
+                    "Library/Rime",
+                    isDirectory: true
+                )
+            )
         }
         set {
             let clamped = clamp(newValue)
-            UserDefaults.standard.set(clamped, forKey: key)
+            let defaults = UserDefaults.standard
+            defaults.set(clamped, forKey: key)
+            if !defaults.bool(forKey: legacyMigrationKey) {
+                defaults.set(true, forKey: legacyMigrationKey)
+            }
             IMELog.write("chord_duration=\(clamped) source=preference")
             NotificationCenter.default.post(name: .chordDurationDidChange, object: nil)
         }
     }
 
     static func resetToDefault() {
-        UserDefaults.standard.removeObject(forKey: key)
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: key)
+        // Reset is an explicit choice of the product default. Do not import an
+        // old squirrel.yaml value again on the next read.
+        defaults.set(true, forKey: legacyMigrationKey)
         IMELog.write("chord_duration reset -> \(defaultDuration)")
         NotificationCenter.default.post(name: .chordDurationDidChange, object: nil)
+    }
+
+    /// Settings became UserDefaults-backed in 0.4, but existing installations
+    /// already carried their tuned `chord_duration` in the Squirrel frontend
+    /// config. Import that value exactly once so an upgrade does not silently
+    /// replace (for example) a 50 ms chord window with the 100 ms default.
+    static func resolvedDuration(
+        defaults: UserDefaults,
+        userDirectory: URL,
+        squirrelDirectory: URL
+    ) -> TimeInterval {
+        if defaults.object(forKey: key) != nil {
+            let stored = clamp(defaults.double(forKey: key))
+            if stored != defaults.double(forKey: key) {
+                defaults.set(stored, forKey: key)
+            }
+            if !defaults.bool(forKey: legacyMigrationKey) {
+                defaults.set(true, forKey: legacyMigrationKey)
+            }
+            return stored
+        }
+
+        guard !defaults.bool(forKey: legacyMigrationKey) else {
+            return defaultDuration
+        }
+
+        let candidates = [
+            userDirectory.appendingPathComponent("build/squirrel.yaml"),
+            userDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            userDirectory.appendingPathComponent("squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("build/squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.yaml"),
+        ]
+        var visited: Set<String> = []
+        for url in candidates {
+            let path = url.standardizedFileURL.path
+            guard visited.insert(path).inserted,
+                  let legacy = legacyDuration(in: url) else {
+                continue
+            }
+            let migrated = clamp(legacy)
+            defaults.set(migrated, forKey: key)
+            defaults.set(true, forKey: legacyMigrationKey)
+            IMELog.write(
+                "chord_duration=\(migrated) source=legacy-config path=\(path)"
+            )
+            return migrated
+        }
+        // Freeze the one-shot decision only after the scan completes. Even a
+        // missing or malformed legacy config must not be re-imported after the
+        // user later chooses "reset to default" by removing the preference.
+        defaults.set(true, forKey: legacyMigrationKey)
+        return defaultDuration
+    }
+
+    private static func legacyDuration(in url: URL) -> TimeInterval? {
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else {
+            return nil
+        }
+        for rawLine in contents.components(separatedBy: .newlines) {
+            let uncommented = rawLine.split(
+                separator: "#",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            ).first ?? ""
+            let parts = uncommented.split(
+                separator: ":",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            guard parts.count == 2,
+                  parts[0].trimmingCharacters(in: .whitespaces)
+                    == "chord_duration",
+                  let duration = Double(
+                    parts[1].trimmingCharacters(in: .whitespaces)
+                  ),
+                  duration.isFinite,
+                  duration > 0 else {
+                continue
+            }
+            return duration
+        }
+        return nil
     }
 }
 

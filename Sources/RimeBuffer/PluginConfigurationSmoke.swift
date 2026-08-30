@@ -454,6 +454,22 @@ private func pluginConfigurationLayoutIsSafe(
             )
         }
 
+        let buttonViews = descendants(of: controller.view).compactMap {
+            $0 as? NSButton
+        }
+        guard buttonViews.allSatisfy({ button in
+            button is RimePointingHandButton
+                || button is RimeFixedAccentPopUpButton
+        }) else {
+            let missingOwners = buttonViews.filter { button in
+                !(button is RimePointingHandButton)
+                    && !(button is RimeFixedAccentPopUpButton)
+            }.map { String(describing: type(of: $0)) }
+            return rejectLayout(
+                "pointing-hand-owner=\(missingOwners.joined(separator: ","))"
+            )
+        }
+
         let interactiveViews = descendants(of: controller.view).filter {
             if let textField = $0 as? NSTextField {
                 return textField.isEditable

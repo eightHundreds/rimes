@@ -3,8 +3,9 @@
 # 拉取 librime 运行时到 Vendor/rime/，用于把 RimeBuffer 打成自包含 app
 # （装一个就能用，无需单独安装 Squirrel）。
 #
-# 来源：Squirrel 官方 .pkg。librime 是静态链接的（依赖只有系统 libSystem/libc++），
-# 所以只需取 librime.1.dylib + 3 个插件 + SharedSupport（默认词库/方案）。
+# 来源：Squirrel 官方 .pkg + 官方 rime-octagram-data 固定版本。librime 是
+# 静态链接的（依赖只有系统 libSystem/libc++），所以取 librime.1.dylib、
+# 3 个插件、SharedSupport（默认词库/方案）与已校验的简体语言模型。
 # 不取 Sparkle（那是 Squirrel 自己的更新器，RimeBuffer 用自己的自动更新）。
 #
 # Vendor/ 是 gitignore 的——不把二进制提交进仓库，构建时按审计过的
@@ -22,6 +23,10 @@ SQUIRREL_PACKAGE_SHA256="614746013212937623d5bbab9901e9c43d1ec937aa32307d6b6092a
 SQUIRREL_TEAM_ID="28HU5A7B46"
 SQUIRREL_INSTALLER_IDENTITY="Developer ID Installer: Yuncao Liu (${SQUIRREL_TEAM_ID})"
 SQUIRREL_BUNDLE_ID="im.rime.inputmethod.Squirrel"
+OCTAGRAM_REVISION="f8ce3b534733e489a8470a7c2adf5a154e8ea069"
+OCTAGRAM_MODEL="zh-hans-t-essay-bgw.gram"
+OCTAGRAM_MODEL_BYTES="40925228"
+OCTAGRAM_MODEL_SHA256="d3cb2438c1fdcd6a855dd6ca8f5c1060a29273c6b64c2c2c69af67cd71b6aa7e"
 DEST="Vendor/rime"
 FORCE="${1:-}"
 CACHE_DIR="Vendor/.cache"
@@ -140,6 +145,45 @@ cp "${runtime_files[0]}" "$DEST/Frameworks/"
 mkdir -p "$DEST/Frameworks/rime-plugins"
 cp "${runtime_files[@]:1}" "$DEST/Frameworks/rime-plugins/"
 cp -R "$SRC/SharedSupport" "$DEST/SharedSupport"
+
+echo "==> 获取已审计的简体 Octagram 模型"
+octagram_cache="$CACHE_DIR/$OCTAGRAM_MODEL"
+octagram_tmp="$TMP/$OCTAGRAM_MODEL"
+octagram_used_cache=false
+if [[ "$FORCE" != "--force" && -f "$octagram_cache" && ! -L "$octagram_cache" ]] \
+    && [[ "$(/usr/bin/stat -f%z "$octagram_cache")" == "$OCTAGRAM_MODEL_BYTES" ]] \
+    && [[ "$(/usr/bin/shasum -a 256 "$octagram_cache" | /usr/bin/awk '{print $1}')" \
+        == "$OCTAGRAM_MODEL_SHA256" ]]; then
+    /usr/bin/ditto "$octagram_cache" "$octagram_tmp"
+    octagram_used_cache=true
+else
+    octagram_url="https://raw.githubusercontent.com/lotem/rime-octagram-data/${OCTAGRAM_REVISION}/${OCTAGRAM_MODEL}"
+    octagram_effective_url="$(
+        curl --fail --location --show-error --silent \
+            --proto '=https' --tlsv1.2 \
+            --output "$octagram_tmp" \
+            --write-out '%{url_effective}' \
+            "$octagram_url"
+    )"
+    case "$octagram_effective_url" in
+        https://raw.githubusercontent.com/*) ;;
+        *) die "Octagram download left the reviewed GitHub HTTPS host: $octagram_effective_url" ;;
+    esac
+fi
+[[ "$(/usr/bin/stat -f%z "$octagram_tmp")" == "$OCTAGRAM_MODEL_BYTES" ]] \
+    || die "unexpected Octagram model size"
+[[ "$(/usr/bin/shasum -a 256 "$octagram_tmp" | /usr/bin/awk '{print $1}')" \
+    == "$OCTAGRAM_MODEL_SHA256" ]] \
+    || die "Octagram model SHA-256 mismatch"
+if [[ "$octagram_used_cache" != true ]]; then
+    /bin/mkdir -p "$CACHE_DIR"
+    octagram_cache_tmp="$(/usr/bin/mktemp "$CACHE_DIR/.Octagram.XXXXXX")"
+    /usr/bin/ditto "$octagram_tmp" "$octagram_cache_tmp"
+    /bin/chmod 600 "$octagram_cache_tmp"
+    /bin/mv -f "$octagram_cache_tmp" "$octagram_cache"
+fi
+/usr/bin/ditto "$octagram_tmp" "$DEST/SharedSupport/$OCTAGRAM_MODEL"
+/bin/chmod 0644 "$DEST/SharedSupport/$OCTAGRAM_MODEL"
 
 echo "==> 完成（Squirrel ${SQUIRREL_VERSION}）："
 du -sh "$DEST/Frameworks" "$DEST/SharedSupport"

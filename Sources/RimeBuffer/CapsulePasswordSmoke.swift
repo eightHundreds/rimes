@@ -140,6 +140,23 @@ func runCapsulePasswordSmokeTest() -> Bool {
             return fail("password title-only local search")
         }
 
+        let copiedPasswordURL = passwordStore.passwordDirectoryURL
+            .appendingPathComponent("copied-in-obsidian.md")
+        try FileManager.default.copyItem(
+            at: first.fileURL,
+            to: copiedPasswordURL
+        )
+        guard chmod(copiedPasswordURL.path, 0o600) == 0 else {
+            return fail("copied password fixture permissions")
+        }
+        do {
+            _ = try passwordStore.listSummaries()
+            return fail("password filename and authenticated UUID diverged")
+        } catch CapsulePasswordStoreError.malformedDocument {
+            // Expected: an Obsidian copy must never alias the canonical UUID.
+        }
+        try FileManager.default.removeItem(at: copiedPasswordURL)
+
         let decrypted = try passwordStore.record(id: first.id)
         guard decrypted.secret.url == firstRequest.url,
               decrypted.secret.app == firstRequest.app,
@@ -185,48 +202,6 @@ func runCapsulePasswordSmokeTest() -> Bool {
             // Expected.
         }
 
-        guard CapsulePasswordUnlockChord.stepCount == 4,
-              CapsulePasswordUnlockChord.accepts(keycode: 0x72),
-              CapsulePasswordUnlockChord.accepts(keycode: 0x6e),
-              !CapsulePasswordUnlockChord.accepts(keycode: 0x66),
-              !CapsulePasswordUnlockChord.accepts(keycode: 0x6a),
-              CapsulePasswordUnlockChord.matches([
-                (keycode: 0x68, mask: 0),
-                (keycode: 0x72, mask: 0),
-              ], step: 0),
-              CapsulePasswordUnlockChord.matches([
-                (keycode: 0x6f, mask: 0),
-                (keycode: 0x77, mask: 0),
-              ], step: 1),
-              CapsulePasswordUnlockChord.matches([
-                (keycode: 0x76, mask: 0),
-                (keycode: 0x6e, mask: 0),
-                (keycode: 0x63, mask: 0),
-              ], step: 2),
-              CapsulePasswordUnlockChord.matches([
-                (keycode: 0x75, mask: 0),
-                (keycode: 0x71, mask: 0),
-              ], step: 3),
-              !CapsulePasswordUnlockChord.matches([
-                (keycode: 0x72, mask: 0),
-              ], step: 0),
-              !CapsulePasswordUnlockChord.matches([
-                (keycode: 0x72, mask: RimeKey.shiftMask),
-                (keycode: 0x68, mask: 0),
-              ], step: 0) else {
-            return fail("sequenced unlock chord contract")
-        }
-
-        guard testInlineContentCreation(store: contentStore),
-              testAbsoluteSkillAction(),
-              testPasswordWorkspace(root: root, instant: instant),
-              TranslationRailRoleSymbolRules.resolve("囊", target: true).name
-                == "archivebox",
-              TranslationRailRoleSymbolRules.resolve("查", target: false).name
-                == "magnifyingglass" else {
-            return false
-        }
-
         try passwordStore.remove(id: first.id)
         guard try passwordStore.listSummaries().isEmpty else {
             return fail("password record removal")
@@ -239,155 +214,6 @@ func runCapsulePasswordSmokeTest() -> Bool {
     return true
 }
 
-private func testInlineContentCreation(store: CapsuleContentStore) -> Bool {
-    let source = BufferModel()
-    source.enabled = true
-    source.stageExternal("一条全新的本地事实", origin: .rime)
-    let workspace = CapsuleWorkspace(
-        sourceModel: source,
-        selected: { true },
-        dependencies: .init(
-            search: { _, kind, _ in
-                guard kind == .memory else { return [] }
-                return []
-            },
-            passwordRecord: { _ in
-                throw CapsulePasswordStoreError.recordNotFound
-            },
-            createContent: { try store.put($0) },
-            performBackground: { $0() }
-        ),
-        initialKind: .memory,
-        persistSelectedKind: { _ in }
-    )
-    workspace.start()
-    workspace.fireSearchDebounceForTesting()
-    guard capsuleSmokeWaitUntil({ workspace.phase == .ready }),
-          workspace.railSnapshot.outputBlocks.map(\.text)
-            == ["＋ Memory"],
-          let memoryAction = workspace.railSnapshot.outputBlocks.first,
-          workspace.selectResult(blockID: memoryAction.id),
-          capsuleSmokeWaitUntil({ workspace.phase == .ready }),
-          workspace.railSnapshot.outputBlocks.map(\.text)
-            == ["Memory · 一条全新的本地事实 · 一条全新的本地事实"],
-          workspace.deliveryPendingBlocks.map(\.text)
-            == ["一条全新的本地事实"],
-          workspace.prepareForDelivery() else {
-        workspace.stop()
-        return fail("empty-result inline Memory creation")
-    }
-    let generation = workspace.deliveryGeneration
-    guard let deliveryID = workspace.deliveryPendingBlocks.first?.id,
-          workspace.deliveryBlock(id: deliveryID, generation: generation)?.text
-            == "一条全新的本地事实" else {
-        workspace.stop()
-        return fail("ordinary Capsule delivery lease")
-    }
-    workspace.consumeDelivered(blockIDs: [deliveryID], generation: generation)
-    guard source.blocks.isEmpty,
-          workspace.deliveryPendingBlocks.isEmpty else {
-        workspace.stop()
-        return fail("ordinary Capsule delivery consumption")
-    }
-    workspace.stop()
-    return true
-}
-
-private func testAbsoluteSkillAction() -> Bool {
-    let source = BufferModel()
-    source.enabled = true
-    source.stageExternal("/tmp/example-capsule-skill", origin: .rime)
-    let workspace = CapsuleWorkspace(
-        sourceModel: source,
-        selected: { true },
-        dependencies: .init(
-            search: { _, kind, _ in
-                guard kind == .skill else { return [] }
-                return []
-            },
-            passwordRecord: { _ in
-                throw CapsulePasswordStoreError.recordNotFound
-            },
-            createContent: { _ in
-                throw CapsuleContentStoreError.fileOperation("unused")
-            },
-            performBackground: { $0() }
-        ),
-        initialKind: .skill,
-        persistSelectedKind: { _ in }
-    )
-    workspace.start()
-    workspace.fireSearchDebounceForTesting()
-        let passed = capsuleSmokeWaitUntil({ workspace.phase == .ready })
-        && workspace.railSnapshot.outputBlocks.map(\.text)
-            == ["＋ Skill"]
-    workspace.stop()
-    return passed || fail("absolute-path Skill inline action")
-}
-
-private func testPasswordWorkspace(root: URL, instant: Date) -> Bool {
-    let source = BufferModel()
-    source.enabled = true
-    source.stageExternal("示例", origin: .rime)
-    let visible = CapsuleWorkspace.Candidate(
-        id: UUID(),
-        type: .password,
-        title: "示例搜索结果",
-        payload: nil,
-        snippet: "••••••••"
-    )
-    let workspace = CapsuleWorkspace(
-        sourceModel: source,
-        selected: { true },
-        dependencies: .init(
-            search: { query, kind, limit in
-                guard query == "示例", kind == .password, limit == 5 else {
-                    return []
-                }
-                return [visible]
-            },
-            passwordRecord: { _ in
-                throw CapsulePasswordStoreError.recordNotFound
-            },
-            createContent: { _ in
-                CapsuleContentSummary(
-                    id: UUID(),
-                    type: .memory,
-                    title: "unused",
-                    updatedAt: instant,
-                    fileURL: root.appendingPathComponent("unused.md")
-                )
-            },
-            performBackground: { $0() }
-        ),
-        initialKind: .password,
-        persistSelectedKind: { _ in }
-    )
-    workspace.start()
-    workspace.fireSearchDebounceForTesting()
-    guard capsuleSmokeWaitUntil({ workspace.phase == .ready }),
-          workspace.railSnapshot.outputBlocks.map(\.text)
-            == ["Password · 示例搜索结果 · ••••••••"],
-          workspace.canRequestProtectedDelivery,
-          !workspace.protectedDeliveryPromptActive,
-          !workspace.acceptsUnlockChordKey(0x66),
-          !workspace.acceptsUnlockChordKey(0x6a),
-          !workspace.acceptsUnlockChordKey(0x72),
-          workspace.deliveryPendingBlocks.isEmpty,
-          !workspace.prepareForDelivery() else {
-        workspace.stop()
-        return fail("password masked result and isolated delivery path")
-    }
-    let options = workspace.optionPickerOptions.map(\.identifier)
-    let passed = options == ["prompt", "memory", "password", "skill"]
-        && workspace.setOptionPickerSelection("prompt")
-        && workspace.selectedOptionPickerID == "prompt"
-        && !workspace.acceptsUnlockChordKey(0x72)
-        && workspace.deliveryPendingBlocks.isEmpty
-    workspace.stop()
-    return passed || fail("Capsule type picker and inactive unlock capture")
-}
-
 private func permissions(_ path: String) -> mode_t? {
     var metadata = stat()
     guard path.withCString({ stat($0, &metadata) }) == 0 else { return nil }
@@ -397,18 +223,4 @@ private func permissions(_ path: String) -> mode_t? {
 private func fail(_ message: String) -> Bool {
     print("FAILED: \(message)")
     return false
-}
-
-private func capsuleSmokeWaitUntil(
-    _ predicate: () -> Bool,
-    timeout: TimeInterval = 1
-) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while !predicate(), Date() < deadline {
-        RunLoop.current.run(
-            mode: .default,
-            before: Date().addingTimeInterval(0.005)
-        )
-    }
-    return predicate()
 }

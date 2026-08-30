@@ -16,7 +16,13 @@ import {
   Segmented,
   Switch,
 } from "../design-system/primitives";
-import { themeCSSVariables, themes, type ThemeID } from "../design-system/tokens";
+import {
+  themeCSSVariables,
+  themeFamilies,
+  themeFamilyOrder,
+  themes,
+  type ThemeID,
+} from "../design-system/tokens";
 import {
   PluginConfigurationDialog,
   type PluginConfiguration,
@@ -28,6 +34,9 @@ export type SettingsRouteID =
   | "core.input-method"
   | "core.appearance"
   | "core.buffer"
+  | "core.clipboard"
+  | "core.mailbox"
+  | "core.capsule"
   | "core.connectors"
   | "core.plugins"
   | "core.maintenance"
@@ -60,7 +69,7 @@ const coreRoutes: readonly SettingsRoute[] = [
   {
     id: "core.appearance",
     title: "外观",
-    description: "主题同时作用于候选框、缓冲工作台与设置页预览。",
+    description: "主题同时作用于候选框、Buffer、Clipboard History 与设置页预览。",
     icon: "appearance",
     section: "设置",
     subpages: [
@@ -70,11 +79,35 @@ const coreRoutes: readonly SettingsRoute[] = [
   },
   {
     id: "core.buffer",
-    title: "缓冲区",
-    description: "控制暂存、独立工作台、跨桌面显示与切换应用行为。",
+    title: "Buffer",
+    description: "管理独立 Buffer 工作台；Clipboard History 不属于 Buffer。",
     icon: "tray",
     section: "设置",
-    subpages: [{ id: "buffer", title: "缓冲区" }],
+    subpages: [{ id: "buffer", title: "Buffer" }],
+  },
+  {
+    id: "core.clipboard",
+    title: "Clipboard",
+    description: "管理独立、仅在本机持久保存的多类型剪贴板历史窗口。",
+    icon: "clipboard",
+    section: "设置",
+    subpages: [{ id: "clipboard", title: "Clipboard History" }],
+  },
+  {
+    id: "core.mailbox",
+    title: "Mailbox",
+    description: "独立接收、保存和处理本地消息；按需显式发送到 Buffer。",
+    icon: "book",
+    section: "设置",
+    subpages: [{ id: "mailbox", title: "Mailbox" }],
+  },
+  {
+    id: "core.capsule",
+    title: "Capsule",
+    description: "独立管理 Prompt、Memory、Password 与 Skill 本机条目。",
+    icon: "database",
+    section: "设置",
+    subpages: [{ id: "capsule", title: "Capsule" }],
   },
   {
     id: "core.connectors",
@@ -278,7 +311,7 @@ export function SettingsSurface({
   const [bufferWindowVisible, setBufferWindowVisible] = useState(true);
   const [bufferPinned, setBufferPinned] = useState(true);
   const [closeAfterLastDelivery, setCloseAfterLastDelivery] = useState(true);
-  const [clipboardHistoryEnabled, setClipboardHistoryEnabled] = useState(false);
+  const [clipboardHistoryEnabled, setClipboardHistoryEnabled] = useState(true);
   const [resetOnAppSwitch, setResetOnAppSwitch] = useState(false);
   const [gatewayEnabled, setGatewayEnabled] = useState(true);
   const [gatewayClaudeOpen, setGatewayClaudeOpen] = useState(false);
@@ -694,26 +727,50 @@ export function SettingsSurface({
     if (currentRoute.id === "core.appearance") {
       if (currentSubpage === "theme") {
         return (
-          <SettingsSection title="主题" description="主题固定使用产品色，不再跟随系统强调色。">
-            <div className="theme-choice-list">
-              {(Object.entries(themes) as [ThemeID, (typeof themes)[ThemeID]][]).map(([id, theme]) => (
-                <button
-                  aria-pressed={activeThemeID === id}
-                  className={`theme-choice${activeThemeID === id ? " is-selected" : ""}`}
-                  key={id}
-                  onClick={() => {
-                    setActiveThemeID(id);
-                    onThemeChange?.(id);
-                    setStatus(`已切换到${theme.title}主题`);
-                  }}
-                  style={themeCSSVariables(theme)}
-                  type="button"
-                >
-                  <span className="theme-choice__icon"><Icon name="appearance" size={21} weight="duotone" /></span>
-                  <span className="theme-choice__copy"><strong>{theme.title}</strong><small>{theme.description}</small></span>
-                  {activeThemeID === id ? <Badge tone="accent">正在使用</Badge> : <Badge>可用</Badge>}
-                </button>
-              ))}
+          <SettingsSection title="主题" description="主题与配色分开管理：经典包含三种既有配色，拉斯塔是一套独立视觉架构。">
+            <div className="theme-family-list">
+              {themeFamilyOrder.map((familyID) => {
+                const family = themeFamilies[familyID];
+                return (
+                  <section className="theme-family" key={familyID}>
+                    <header className="theme-family__header">
+                      <span>
+                        <strong>{family.title}</strong>
+                        <small>{family.description}</small>
+                      </span>
+                      <Badge>{family.colorways.length > 1 ? `${family.colorways.length} 配色` : "独立主题"}</Badge>
+                    </header>
+                    <div className="theme-choice-list">
+                      {family.colorways.map((id) => {
+                        const theme = themes[id];
+                        return (
+                          <button
+                            aria-pressed={activeThemeID === id}
+                            className={`theme-choice theme-choice--${familyID}${activeThemeID === id ? " is-selected" : ""}`}
+                            key={id}
+                            onClick={() => {
+                              setActiveThemeID(id);
+                              onThemeChange?.(id);
+                              setStatus(`已切换到${family.title}${familyID === "classic" ? ` · ${theme.title}` : ""}主题`);
+                            }}
+                            style={themeCSSVariables(theme)}
+                            type="button"
+                          >
+                            <span className="theme-choice__icon"><Icon name="appearance" size={21} weight="duotone" /></span>
+                            <span className="theme-choice__copy"><strong>{theme.title}</strong><small>{theme.description}</small></span>
+                            <span aria-hidden="true" className="theme-choice__palette">
+                              <i style={{ background: theme.brandRed }} />
+                              <i style={{ background: theme.brandYellow }} />
+                              <i style={{ background: theme.brandGreen }} />
+                            </span>
+                            {activeThemeID === id ? <Badge tone="accent">正在使用</Badge> : <Badge>可用</Badge>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })}
             </div>
           </SettingsSection>
         );
@@ -732,17 +789,48 @@ export function SettingsSurface({
 
     if (currentRoute.id === "core.buffer") {
       return (
-        <SettingsSection title="缓冲区" description="关闭工作台会暂停捕获并收束瞬态状态，但保留已经形成的块。">
+        <SettingsSection title="Buffer" description="关闭工作台会暂停捕获并收束瞬态状态，但保留已经形成的块。">
           <SettingRow title="启用缓冲模式" detail="提交内容先暂存，确认后再发送到当前文本框。" icon="tray" control={<Switch checked={bufferEnabled} label="启用缓冲模式" onChange={setBufferEnabled} />} />
           <SettingRow title="显示独立缓冲工作台" detail="聚焦文本框时把工作台带到当前屏幕。" icon="eye" control={<Switch checked={bufferWindowVisible} label="显示独立缓冲工作台" onChange={setBufferWindowVisible} />} />
           <SettingRow title="常显于所有桌面与全屏空间" detail="适合在应用和全屏空间之间切换时持续使用。" icon="pin" control={<Switch checked={bufferPinned} label="跨桌面常显" onChange={setBufferPinned} />} />
           <SettingRow title="最后一块上屏后关闭工作台" detail="适用于 Default 与所有缓冲插件；部分失败或内容变化时保持打开。" icon="check" control={<Switch checked={closeAfterLastDelivery} label="最后一块上屏后关闭工作台" onChange={setCloseAfterLastDelivery} />} />
-          <SettingRow title="启用剪贴板历史" detail="仅在工作台可见且不处于安全输入时收录；默认关闭。" icon="clipboard" control={<Switch checked={clipboardHistoryEnabled} label="启用剪贴板历史" onChange={setClipboardHistoryEnabled} />} />
           <SettingRow title="切换应用时清空本地缓冲" detail="只在没有外部来源块时执行；默认关闭。" icon="trash" control={<Switch checked={resetOnAppSwitch} label="切换应用时清空本地缓冲" onChange={setResetOnAppSwitch} />} />
           <div className="settings-action-row">
             <Button icon="export" kind="secondary" onClick={() => setStatus("缓冲工作台已移到当前屏幕")}>移到当前屏幕</Button>
             <Button icon="eye" kind="ghost" onClick={() => setBufferWindowVisible(true)}>显示工作台</Button>
           </div>
+        </SettingsSection>
+      );
+    }
+
+    if (currentRoute.id === "core.clipboard") {
+      return (
+        <SettingsSection title="Clipboard History" description="Clipboard 与 Buffer、Mailbox、Capsule 同级；历史保存在本机私有数据库，窗口关闭后仍会继续收录。">
+          <SettingRow title="独立底部窗口" detail="使用 ⌘⇧P 打开 nonactivating 窗口；不会开启 Buffer 或改变它的内容。" icon="clipboard" control={<Badge tone="accent">⌘⇧P</Badge>} />
+          <SettingRow title="收录剪贴板历史" detail="RIMES 运行时后台收录文本、链接、图片、文件与颜色；安全保护期间不会读取。" icon="check" control={<Switch checked={clipboardHistoryEnabled} label="收录剪贴板历史" onChange={setClipboardHistoryEnabled} />} />
+          <SettingRow title="本机私有历史" detail="图片卡片显示异步缩略图和来源 App 图标；数据不进入仓库，也不提供云同步。" icon="database" control={<Badge tone="neutral">LOCAL</Badge>} />
+          <SettingRow title="自动保护" detail="Secure Input、锁屏、睡眠或会话失活时停止读取并遮蔽正文；恢复时不会补录保护期间内容。" icon="lock" control={<Badge tone="accent">FAIL CLOSED</Badge>} />
+          <Button icon="eye" kind="secondary" onClick={() => setStatus("已模拟打开 Clipboard History 独立窗口")}>打开 Clipboard History</Button>
+        </SettingsSection>
+      );
+    }
+
+    if (currentRoute.id === "core.mailbox") {
+      return (
+        <SettingsSection title="Mailbox" description="Mailbox 有自己的窗口、存储和生命周期；发送到 Buffer 是明确触发的可选桥接。">
+          <SettingRow title="独立窗口" detail="使用 ⌘⇧M 打开，不要求 Buffer 已显示或启用。" icon="book" control={<Badge tone="accent">⌘⇧M</Badge>} />
+          <SettingRow title="本机持久化" detail="会话、备注和审核状态保存在 Mailbox 自己的数据目录。" icon="database" control={<Badge tone="neutral">LOCAL</Badge>} />
+          <Button icon="eye" kind="secondary" onClick={() => setStatus("已模拟打开 Mailbox 独立窗口")}>打开 Mailbox</Button>
+        </SettingsSection>
+      );
+    }
+
+    if (currentRoute.id === "core.capsule") {
+      return (
+        <SettingsSection title="Capsule" description="Capsule 是核心本机内容库，不再出现在 Buffer 插件目录或启停状态中。">
+          <SettingRow title="内容类型" detail="Prompt · Memory · Password · Skill" icon="database" control={<Badge tone="accent">4 TYPES</Badge>} />
+          <SettingRow title="本机 Markdown" detail="普通条目兼容 Obsidian；密码字段保持本机密文。" icon="lock" control={<Badge tone="neutral">LOCAL</Badge>} />
+          <Button icon="eye" kind="secondary" onClick={() => setStatus("已模拟打开 Capsule 独立窗口")}>打开 Capsule</Button>
         </SettingsSection>
       );
     }

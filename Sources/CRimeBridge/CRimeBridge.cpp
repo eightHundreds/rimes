@@ -250,6 +250,34 @@ struct RimeApi {
     const char* (*get_version)(void);
     void (*set_caret_pos)(RimeSessionId, size_t);
     Bool (*select_candidate_on_current_page)(RimeSessionId, size_t);
+    Bool (*candidate_list_begin)(RimeSessionId, RimeCandidateListIterator*);
+    Bool (*candidate_list_next)(RimeCandidateListIterator*);
+    void (*candidate_list_end)(RimeCandidateListIterator*);
+    Bool (*user_config_open)(const char*, RimeConfig*);
+    Bool (*candidate_list_from_index)(RimeSessionId,
+                                      RimeCandidateListIterator*,
+                                      int);
+    const char* (*get_prebuilt_data_dir)(void);
+    const char* (*get_staging_dir)(void);
+    void (*commit_proto)(RimeSessionId, void*);
+    void (*context_proto)(RimeSessionId, void*);
+    void (*status_proto)(RimeSessionId, void*);
+    const char* (*get_state_label)(RimeSessionId, const char*, Bool);
+    Bool (*delete_candidate)(RimeSessionId, size_t);
+    Bool (*delete_candidate_on_current_page)(RimeSessionId, size_t);
+    RimeStringSlice (*get_state_label_abbreviated)(RimeSessionId,
+                                                    const char*,
+                                                    Bool,
+                                                    Bool);
+    Bool (*set_input)(RimeSessionId, const char*);
+    void (*get_shared_data_dir_s)(char*, size_t);
+    void (*get_user_data_dir_s)(char*, size_t);
+    void (*get_prebuilt_data_dir_s)(char*, size_t);
+    void (*get_staging_dir_s)(char*, size_t);
+    void (*get_sync_dir_s)(char*, size_t);
+    Bool (*highlight_candidate)(RimeSessionId, size_t);
+    Bool (*highlight_candidate_on_current_page)(RimeSessionId, size_t);
+    Bool (*change_page)(RimeSessionId, Bool);
 };
 
 typedef RimeApi* (*RimeGetApiFunc)(void);
@@ -257,6 +285,7 @@ typedef RimeApi* (*RimeGetApiFunc)(void);
 static std::mutex gMutex;
 static RimeApi* gApi = nullptr;
 static bool gStarted = false;
+static bool gOctagramAvailable = false;
 static std::string gLastError;
 static std::string gSharedDataDir;
 static std::string gUserDataDir;
@@ -387,6 +416,8 @@ bool BBRimeStart(const char* sharedDataDir,
 
     gApi->setup(&traits);
     gApi->initialize(&traits);
+    gOctagramAvailable = gApi->find_module
+        && gApi->find_module("octagram") != nullptr;
 
     // First-run / stale deploy: build the schemas from shared_data_dir into
     // user_data_dir/build. This is what makes a self-contained app work with no
@@ -410,6 +441,16 @@ bool BBRimeStart(const char* sharedDataDir,
         }
     }
 
+    // This inference-only schema is intentionally absent from the F4 list, so
+    // ordinary maintenance may not compile it. Failure stays non-fatal: the
+    // stream engine can fall back without taking ordinary Rime input down.
+    if (gApi->deploy_schema
+        && fileExists(gSharedDataDir + "/stream_input_local.schema.yaml")) {
+        const std::string streamSchema =
+            gSharedDataDir + "/stream_input_local.schema.yaml";
+        gApi->deploy_schema(streamSchema.c_str());
+    }
+
     // Health gate: only report started if a smoke session actually spins up.
     if (!gApi->create_session) {
         gLastError = "librime missing create_session";
@@ -430,6 +471,11 @@ bool BBRimeStart(const char* sharedDataDir,
 bool BBRimeIsHealthy(void) {
     std::lock_guard<std::mutex> lock(gMutex);
     return gStarted && gApi != nullptr;
+}
+
+bool BBRimeHasOctagram(void) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gStarted && gOctagramAvailable;
 }
 
 uint64_t BBRimeCreateSession(void) {
@@ -604,6 +650,77 @@ bool BBRimeSelectSchema(uint64_t session, const char* schemaId) {
     std::lock_guard<std::mutex> lock(gMutex);
     if (!gStarted || !gApi || !gApi->select_schema || session == 0 || !schemaId) return false;
     return gApi->select_schema(static_cast<RimeSessionId>(session), schemaId);
+}
+
+int BBRimeDecodeCandidateTexts(uint64_t session,
+                               const char* input,
+                               char* textBuffer,
+                               uint64_t candidateStride,
+                               int maxCount) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !gApi || session == 0 || !input || !textBuffer
+        || candidateStride < 2 || candidateStride > 65536
+        || maxCount <= 0 || maxCount > BB_MAX_CANDIDATES
+        || !gApi->get_context || !gApi->free_context
+        || !gApi->clear_composition
+        || !apiHasMember(gApi, &RimeApi::set_input)
+        || !gApi->set_input
+        || !apiHasMember(gApi, &RimeApi::highlight_candidate_on_current_page)
+        || !gApi->highlight_candidate_on_current_page) {
+        return -1;
+    }
+
+    const size_t stride = static_cast<size_t>(candidateStride);
+    memset(textBuffer, 0, stride * static_cast<size_t>(maxCount));
+    const RimeSessionId id = static_cast<RimeSessionId>(session);
+    gApi->clear_composition(id);
+    if (!gApi->set_input(id, input)) {
+        gApi->clear_composition(id);
+        return -1;
+    }
+
+    RimeContext context = {0};
+    RIME_STRUCT_INIT(RimeContext, context);
+    if (!gApi->get_context(id, &context)) {
+        gApi->clear_composition(id);
+        return -1;
+    }
+
+    int count = context.menu.candidates ? context.menu.num_candidates : 0;
+    if (count > maxCount) count = maxCount;
+    gApi->free_context(&context);
+
+    // candidate.text may cover only the translated prefix. Highlight each
+    // choice and copy commit_text_preview instead so an unselected tail can
+    // never be silently dropped (for example, `nihaox` -> `你好像`, not `你好`).
+    for (int i = 0; i < count; ++i) {
+        // librime returns false when highlighting is a no-op (normally item 0
+        // is already highlighted), so validate the resulting context instead
+        // of treating that Bool as an error code.
+        gApi->highlight_candidate_on_current_page(id, static_cast<size_t>(i));
+        RimeContext preview = {0};
+        RIME_STRUCT_INIT(RimeContext, preview);
+        if (!gApi->get_context(id, &preview)) {
+            gApi->clear_composition(id);
+            return -1;
+        }
+        if (preview.menu.highlighted_candidate_index != i) {
+            gApi->free_context(&preview);
+            gApi->clear_composition(id);
+            return -1;
+        }
+        const char* text = preview.commit_text_preview;
+        const size_t length = text ? strnlen(text, stride) : 0;
+        if (!text || length == 0 || length >= stride) {
+            gApi->free_context(&preview);
+            gApi->clear_composition(id);
+            return -1;
+        }
+        memcpy(textBuffer + stride * static_cast<size_t>(i), text, length);
+        gApi->free_context(&preview);
+    }
+    gApi->clear_composition(id);
+    return count;
 }
 
 bool BBRimeDeploy(void) {

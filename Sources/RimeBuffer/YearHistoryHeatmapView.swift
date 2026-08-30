@@ -51,7 +51,14 @@ final class YearHistoryHeatmapView: NSView {
 
     /// Called only for a real calendar cell between the first and last recorded
     /// day. Missing days inside that interval are selectable with a total of 0.
-    var onSelectDay: ((String) -> Void)?
+    var onSelectDay: ((String) -> Void)? {
+        didSet {
+            window?.invalidateCursorRects(for: self)
+            if let lastMousePoint {
+                updatePointerCursor(over: cell(at: lastMousePoint))
+            }
+        }
+    }
 
     private enum Metrics {
         static let cellSize: CGFloat = 12
@@ -109,6 +116,23 @@ final class YearHistoryHeatmapView: NSView {
         trackingAreaReference = area
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard onSelectDay != nil else { return }
+        for cell in calendarLayout.cells {
+            addCursorRect(
+                Self.cellFrame(
+                    weekIndex: cell.weekIndex,
+                    weekdayIndex: cell.weekdayIndex,
+                    origin: gridOrigin,
+                    cellSize: Metrics.cellSize,
+                    spacing: Metrics.spacing
+                ),
+                cursor: RimePointingHandCursorRules.cursor(enabled: true)
+            )
+        }
+    }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
@@ -121,13 +145,14 @@ final class YearHistoryHeatmapView: NSView {
     override func mouseExited(with event: NSEvent) {
         lastMousePoint = nil
         setHoveredCell(nil)
+        RimePointingHandCursorRules.mouseExited()
     }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         updateHover(at: point)
-        guard let cell = cell(at: point) else { return }
-        onSelectDay?(cell.dayKey)
+        guard let onSelectDay, let cell = cell(at: point) else { return }
+        onSelectDay(cell.dayKey)
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -309,6 +334,7 @@ final class YearHistoryHeatmapView: NSView {
             ($0.weekIndex * 7 + $0.weekdayIndex, $0)
         })
         invalidateIntrinsicContentSize()
+        window?.invalidateCursorRects(for: self)
         needsDisplay = true
         if let lastMousePoint {
             updateHover(at: lastMousePoint)
@@ -336,7 +362,25 @@ final class YearHistoryHeatmapView: NSView {
 
     private func updateHover(at point: CGPoint) {
         lastMousePoint = point
-        setHoveredCell(cell(at: point))
+        let hoveredCell = cell(at: point)
+        setHoveredCell(hoveredCell)
+        updatePointerCursor(over: hoveredCell)
+    }
+
+    static func pointerActionIsEnabled(
+        hasSelectionHandler: Bool,
+        overDayCell: Bool
+    ) -> Bool {
+        hasSelectionHandler && overDayCell
+    }
+
+    private func updatePointerCursor(over cell: DayCell?) {
+        RimePointingHandCursorRules.mouseEntered(
+            enabled: Self.pointerActionIsEnabled(
+                hasSelectionHandler: onSelectDay != nil,
+                overDayCell: cell != nil
+            )
+        )
     }
 
     private func setHoveredCell(_ cell: DayCell?) {
@@ -578,8 +622,22 @@ func runHistoryHeatmapSmokeTest() -> Bool {
             == CGSize(width: 27, height: 102),
           YearHistoryHeatmapView.monthMarkers(layout: layout).map(\.monthKey)
             == ["2024-02", "2024-03"],
-          YearHistoryHeatmapView.makeLayout(snapshot: .empty) == .empty else {
+              YearHistoryHeatmapView.makeLayout(snapshot: .empty) == .empty else {
         return fail("pure geometry, month markers, or empty state")
+    }
+    guard YearHistoryHeatmapView.pointerActionIsEnabled(
+            hasSelectionHandler: true,
+            overDayCell: true
+          ),
+          !YearHistoryHeatmapView.pointerActionIsEnabled(
+            hasSelectionHandler: false,
+            overDayCell: true
+          ),
+          !YearHistoryHeatmapView.pointerActionIsEnabled(
+            hasSelectionHandler: true,
+            overDayCell: false
+          ) else {
+        return fail("selectable-cell pointer applicability")
     }
     let excessiveSpan = KeyFrequencyHistorySnapshot(
         days: [

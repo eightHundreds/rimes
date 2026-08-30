@@ -1,0 +1,1208 @@
+import Cocoa
+import Carbon.HIToolbox
+import InputMethodKit
+
+enum ClipboardHistoryWindowVisibilityRules {
+    static func isVisibleOnActiveSpace(isOrdered: Bool, isOnActiveSpace: Bool) -> Bool {
+        isOrdered && isOnActiveSpace
+    }
+}
+
+enum ClipboardHistoryEventRoute: Equatable {
+    case handledBySurface
+    case routeToRime
+    case passThrough
+}
+
+enum ClipboardHistoryWindowLifecycleRules {
+    static func captureState(
+        windowVisibleOnActiveSpace: Bool,
+        captureEnabled: Bool,
+        secureInput: Bool,
+        screenLocked: Bool,
+        sessionInactive: Bool,
+        sleeping: Bool
+    ) -> ClipboardHistoryCaptureState {
+        var protection: ClipboardHistoryProtection = []
+        if secureInput { protection.insert(.secureInput) }
+        if screenLocked { protection.insert(.screenLocked) }
+        if sessionInactive || sleeping { protection.insert(.sessionInactive) }
+        return ClipboardHistoryCaptureState(
+            windowVisible: windowVisibleOnActiveSpace,
+            captureEnabled: captureEnabled,
+            protection: protection
+        )
+    }
+}
+
+enum ClipboardHistoryActivationRules {
+    static func canInsertEveryItemAsPlainText(
+        items: [ClipboardHistoryItem],
+        archives: [ClipboardPasteboardArchive]
+    ) -> Bool {
+        guard !items.isEmpty, items.count == archives.count else { return false }
+        return zip(items, archives).allSatisfy { pair in
+            let (item, archive) = pair
+            return (item.kind == .text || item.kind == .link)
+                && item.textCompleteness == .complete
+                && !(item.canonicalText ?? "").isEmpty
+                && !archive.requiresPasteboardRestorationForTextInsertion
+        }
+    }
+}
+
+/// Rich clipboard values cannot be represented by IMKTextInput.insertText.
+/// Restore the native pasteboard archive, then send one tagged Command+V pair
+/// directly to the exact process that owned the frozen FocusToken. The tag lets
+/// RIMES pass its own synthetic event through even when Buffer capture happens
+/// to be enabled, while an untagged user Command+V keeps its existing routing.
+enum ClipboardHistoryHostPasteRules {
+    enum SequenceDecision: Equatable {
+        case passAndArmKeyDown
+        case passAndFinish
+        case consumeAndFinish
+    }
+
+    private static let markerPrefix: Int64 = 0x5249_4D45_0000_0000
+    private static let markerMask = Int64(bitPattern: 0xFFFF_FFFF_0000_0000)
+
+    static func makeMarker() -> Int64 {
+        markerPrefix | Int64(UInt32.random(in: 1...UInt32.max))
+    }
+
+    static func makeEventPair(
+        marker: Int64
+    ) -> (keyDown: CGEvent, keyUp: CGEvent)? {
+        guard marker & markerMask == markerPrefix else { return nil }
+        guard let source = CGEventSource(stateID: .combinedSessionState),
+              let keyDown = CGEvent(
+                keyboardEventSource: source,
+                virtualKey: CGKeyCode(kVK_ANSI_V),
+                keyDown: true
+              ),
+              let keyUp = CGEvent(
+                keyboardEventSource: source,
+                virtualKey: CGKeyCode(kVK_ANSI_V),
+                keyDown: false
+              ) else { return nil }
+        source.localEventsSuppressionInterval = 0
+        for event in [keyDown, keyUp] {
+            event.flags = [.maskCommand]
+            event.setIntegerValueField(
+                .eventSourceUserData,
+                value: marker
+            )
+        }
+        return (keyDown, keyUp)
+    }
+
+    static func isTaggedPasteEvent(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown || event.type == .keyUp,
+              event.keyCode == UInt16(kVK_ANSI_V),
+              let marker = event.cgEvent?.getIntegerValueField(
+                .eventSourceUserData
+              ), marker & markerMask == markerPrefix else { return false }
+        let modifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option, .shift])
+        return modifiers == [.command]
+    }
+
+    static func matches(_ event: NSEvent, marker: Int64) -> Bool {
+        isTaggedPasteEvent(event)
+            && event.cgEvent?.getIntegerValueField(.eventSourceUserData)
+                == marker
+    }
+
+    static func sequenceDecision(
+        eventType: NSEvent.EventType,
+        keyDownAccepted: Bool
+    ) -> SequenceDecision {
+        switch (eventType, keyDownAccepted) {
+        case (.keyDown, false): return .passAndArmKeyDown
+        case (.keyUp, true): return .passAndFinish
+        default: return .consumeAndFinish
+        }
+    }
+
+    static func hasPostEventAccess(requestIfNeeded: Bool) -> Bool {
+        if CGPreflightPostEventAccess() { return true }
+        return requestIfNeeded && CGRequestPostEventAccess()
+    }
+
+    @discardableResult
+    static func postPaste(
+        to processIdentifier: pid_t,
+        marker: Int64,
+        validateAuthority: () -> Bool
+    ) -> Bool {
+        guard processIdentifier > 0,
+              hasPostEventAccess(requestIfNeeded: false),
+              let events = makeEventPair(marker: marker),
+              validateAuthority() else { return false }
+        events.keyDown.postToPid(processIdentifier)
+        events.keyUp.postToPid(processIdentifier)
+        return true
+    }
+}
+
+private final class ClipboardHistoryPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+private final class ClipboardHistoryChromeView: NSVisualEffectView {
+    private let borderLayer = CAShapeLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        borderLayer.fillColor = NSColor.clear.cgColor
+        layer?.addSublayer(borderLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        let scale = window?.backingScaleFactor ?? 2
+        let lineWidth = 1 / max(1, scale)
+        layer?.cornerRadius = ClipboardHistoryWindowMetrics.cornerRadius
+        layer?.masksToBounds = true
+        borderLayer.frame = bounds
+        borderLayer.lineWidth = lineWidth
+        borderLayer.path = CGPath(
+            roundedRect: bounds.insetBy(dx: lineWidth / 2, dy: lineWidth / 2),
+            cornerWidth: ClipboardHistoryWindowMetrics.cornerRadius,
+            cornerHeight: ClipboardHistoryWindowMetrics.cornerRadius,
+            transform: nil
+        )
+    }
+
+    func applyAppearance() {
+        material = RimeUI.isDark ? .hudWindow : .popover
+        blendingMode = .behindWindow
+        state = .active
+        appearance = RimeUI.appKitAppearance
+        layer?.backgroundColor = RimeUI.workbenchChrome.cgColor
+        borderLayer.strokeColor = RimeUI.borderStrong.cgColor
+        needsLayout = true
+    }
+}
+
+/// Standalone Clipboard History surface. It deliberately remains
+/// nonactivating so the exact external FocusToken survives while the user
+/// searches and selects. It is not a Buffer source or destination.
+final class ClipboardHistoryWindowController: NSObject, NSWindowDelegate {
+    static let shared = ClipboardHistoryWindowController()
+
+    private enum Key {
+        static let captureEnabled = "clipboardHistory.captureEnabled.v1"
+        static let legacyRailEnabled = "bufferWindow.clipboardRailEnabled.v1"
+    }
+
+    private let panel: ClipboardHistoryPanel
+    private let chrome = ClipboardHistoryChromeView(frame: .zero)
+    private let historyModel: ClipboardHistoryModel
+    private let pane: ClipboardHistoryPaneView
+    private var observers: [NSObjectProtocol] = []
+    private var secureInputTimer: Timer?
+    private var lastSecureInputState = IsSecureEventInputEnabled()
+    private var sessionInactive = false
+    private var screenLocked = false
+    private var sleeping = false
+    private var hiddenForSession = false
+    private var presentationIntent = false
+    private var presentationTargetToken: FocusToken?
+    private weak var presentationTargetController: RimeBufferController?
+    private var explicitCaptureGeneration: UInt64 = 0
+    private var consumedKeyCodes: Set<UInt16> = []
+    private var lastHandledKeyCode: UInt16?
+    private var lastHandledClientIdentity: ObjectIdentifier?
+    private var lastHandledKeyUptime: TimeInterval = 0
+    private var richActivationGeneration: UInt64 = 0
+    private var richActivationInFlight = false
+    private struct PendingHostPaste {
+        let token: FocusToken
+        let clientIdentity: ObjectIdentifier
+        let processIdentifier: pid_t
+        let marker: Int64
+        let generation: UInt64
+        let expiresAtUptime: TimeInterval
+        var keyDownAccepted = false
+    }
+    private var pendingHostPaste: PendingHostPaste?
+    private var pendingHostPasteGeneration: UInt64 = 0
+
+    var isVisible: Bool {
+        ClipboardHistoryWindowVisibilityRules.isVisibleOnActiveSpace(
+            isOrdered: panel.isVisible,
+            isOnActiveSpace: panel.isOnActiveSpace
+        )
+    }
+
+    var captureEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Key.captureEnabled) }
+        set {
+            guard newValue != captureEnabled else { return }
+            if !newValue { retireSearchCompositionIfNeeded() }
+            UserDefaults.standard.set(newValue, forKey: Key.captureEnabled)
+            syncCaptureState()
+            if newValue, isVisible { scheduleExplicitCapture() }
+        }
+    }
+
+    private override init() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Key.captureEnabled) == nil {
+            let migrated = defaults.object(forKey: Key.legacyRailEnabled)
+                .map { _ in defaults.bool(forKey: Key.legacyRailEnabled) } ?? true
+            defaults.set(migrated, forKey: Key.captureEnabled)
+        }
+
+        let model = MainActor.assumeIsolated { ClipboardHistoryModel() }
+        historyModel = model
+        pane = MainActor.assumeIsolated { ClipboardHistoryPaneView(model: model) }
+        panel = ClipboardHistoryPanel(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: ClipboardHistoryWindowMetrics.preferredWidth,
+                height: ClipboardHistoryWindowMetrics.preferredHeight
+            ),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+        buildWindow()
+        installObservers()
+        MainActor.assumeIsolated { historyModel.start() }
+        syncCaptureState()
+    }
+
+    deinit {
+        secureInputTimer?.invalidate()
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    func start() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        syncCaptureState()
+    }
+
+    @discardableResult
+    func flushPersistenceBeforeTermination(
+        timeout: TimeInterval = 5
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return MainActor.assumeIsolated {
+            historyModel.flushPersistence(timeout: timeout)
+        }
+    }
+
+    func toggleVisibility() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        isVisible ? hide() : show()
+    }
+
+    func show() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !sessionProtectionActive else { return }
+
+        cancelPendingHostPaste()
+        presentationIntent = true
+        hiddenForSession = false
+        consumedKeyCodes.removeAll()
+        MainActor.assumeIsolated { pane.resetSearch() }
+
+        let initialTarget = InputFocusCoordinator.shared.liveTarget(
+            forceOverlayVisibilityRefresh: true
+        )
+        if let initialTarget,
+           initialTarget.isExternalTarget,
+           initialTarget.compositionActive {
+            initialTarget.controller?.resolveCompositionForWorkbenchTransition(
+                target: initialTarget
+            )
+        }
+        presentationTargetToken = initialTarget.flatMap { target in
+            guard target.isExternalTarget,
+                  InputFocusCoordinator.shared.liveTarget(
+                    expected: target.token,
+                    forceOverlayVisibilityRefresh: true
+                  ) === target else { return nil }
+            return target.token
+        }
+        presentationTargetController = presentationTargetToken == nil
+            ? nil
+            : initialTarget?.controller
+
+        positionOnCurrentScreen(target: initialTarget)
+        if panel.isVisible, !panel.isOnActiveSpace { panel.orderOut(nil) }
+        applyAppearance()
+        panel.orderFrontRegardless()
+        syncCaptureState()
+        scheduleExplicitCapture()
+        RimeBufferController.refreshActiveUI()
+        let targetDescription = presentationTargetToken?.description ?? "none"
+        IMELog.write("clipboard window shown target=\(targetDescription)")
+    }
+
+    func hide(preservingPendingHostPaste: Bool = false) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        retireSearchCompositionIfNeeded()
+        richActivationGeneration &+= 1
+        richActivationInFlight = false
+        if !preservingPendingHostPaste { cancelPendingHostPaste() }
+        presentationIntent = false
+        hiddenForSession = false
+        explicitCaptureGeneration &+= 1
+        presentationTargetToken = nil
+        presentationTargetController = nil
+        MainActor.assumeIsolated { pane.resetSearch() }
+        panel.orderOut(nil)
+        syncCaptureState()
+        IMELog.write("clipboard window hidden")
+    }
+
+    /// Returns nil for an ordinary hardware event, false when the exact tagged
+    /// event should continue to the host, and true when a stale/forged tagged
+    /// event must be consumed. This runs before Buffer shortcut routing.
+    func routeSyntheticHostPaste(
+        _ event: NSEvent,
+        client: IMKTextInput,
+        controller: RimeBufferController,
+        focusAdopted: Bool
+    ) -> Bool? {
+        guard ClipboardHistoryHostPasteRules.isTaggedPasteEvent(event) else {
+            return nil
+        }
+        guard focusAdopted,
+              let pending = livePendingHostPaste(),
+              ClipboardHistoryHostPasteRules.matches(
+                event,
+                marker: pending.marker
+              ),
+              pendingHostPasteTarget(
+                pending,
+                client: client,
+                controller: controller
+              ) != nil else {
+            cancelPendingHostPaste()
+            return true
+        }
+        switch ClipboardHistoryHostPasteRules.sequenceDecision(
+            eventType: event.type,
+            keyDownAccepted: pending.keyDownAccepted
+        ) {
+        case .passAndArmKeyDown:
+            var armed = pending
+            armed.keyDownAccepted = true
+            pendingHostPaste = armed
+            return false
+        case .passAndFinish:
+            cancelPendingHostPaste()
+            return false
+        case .consumeAndFinish:
+            cancelPendingHostPaste()
+            return true
+        }
+    }
+
+    /// AppKit hosts may issue `didCommandBy(paste:)` after the tagged keyDown.
+    /// Let that one callback reach the host instead of reinterpreting it as a
+    /// Buffer source-paste command.
+    func routeSyntheticHostPasteCommand(
+        _ selector: Selector,
+        client: IMKTextInput?,
+        controller: RimeBufferController
+    ) -> Bool? {
+        guard NSStringFromSelector(selector) == "paste:",
+              let pending = livePendingHostPaste()
+        else { return nil }
+        let target = pending.keyDownAccepted
+            ? pendingHostPasteTarget(
+                pending,
+                client: client,
+                controller: controller
+              )
+            : nil
+        cancelPendingHostPaste()
+        return target == nil
+    }
+
+    /// The standalone panel stays nonactivating, so its logical search field
+    /// borrows the current controller's Rime session while retaining the exact
+    /// external client as a later delivery target.
+    func capturesSearchInput(
+        expected token: FocusToken,
+        client: IMKTextInput
+    ) -> Bool {
+        guard isVisible,
+              presentationTargetToken == token,
+              captureState().allowsContentPresentation,
+              let target = InputFocusCoordinator.shared.interactionTarget(
+                expected: token
+              ),
+              target.isExternalTarget,
+              target.clientIdentity == ObjectIdentifier(client as AnyObject)
+        else { return false }
+        return true
+    }
+
+    @discardableResult
+    func appendSearchText(
+        _ text: String,
+        expected token: FocusToken,
+        client: IMKTextInput
+    ) -> Bool {
+        guard capturesSearchInput(expected: token, client: client) else {
+            return false
+        }
+        return MainActor.assumeIsolated { pane.appendSearchText(text) }
+    }
+
+    func updateSearchComposition(
+        _ text: String,
+        expected token: FocusToken,
+        client: IMKTextInput
+    ) -> NSRect? {
+        guard capturesSearchInput(expected: token, client: client) else {
+            return nil
+        }
+        return MainActor.assumeIsolated {
+            pane.updateComposingText(text)
+            return pane.searchCaretRectOnScreen()
+        }
+    }
+
+    func searchCaretScreenRect(expected token: FocusToken) -> NSRect? {
+        guard isVisible,
+              presentationTargetToken == token,
+              captureState().allowsContentPresentation,
+              InputFocusCoordinator.shared.interactionTarget(
+                expected: token
+              ) != nil else { return nil }
+        return MainActor.assumeIsolated { pane.searchCaretRectOnScreen() }
+    }
+
+    func clearSearchComposition() {
+        MainActor.assumeIsolated { pane.updateComposingText("") }
+    }
+
+    func focusDidChange() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let pending = pendingHostPaste,
+           pendingHostPasteTarget(
+            pending,
+            client: nil,
+            controller: nil
+           ) == nil {
+            cancelPendingHostPaste()
+        }
+        guard isVisible, let presentationTargetToken else { return }
+        guard InputFocusCoordinator.shared.liveTarget(
+            expected: presentationTargetToken,
+            forceOverlayVisibilityRefresh: true
+        ) != nil else {
+            hide()
+            return
+        }
+    }
+
+    func focusInvalidated(_ token: FocusToken) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if pendingHostPaste?.token == token {
+            cancelPendingHostPaste()
+        }
+        guard presentationTargetToken == token else { return }
+        hide()
+    }
+
+    /// IMK routing entry. Key-up ownership survives a successful Return that
+    /// closes the panel, preventing the release from leaking into the host.
+    @discardableResult
+    func route(_ event: NSEvent, client: IMKTextInput) -> ClipboardHistoryEventRoute {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if event.type == .keyUp {
+            return consumedKeyCodes.remove(event.keyCode) != nil
+                ? .handledBySurface
+                : .passThrough
+        }
+        guard event.type == .keyDown else { return .passThrough }
+        // A fresh physical keyDown retires command-callback ownership from the
+        // preceding press before this event decides whether Clip owns it.
+        lastHandledKeyCode = nil
+        lastHandledClientIdentity = nil
+        guard isVisible,
+              let token = presentationTargetToken,
+              let target = InputFocusCoordinator.shared.liveTarget(
+                expected: token,
+                forceOverlayVisibilityRefresh: true
+              ),
+              target.isExternalTarget,
+              target.clientIdentity == ObjectIdentifier(client as AnyObject),
+              !IsSecureEventInputEnabled() else { return .passThrough }
+
+        if target.controller?.clipboardSearchCompositionIsActive(
+            expected: token,
+            client: client
+        ) == true,
+           Self.isRimeCompositionEditingEvent(event) {
+            armEventOwnership(event, client: client)
+            return .routeToRime
+        }
+
+        // Arm callback suppression before the action. Delivery can synchronously
+        // re-enter a host, so recording only after Return finishes is too late.
+        lastHandledKeyCode = event.keyCode
+        lastHandledClientIdentity = ObjectIdentifier(client as AnyObject)
+        lastHandledKeyUptime = ProcessInfo.processInfo.systemUptime
+        let handled = MainActor.assumeIsolated { pane.handleKeyDown(event) }
+        if handled {
+            consumedKeyCodes.insert(event.keyCode)
+            return .handledBySurface
+        }
+        if Self.isPlainSearchInputEvent(event) {
+            consumedKeyCodes.insert(event.keyCode)
+            return .routeToRime
+        }
+        lastHandledKeyCode = nil
+        lastHandledClientIdentity = nil
+        return .passThrough
+    }
+
+    /// Suppresses AppKit command callbacks corresponding to an IMK keyDown we
+    /// already handled. Some hosts send both paths even after `handle` returns
+    /// true; consuming the duplicate prevents Return/Delete/Escape leakage.
+    func consumeCommandIfRecentlyHandled(
+        _ selector: Selector,
+        client: IMKTextInput?
+    ) -> Bool {
+        guard let lastHandledKeyCode,
+              Self.hardwareKeyCodes(for: selector).contains(lastHandledKeyCode),
+              ProcessInfo.processInfo.systemUptime - lastHandledKeyUptime < 0.5 else {
+            return false
+        }
+        if let client,
+           lastHandledClientIdentity != ObjectIdentifier(client as AnyObject) {
+            return false
+        }
+        return true
+    }
+
+    func clearHistory() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !MainActor.assumeIsolated({ historyModel.isContentShielded }) else {
+            return
+        }
+        MainActor.assumeIsolated { historyModel.clear() }
+    }
+
+    private func buildWindow() {
+        panel.level = CandidatePanelLevelRules.workbenchStandard
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = false
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .transient]
+        panel.delegate = self
+        panel.setAccessibilityTitle("RIMES Clipboard History")
+
+        chrome.translatesAutoresizingMaskIntoConstraints = false
+        pane.translatesAutoresizingMaskIntoConstraints = false
+        chrome.addSubview(pane)
+        NSLayoutConstraint.activate([
+            pane.leadingAnchor.constraint(equalTo: chrome.leadingAnchor, constant: 2),
+            pane.trailingAnchor.constraint(equalTo: chrome.trailingAnchor, constant: -2),
+            pane.topAnchor.constraint(equalTo: chrome.topAnchor, constant: 2),
+            pane.bottomAnchor.constraint(equalTo: chrome.bottomAnchor, constant: -2),
+        ])
+        panel.contentView = chrome
+
+        MainActor.assumeIsolated {
+            pane.onActivate = { [weak self] items in
+                self?.deliver(items) ?? false
+            }
+            pane.onCopy = { [weak self] items in self?.copy(items) ?? false }
+            pane.onClose = { [weak self] in self?.hide() }
+        }
+        applyAppearance()
+    }
+
+    private func applyAppearance() {
+        panel.appearance = RimeUI.appKitAppearance
+        chrome.applyAppearance()
+        panel.invalidateShadow()
+    }
+
+    private func positionOnCurrentScreen(target: FocusLease?) {
+        let targetRect = target.flatMap { lease in
+            lease.controller?.workbenchCaretRect(expected: lease)
+        }
+        let screen = targetRect.flatMap { rect in
+            NSScreen.screens.first { $0.visibleFrame.intersects(rect) }
+        } ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+        let visible = screen?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let width = min(
+            ClipboardHistoryWindowMetrics.preferredWidth,
+            max(1, visible.width - 32)
+        )
+        let height = min(ClipboardHistoryWindowMetrics.preferredHeight, visible.height)
+        let frame = NSRect(
+            x: visible.midX - width / 2,
+            y: visible.minY + min(24, max(0, visible.height - height)),
+            width: width,
+            height: height
+        )
+        panel.setFrame(frame, display: false)
+    }
+
+    private func captureState(
+        secureInputEnabled: Bool? = nil
+    ) -> ClipboardHistoryCaptureState {
+        ClipboardHistoryWindowLifecycleRules.captureState(
+            windowVisibleOnActiveSpace: isVisible && !hiddenForSession,
+            captureEnabled: captureEnabled,
+            secureInput: secureInputEnabled ?? IsSecureEventInputEnabled(),
+            screenLocked: screenLocked,
+            sessionInactive: sessionInactive,
+            sleeping: sleeping
+        )
+    }
+
+    private func syncCaptureState(secureInputEnabled: Bool? = nil) {
+        let state = captureState(secureInputEnabled: secureInputEnabled)
+        MainActor.assumeIsolated {
+            historyModel.update(
+                windowVisible: state.windowVisible,
+                captureEnabled: state.captureEnabled,
+                protection: state.protection
+            )
+            pane.reloadFromModel()
+        }
+    }
+
+    private func scheduleExplicitCapture() {
+        explicitCaptureGeneration &+= 1
+        let generation = explicitCaptureGeneration
+        DispatchQueue.main.async { [weak self] in
+            self?.performExplicitCapture(generation: generation, mayRetry: true)
+        }
+    }
+
+    private func performExplicitCapture(generation: UInt64, mayRetry: Bool) {
+        guard generation == explicitCaptureGeneration,
+              presentationIntent,
+              captureEnabled else { return }
+        syncCaptureState()
+        let state = captureState()
+        if state.allowsClipboardObservation {
+            _ = MainActor.assumeIsolated {
+                historyModel.captureCurrentIfEligible()
+            }
+            return
+        }
+        guard mayRetry,
+              panel.isVisible,
+              !sessionProtectionActive,
+              !IsSecureEventInputEnabled() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.performExplicitCapture(generation: generation, mayRetry: false)
+        }
+    }
+
+    private func deliver(_ items: [ClipboardHistoryItem]) -> Bool {
+        guard isVisible,
+              captureState().allowsContentPresentation,
+              !items.isEmpty else {
+            NSSound.beep()
+            return false
+        }
+        return activateArchives(items, closesAfterWrite: true)
+    }
+
+    private func copy(_ items: [ClipboardHistoryItem]) -> Bool {
+        guard isVisible, captureState().allowsContentPresentation,
+              !items.isEmpty else {
+            NSSound.beep()
+            return false
+        }
+        return activateArchives(items, closesAfterWrite: false)
+    }
+
+    private func activateArchives(
+        _ items: [ClipboardHistoryItem],
+        closesAfterWrite: Bool
+    ) -> Bool {
+        guard !richActivationInFlight else {
+            NSSound.beep()
+            return false
+        }
+        let expectedToken = presentationTargetToken
+        if closesAfterWrite, expectedToken == nil {
+            NSSound.beep()
+            return false
+        }
+
+        richActivationGeneration &+= 1
+        let generation = richActivationGeneration
+        richActivationInFlight = true
+        let itemIDs = items.map(\.id)
+        MainActor.assumeIsolated {
+            historyModel.loadArchives(ids: itemIDs) { [weak self] archives in
+                guard let self,
+                      self.richActivationGeneration == generation else {
+                    return
+                }
+                self.richActivationInFlight = false
+                guard self.isVisible,
+                      self.captureState().allowsContentPresentation,
+                      let archives,
+                      archives.count == items.count else {
+                    NSSound.beep()
+                    return
+                }
+
+                if closesAfterWrite {
+                    guard let expectedToken,
+                          self.presentationTargetToken == expectedToken,
+                          let target = InputFocusCoordinator.shared.liveTarget(
+                            expected: expectedToken,
+                            forceOverlayVisibilityRefresh: true
+                          ),
+                          target.isExternalTarget else {
+                        NSSound.beep()
+                        return
+                    }
+
+                    let canInsertEveryItem = ClipboardHistoryActivationRules
+                        .canInsertEveryItemAsPlainText(
+                            items: items,
+                            archives: archives
+                        )
+                    if canInsertEveryItem {
+                        guard let controller = target.controller else {
+                            NSSound.beep()
+                            return
+                        }
+                        var deliveredIDs: [UUID] = []
+                        for item in items {
+                            guard self.isVisible,
+                                  self.presentationTargetToken == expectedToken,
+                                  self.captureState().allowsContentPresentation,
+                                  let canonicalText = item.canonicalText,
+                                  controller.deliverClipboardHistoryText(
+                                    canonicalText,
+                                    expected: expectedToken
+                                  ) else { break }
+                            deliveredIDs.append(item.id)
+                        }
+                        MainActor.assumeIsolated {
+                            _ = self.historyModel.promote(ids: deliveredIDs)
+                        }
+                        if deliveredIDs.count == items.count {
+                            self.hide()
+                        } else {
+                            let remaining = items.dropFirst(deliveredIDs.count)
+                                .map(\.id)
+                            MainActor.assumeIsolated {
+                                _ = self.historyModel.select(
+                                    ids: remaining,
+                                    focusedID: remaining.first
+                                )
+                            }
+                            NSSound.beep()
+                        }
+                        return
+                    }
+                }
+
+                // IMKit can insert complete plain text through the exact focus
+                // token, but it has no lossless primitive for HTML/RTF, images,
+                // files, colors, or unknown UTIs. Restore those representations
+                // exactly, then target one tagged paste gesture to the same
+                // process. Access is requested only from this explicit action.
+                var richTarget: FocusLease?
+                if closesAfterWrite {
+                    guard ClipboardHistoryHostPasteRules.hasPostEventAccess(
+                        requestIfNeeded: true
+                    ) else {
+                        NSSound.beep()
+                        IMELog.write("clipboard host paste permission unavailable")
+                        return
+                    }
+                    guard let expectedToken,
+                          self.presentationTargetToken == expectedToken,
+                          !IsSecureEventInputEnabled(),
+                          !self.sessionProtectionActive,
+                          let target = InputFocusCoordinator.shared.liveTarget(
+                            expected: expectedToken,
+                            forceOverlayVisibilityRefresh: true
+                          ),
+                          target.isExternalTarget,
+                          target.processIdentifier > 0,
+                          target.client != nil else {
+                        NSSound.beep()
+                        IMELog.write("clipboard host paste target changed before restore")
+                        return
+                    }
+                    richTarget = target
+                }
+                do {
+                    let merged = try ClipboardPasteboardArchive.merging(archives)
+                    let writtenChangeCount = try merged.write(to: .general)
+                    self.syncCaptureState()
+                    MainActor.assumeIsolated {
+                        _ = self.historyModel.baselineAfterOwnPasteboardWrite(
+                            expectedChangeCount: writtenChangeCount
+                        )
+                    }
+                    if closesAfterWrite {
+                        guard let frozenTarget = richTarget,
+                              let expectedToken,
+                              frozenTarget.token == expectedToken,
+                              let target = InputFocusCoordinator.shared.liveTarget(
+                                expected: expectedToken,
+                                forceOverlayVisibilityRefresh: true
+                              ),
+                              target.isExternalTarget,
+                              target.processIdentifier
+                                == frozenTarget.processIdentifier,
+                              target.clientIdentity
+                                == frozenTarget.clientIdentity,
+                              target.client != nil,
+                              !IsSecureEventInputEnabled(),
+                              !self.sessionProtectionActive else {
+                            NSSound.beep()
+                            IMELog.write("clipboard host paste target changed after restore")
+                            return
+                        }
+                        let marker = self.armPendingHostPaste(target: target)
+                        guard ClipboardHistoryHostPasteRules.postPaste(
+                            to: target.processIdentifier,
+                            marker: marker,
+                            validateAuthority: {
+                                guard let pending = self.livePendingHostPaste(),
+                                      pending.marker == marker else {
+                                    return false
+                                }
+                                return self.pendingHostPasteTarget(
+                                    pending,
+                                    client: target.client,
+                                    controller: target.controller
+                                ) != nil
+                            }
+                        ) else {
+                            self.cancelPendingHostPaste()
+                            NSSound.beep()
+                            IMELog.write("clipboard host paste event unavailable")
+                            return
+                        }
+                        MainActor.assumeIsolated {
+                            _ = self.historyModel.promote(ids: itemIDs)
+                        }
+                        self.hide(preservingPendingHostPaste: true)
+                    } else {
+                        MainActor.assumeIsolated {
+                            _ = self.historyModel.promote(ids: itemIDs)
+                        }
+                    }
+                } catch {
+                    IMELog.write(
+                        "clipboard archive restore failed: "
+                            + error.localizedDescription
+                    )
+                    NSSound.beep()
+                }
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    private func armPendingHostPaste(target: FocusLease) -> Int64 {
+        pendingHostPasteGeneration &+= 1
+        let generation = pendingHostPasteGeneration
+        let marker = ClipboardHistoryHostPasteRules.makeMarker()
+        pendingHostPaste = PendingHostPaste(
+            token: target.token,
+            clientIdentity: target.clientIdentity,
+            processIdentifier: target.processIdentifier,
+            marker: marker,
+            generation: generation,
+            expiresAtUptime: ProcessInfo.processInfo.systemUptime + 0.25
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self,
+                  self.pendingHostPaste?.generation == generation else {
+                return
+            }
+            self.cancelPendingHostPaste()
+        }
+        return marker
+    }
+
+    private func livePendingHostPaste() -> PendingHostPaste? {
+        guard let pendingHostPaste else { return nil }
+        guard ProcessInfo.processInfo.systemUptime
+                <= pendingHostPaste.expiresAtUptime else {
+            cancelPendingHostPaste()
+            return nil
+        }
+        return pendingHostPaste
+    }
+
+    private func cancelPendingHostPaste() {
+        pendingHostPasteGeneration &+= 1
+        pendingHostPaste = nil
+    }
+
+    private func pendingHostPasteTarget(
+        _ pending: PendingHostPaste,
+        client: IMKTextInput?,
+        controller: RimeBufferController?
+    ) -> FocusLease? {
+        guard !IsSecureEventInputEnabled(),
+              !sessionProtectionActive else { return nil }
+        if let client,
+           pending.clientIdentity != ObjectIdentifier(client as AnyObject) {
+            return nil
+        }
+        guard let target = InputFocusCoordinator.shared.liveTarget(
+                expected: pending.token,
+                forceOverlayVisibilityRefresh: true
+              ),
+              target.isExternalTarget,
+              target.processIdentifier == pending.processIdentifier,
+              target.clientIdentity == pending.clientIdentity,
+              target.client != nil else { return nil }
+        if let controller, target.controller !== controller { return nil }
+        return target
+    }
+
+    func cancelPendingHostPasteForInputSourceChange() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        cancelPendingHostPaste()
+    }
+
+    private func installObservers() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
+            forName: .rimeAppearanceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in self?.applyAppearance() })
+
+        let workspace = NSWorkspace.shared.notificationCenter
+        observers.append(workspace.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.activeSpaceDidChange()
+        })
+        observers.append(workspace.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sessionInactive = true
+            self?.protectForSession()
+        })
+        observers.append(workspace.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sessionInactive = false
+            self?.restoreAfterSessionProtection()
+        })
+        observers.append(workspace.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sleeping = true
+            self?.protectForSession()
+        })
+        observers.append(workspace.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sleeping = false
+            self?.restoreAfterSessionProtection()
+        })
+
+        let distributed = DistributedNotificationCenter.default()
+        observers.append(distributed.addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenLocked = true
+            self?.protectForSession()
+        })
+        observers.append(distributed.addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenLocked = false
+            self?.restoreAfterSessionProtection()
+        })
+
+        secureInputTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let secure = IsSecureEventInputEnabled()
+            guard secure != self.lastSecureInputState else { return }
+            self.lastSecureInputState = secure
+            self.syncCaptureState(secureInputEnabled: secure)
+            if secure {
+                self.cancelPendingHostPaste()
+                self.retireSearchCompositionIfNeeded()
+                MainActor.assumeIsolated { self.pane.scrubForProtection() }
+            }
+        }
+        if let secureInputTimer { RunLoop.main.add(secureInputTimer, forMode: .common) }
+    }
+
+    private func protectForSession() {
+        explicitCaptureGeneration &+= 1
+        cancelPendingHostPaste()
+        hiddenForSession = panel.isVisible || presentationIntent
+        retireSearchCompositionIfNeeded()
+        presentationTargetToken = nil
+        presentationTargetController = nil
+        MainActor.assumeIsolated { pane.scrubForProtection() }
+        panel.orderOut(nil)
+        syncCaptureState()
+    }
+
+    /// `isOnActiveSpace` is part of the capture authority, but AppKit does not
+    /// emit a window visibility callback when Mission Control changes Spaces.
+    /// Close the read gate synchronously, then re-evaluate on the next main-loop
+    /// turn after AppKit has updated the panel's Space membership. Resuming is
+    /// baseline-only, so content copied during the transition is never imported.
+    private func activeSpaceDidChange() {
+        explicitCaptureGeneration &+= 1
+        cancelPendingHostPaste()
+        retireSearchCompositionIfNeeded()
+        MainActor.assumeIsolated {
+            historyModel.update(
+                windowVisible: false,
+                captureEnabled: captureEnabled,
+                protection: captureState().protection
+            )
+            pane.reloadFromModel()
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.syncCaptureState()
+        }
+    }
+
+    private func restoreAfterSessionProtection() {
+        syncCaptureState()
+        guard hiddenForSession, presentationIntent, !sessionProtectionActive else { return }
+        hiddenForSession = false
+        positionOnCurrentScreen(target: nil)
+        panel.orderFrontRegardless()
+        syncCaptureState()
+        // Passive restore deliberately establishes only a baseline; content
+        // copied during the protected interval is never imported.
+    }
+
+    private var sessionProtectionActive: Bool {
+        sessionInactive || screenLocked || sleeping
+    }
+
+    private func retireSearchCompositionIfNeeded() {
+        guard let token = presentationTargetToken else {
+            clearSearchComposition()
+            return
+        }
+        presentationTargetController?.cancelClipboardSearchComposition(
+            expected: token
+        )
+        clearSearchComposition()
+    }
+
+    private func armEventOwnership(_ event: NSEvent, client: IMKTextInput) {
+        lastHandledKeyCode = event.keyCode
+        lastHandledClientIdentity = ObjectIdentifier(client as AnyObject)
+        lastHandledKeyUptime = ProcessInfo.processInfo.systemUptime
+        consumedKeyCodes.insert(event.keyCode)
+    }
+
+    static func isPlainSearchInputEvent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option, .function])
+        guard modifiers.isEmpty,
+              let characters = event.characters,
+              !characters.isEmpty else { return false }
+        return isLiteralSearchText(characters)
+    }
+
+    /// AppKit represents arrows and other Cocoa function keys with private-use
+    /// Unicode scalars (for example, Up Arrow is U+F700). Those values are not
+    /// text and must never become invisible bytes in the logical search query.
+    static func isLiteralSearchText(_ text: String) -> Bool {
+        !text.isEmpty && text.unicodeScalars.allSatisfy { scalar in
+            let value = scalar.value
+            let isPrivateUse = (0xE000...0xF8FF).contains(value)
+                || (0xF0000...0xFFFFD).contains(value)
+                || (0x100000...0x10FFFD).contains(value)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !isPrivateUse
+        }
+    }
+
+    static func isRimeCompositionEditingEvent(_ event: NSEvent) -> Bool {
+        let intentModifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option, .shift])
+        guard intentModifiers.isEmpty else { return false }
+        return [
+            UInt16(kVK_Escape), UInt16(kVK_Tab),
+            UInt16(kVK_LeftArrow), UInt16(kVK_RightArrow),
+            UInt16(kVK_UpArrow), UInt16(kVK_DownArrow),
+            UInt16(kVK_Home), UInt16(kVK_End),
+            UInt16(kVK_PageUp), UInt16(kVK_PageDown),
+            UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter),
+            UInt16(kVK_Delete), UInt16(kVK_ForwardDelete),
+        ].contains(event.keyCode)
+    }
+
+    static func hardwareKeyCodes(for selector: Selector) -> Set<UInt16> {
+        switch NSStringFromSelector(selector) {
+        case "insertNewline:", "insertLineBreak:":
+            return [UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter)]
+        case "cancelOperation:": return [UInt16(kVK_Escape)]
+        case "deleteBackward:": return [UInt16(kVK_Delete)]
+        case "deleteForward:": return [UInt16(kVK_ForwardDelete)]
+        case "moveLeft:": return [UInt16(kVK_LeftArrow)]
+        case "moveRight:": return [UInt16(kVK_RightArrow)]
+        case "moveUp:": return [UInt16(kVK_UpArrow)]
+        case "moveDown:": return [UInt16(kVK_DownArrow)]
+        case "pageUp:", "scrollPageUp:": return [UInt16(kVK_PageUp)]
+        case "pageDown:", "scrollPageDown:": return [UInt16(kVK_PageDown)]
+        case "moveToBeginningOfLine:", "moveToBeginningOfDocument:",
+             "scrollToBeginningOfDocument:":
+            return [UInt16(kVK_Home)]
+        case "moveToEndOfLine:", "moveToEndOfDocument:",
+             "scrollToEndOfDocument:":
+            return [UInt16(kVK_End)]
+        case "insertTab:", "insertBacktab:": return [UInt16(kVK_Tab)]
+        case "copy:": return [UInt16(kVK_ANSI_C)]
+        default: return []
+        }
+    }
+}

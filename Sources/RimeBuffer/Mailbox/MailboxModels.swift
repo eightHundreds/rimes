@@ -132,6 +132,90 @@ enum MailboxReplyCapability: String, Codable {
     case localNotesOnly
 }
 
+/// Frozen choice for the first turn of a Mailbox-native conversation. A nil
+/// model intentionally means the connector's verified default; CLI connectors
+/// do not currently expose a model catalog and must not be given invented IDs.
+struct MailboxNewConversationSelection: Equatable {
+    let connectorKind: AITextProviderKind
+    let modelID: String?
+}
+
+struct MailboxNewConversationModelOption: Equatable {
+    let selection: MailboxNewConversationSelection
+    let title: String
+    let isPreferred: Bool
+    let unavailableReason: String?
+
+    var isAvailable: Bool { unavailableReason == nil }
+}
+
+enum MailboxNewConversationModelCatalog {
+    static func options(
+        selectedKind: AITextProviderKind,
+        selectionResolver: (AITextProviderKind) throws -> AITextGenerationSelection,
+        availabilityResolver: (AITextProviderKind) -> AITextProviderAvailability
+    ) -> [MailboxNewConversationModelOption] {
+        AITextProviderKind.allCases.map { kind in
+            let resolvedSelection: AITextGenerationSelection?
+            let selectionFailure: String?
+            do {
+                resolvedSelection = try selectionResolver(kind)
+                selectionFailure = nil
+            } catch {
+                resolvedSelection = nil
+                selectionFailure = error.localizedDescription
+            }
+            // The current CLI adapters intentionally run their verified
+            // defaults and do not expose a model catalog. Ignore any legacy
+            // free-form model preference for those connectors instead of
+            // presenting a choice the adapter cannot honor.
+            let modelID = kind == .openAICompatible
+                ? resolvedSelection?.modelID
+                : nil
+            let selection = MailboxNewConversationSelection(
+                connectorKind: kind,
+                modelID: modelID
+            )
+            let sourceTitle: String
+            switch kind {
+            case .codexCLI: sourceTitle = "Codex CLI"
+            case .claudeCodeCLI: sourceTitle = "Claude Code"
+            case .openAICompatible: sourceTitle = "OpenAI API"
+            }
+            let modelTitle = selection.modelID ?? "默认模型"
+            let availabilityFailure: String?
+            switch availabilityResolver(kind) {
+            case .ready:
+                availabilityFailure = nil
+            case let .unavailable(message):
+                availabilityFailure = message
+            }
+            let unavailableReason = selectionFailure ?? availabilityFailure
+            return MailboxNewConversationModelOption(
+                selection: selection,
+                title: "\(sourceTitle) · \(modelTitle)"
+                    + (unavailableReason == nil ? "" : " · 未连接"),
+                isPreferred: kind == selectedKind,
+                unavailableReason: unavailableReason
+            )
+        }
+    }
+
+    static func liveOptions() -> [MailboxNewConversationModelOption] {
+        options(
+            selectedKind: AITextConnectorSelectionStore.shared.selectedKind,
+            selectionResolver: {
+                try AITextGenerationPreferenceStore.shared.requestSelection(
+                    connectorKind: $0
+                )
+            },
+            availabilityResolver: {
+                AITextConnectorRegistry.shared.availability(for: $0)
+            }
+        )
+    }
+}
+
 /// Persisted source identity contains routing metadata, not credentials.
 /// Names supplied by MCP/HTTP clients are display-only and are not trust proof.
 struct MailboxSource: Codable, Equatable {

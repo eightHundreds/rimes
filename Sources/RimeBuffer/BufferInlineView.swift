@@ -257,8 +257,6 @@ enum TranslationRailRoleSymbolRules {
         case "文": return .init(name: "text.bubble.fill", accessibilityLabel: "转换结果")
         case "搜": return .init(name: "magnifyingglass", accessibilityLabel: "提示词查询")
         case "词": return .init(name: "doc.text.magnifyingglass", accessibilityLabel: "提示词结果")
-        case "查": return .init(name: "magnifyingglass", accessibilityLabel: "Capsule 查询")
-        case "囊": return .init(name: "archivebox", accessibilityLabel: "Capsule 条目")
         default:
             return target
                 ? .init(name: "sparkles", accessibilityLabel: "处理结果")
@@ -282,6 +280,7 @@ private final class TranslationRailChipView: NSStackView {
     private var renderedStale = false
     private var renderedScale: CGFloat = 2
     private(set) var renderedRetainedTailStart: Int?
+    var acceptsPointerActivation: Bool { activationHandler != nil }
 
     init(target: Bool) {
         self.target = target
@@ -314,7 +313,9 @@ private final class TranslationRailChipView: NSStackView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if activationHandler != nil, bounds.contains(point) {
+        guard !isHidden, alphaValue > 0, frame.contains(point) else { return nil }
+        let localPoint = convert(point, from: superview)
+        if activationHandler != nil, bounds.contains(localPoint) {
             return self
         }
         return super.hitTest(point)
@@ -357,12 +358,14 @@ private final class TranslationRailChipView: NSStackView {
     override func mouseEntered(with event: NSEvent) {
         guard activationHandler != nil else { return }
         pointerHovered = true
+        NSCursor.pointingHand.set()
         applySurfaceAppearance()
     }
 
     override func mouseExited(with event: NSEvent) {
         pointerHovered = false
         pointerPressed = false
+        NSCursor.arrow.set()
         applySurfaceAppearance()
     }
 
@@ -380,6 +383,7 @@ private final class TranslationRailChipView: NSStackView {
                 stale: Bool,
                 scale: CGFloat,
                 activationHandler: (() -> Void)? = nil) {
+        let wasPointerHovered = pointerHovered
         self.activationHandler = activationHandler
         renderedSelected = selected
         renderedStale = stale
@@ -387,6 +391,7 @@ private final class TranslationRailChipView: NSStackView {
         if activationHandler == nil {
             pointerHovered = false
             pointerPressed = false
+            if wasPointerHovered { NSCursor.arrow.set() }
         }
         window?.invalidateCursorRects(for: self)
         renderedRetainedTailStart = nil
@@ -407,7 +412,7 @@ private final class TranslationRailChipView: NSStackView {
         if !prefix.isEmpty {
             attributed.addAttributes([
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: selected ? RimeUI.accentBlue : RimeUI.textSecondary,
+                .foregroundColor: selected ? RimeUI.accentTextColor : RimeUI.textSecondary,
             ], range: NSRange(location: 0, length: prefix.utf16.count))
         }
         if let retainedTailStart {
@@ -441,15 +446,15 @@ private final class TranslationRailChipView: NSStackView {
         } else {
             extraEmphasis = 0
         }
-        layer?.backgroundColor = (target
-            ? RimeUI.accentBlue.withAlphaComponent(
-                renderedSelected
-                    ? (RimeUI.isDark ? 0.30 : 0.20) + extraEmphasis
-                    : (RimeUI.isDark ? 0.22 : 0.14) + extraEmphasis
-            )
-            : RimeUI.surface2).cgColor
+        let baseSurface = target && renderedSelected
+            ? RimeUI.bufferChipSelected
+            : RimeUI.bufferChip
+        layer?.backgroundColor = baseSurface.blended(
+            withFraction: extraEmphasis,
+            of: RimeUI.accentBlue
+        )?.cgColor ?? baseSurface.cgColor
         layer?.borderColor = (renderedSelected || pointerHovered
-            ? RimeUI.accentBlue
+            ? RimeUI.accentSecondary
             : RimeUI.border).cgColor
         layer?.borderWidth = 1 / max(renderedScale, 1)
     }
@@ -650,10 +655,11 @@ struct BufferTranslationRailLayoutProbe {
 /// Compact block-level logical input surface used by the independent
 /// workbench. It never becomes first responder or stores an IMK client; a
 /// first-mouse click only requests capture for the still-focused host token.
-final class BufferInlineView: NSView {
+final class BufferInlineView: NSView, NSGestureRecognizerDelegate {
     var onDerivedTargetSelection: ((UUID) -> Void)?
     var onDerivedTargetStep: ((Int) -> Void)?
     var onCaptureRequested: ((Int) -> Void)?
+    var onToolbarToggleRequested: (() -> Void)?
 
     static let standardPreferredHeight: CGFloat = 34
     static let translationPreferredHeight: CGFloat = 68
@@ -684,7 +690,7 @@ final class BufferInlineView: NSView {
         let translation: TranslationRailSnapshot?
         let presentationStyle: BufferDerivedPresentationStyle
         let shielded: Bool
-        let isNight: Bool
+        let appearance: RimeAppearanceMode
     }
 
     private let chipScroll = NSScrollView()
@@ -693,6 +699,7 @@ final class BufferInlineView: NSView {
     private let translationContainer = NSStackView()
     private let translationSourceScroll = NSScrollView()
     private let translationSourceRow = NSStackView()
+    private let inputOptionsButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let leadingSpacer = NSView()
     private let translationSourceSpacer = NSView()
     private let caretView = NSView()
@@ -716,6 +723,8 @@ final class BufferInlineView: NSView {
     private var translationLoadingActive = false
     private var lastRenderSignature: RenderSignature?
     private var contentShielded = false
+    private var inputOptionsTitle = BufferPluginMenuCatalog.defaultTitle
+    private var toolbarExpanded = false
     private var enterHoldProgress: CGFloat?
     private(set) var renderPassCount = 0
     private(set) var renderedSelectedStandardBlockCount = 0
@@ -723,6 +732,9 @@ final class BufferInlineView: NSView {
     private(set) var renderedAlternativeCount = 0
     private(set) var renderedAlternativeIndex = 0
     private(set) var renderedInputPlaceholderVisible = false
+    var renderedInputControlCount: Int {
+        inputOptionsButton.superview == nil ? 0 : 1
+    }
     var renderedBlockCount: Int { renderedBlockIDs.count }
     var renderedInputCaretVisible: Bool {
         caretView.superview === chipRow
@@ -913,6 +925,109 @@ final class BufferInlineView: NSView {
         )
     }
 
+    static func runToolbarToggleInteractionProbe() -> Bool {
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 50))
+        let view = BufferInlineView(
+            frame: NSRect(x: 37, y: 8, width: 460, height: 34)
+        )
+        host.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 37),
+            view.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -23),
+            view.topAnchor.constraint(equalTo: host.topAnchor, constant: 8),
+            view.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -8),
+        ])
+        host.layoutSubtreeIfNeeded()
+        _ = view.renderStandardForPreview()
+        host.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+
+        let buttonRect = view.inputOptionsButton.convert(
+            view.inputOptionsButton.bounds,
+            to: view
+        )
+        guard !buttonRect.isEmpty else { return false }
+        let buttonPoint = NSPoint(x: buttonRect.midX, y: buttonRect.midY)
+        let ordinaryRailPoint = NSPoint(
+            x: min(view.bounds.maxX - 2, buttonRect.maxX + 12),
+            y: view.bounds.midY
+        )
+        var requestedToggleCount = 0
+        var toolbarExpanded = false
+        view.onToolbarToggleRequested = {
+            requestedToggleCount += 1
+            toolbarExpanded.toggle()
+        }
+        view.inputOptionsButton.performClick(nil)
+        let expandedAfterFirstClick = toolbarExpanded
+        view.inputOptionsButton.performClick(nil)
+        let containsButton = view.inputOptionsContains(pointInSelf: buttonPoint)
+        let excludesButton = !view.shouldAttemptLogicalRailClick(at: buttonPoint)
+        let acceptsRail = view.shouldAttemptLogicalRailClick(at: ordinaryRailPoint)
+        let standardPassed = containsButton
+            && excludesButton
+            && acceptsRail
+            && expandedAfterFirstClick
+            && !toolbarExpanded
+            && requestedToggleCount == 2
+
+        let outputID = UUID()
+        _ = view.renderTranslationForPreview(
+            TranslationRailSnapshot(
+                sourceText: "source chip remains a rail capture target",
+                outputBlocks: [
+                    TranslationOutputBlock(
+                        id: outputID,
+                        text: "interactive target chip"
+                    ),
+                ],
+                phase: .ready
+            )
+        )
+        host.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        let sourceChipAccepted: Bool
+        if let sourceChip = view.translationSourceChipView {
+            let rect = sourceChip.convert(sourceChip.bounds, to: view)
+            sourceChipAccepted = view.shouldAttemptLogicalRailClick(
+                at: NSPoint(x: rect.midX, y: rect.midY)
+            )
+        } else {
+            sourceChipAccepted = false
+        }
+        let interactiveChip = TranslationRailChipView(target: true)
+        interactiveChip.translatesAutoresizingMaskIntoConstraints = true
+        interactiveChip.frame = NSRect(x: 180, y: 7, width: 160, height: 20)
+        interactiveChip.update(
+            text: "interactive target chip",
+            stale: false,
+            scale: 2,
+            activationHandler: {}
+        )
+        view.addSubview(interactiveChip, positioned: .above, relativeTo: nil)
+        let targetChipExcluded = !view.shouldAttemptLogicalRailClick(
+            at: NSPoint(
+                x: interactiveChip.frame.midX,
+                y: interactiveChip.frame.midY
+            )
+        )
+        interactiveChip.removeFromSuperview()
+        let passed = standardPassed && sourceChipAccepted && targetChipExcluded
+        if !passed {
+            print(
+                "FAILED: buffer toolbar-toggle interaction probe",
+                "buttonRect=\(buttonRect)",
+                "contains=\(containsButton)",
+                "excluded=\(excludesButton)",
+                "rail=\(acceptsRail)",
+                "toggles=\(requestedToggleCount)",
+                "source=\(sourceChipAccepted)",
+                "target=\(targetChipExcluded)"
+            )
+        }
+        return passed
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
@@ -928,7 +1043,17 @@ final class BufferInlineView: NSView {
             target: self,
             action: #selector(logicalInputClicked(_:))
         )
+        inputClick.delegate = self
         addGestureRecognizer(inputClick)
+
+        configureIconButton(
+            inputOptionsButton,
+            symbolName: "keyboard",
+            toolTip: "展开 Buffer 工具栏"
+        )
+        inputOptionsButton.target = self
+        inputOptionsButton.action = #selector(toolbarToggleTapped)
+        inputOptionsButton.setAccessibilityLabel("展开 Buffer 工具栏")
 
         emptyLabel.font = .systemFont(ofSize: 12)
         emptyLabel.lineBreakMode = .byTruncatingTail
@@ -1013,9 +1138,43 @@ final class BufferInlineView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    func updateInputOptions(symbolName: String,
+                            title: String,
+                            enabled: Bool = true,
+                            toolbarExpanded: Bool = false) {
+        inputOptionsTitle = title
+        self.toolbarExpanded = toolbarExpanded
+        inputOptionsButton.image = RimeUI.symbol(
+            symbolName,
+            pointSize: 12,
+            weight: .semibold
+        )
+        inputOptionsButton.image?.isTemplate = true
+        updateToolbarToggleDescription()
+        inputOptionsButton.isEnabled = enabled
+        inputOptionsButton.refreshInteractionAppearance()
+    }
+
+    func setToolbarExpanded(_ expanded: Bool) {
+        toolbarExpanded = expanded
+        updateToolbarToggleDescription()
+    }
+
+    private func updateToolbarToggleDescription() {
+        let verb = toolbarExpanded ? "收起" : "展开"
+        inputOptionsButton.toolTip = "\(inputOptionsTitle) · 点击\(verb)工具栏"
+        inputOptionsButton.setAccessibilityLabel("\(inputOptionsTitle) · \(verb)工具栏")
+    }
+
+    @objc private func toolbarToggleTapped() {
+        guard !contentShielded, inputOptionsButton.isEnabled else { return }
+        onToolbarToggleRequested?()
+    }
+
     @objc private func logicalInputClicked(_ recognizer: NSClickGestureRecognizer) {
         guard recognizer.state == .ended, !contentShielded else { return }
         let point = recognizer.location(in: self)
+        guard !interactiveDescendantContains(pointInSelf: point) else { return }
         if !translationContainer.isHidden {
             guard renderedShowsSourceRail,
                   translationSourceScroll.convert(
@@ -1045,6 +1204,49 @@ final class BufferInlineView: NSView {
             }
         }
         onCaptureRequested?(insertion)
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: NSGestureRecognizer,
+        shouldAttemptToRecognizeWith event: NSEvent
+    ) -> Bool {
+        let point = convert(event.locationInWindow, from: nil)
+        return shouldAttemptLogicalRailClick(at: point)
+    }
+
+    private func shouldAttemptLogicalRailClick(at point: NSPoint) -> Bool {
+        !contentShielded && !interactiveDescendantContains(pointInSelf: point)
+    }
+
+    private func inputOptionsContains(pointInSelf point: NSPoint) -> Bool {
+        guard inputOptionsButton.superview != nil,
+              !inputOptionsButton.isHidden,
+              inputOptionsButton.alphaValue > 0 else { return false }
+        return inputOptionsButton.convert(
+            inputOptionsButton.bounds,
+            to: self
+        ).contains(point)
+    }
+
+    private func interactiveDescendantContains(pointInSelf point: NSPoint) -> Bool {
+        guard let superview else {
+            return inputOptionsContains(pointInSelf: point)
+        }
+        let pointForHitTest = convert(point, to: superview)
+        var candidate = hitTest(pointForHitTest)
+        while let view = candidate, view !== self {
+            if let control = view as? NSControl,
+               control.isEnabled,
+               control.action != nil {
+                return true
+            }
+            if let chip = view as? TranslationRailChipView,
+               chip.acceptsPointerActivation {
+                return true
+            }
+            candidate = view.superview
+        }
+        return false
     }
 
     private func configureHorizontalRail(_ scroll: NSScrollView, row: NSStackView) {
@@ -1189,6 +1391,7 @@ final class BufferInlineView: NSView {
         let wasRenderingTranslation = !contentShielded
             && lastRenderSignature?.translation != nil
         contentShielded = false
+        inputOptionsButton.isEnabled = true
 
         let signature = RenderSignature(
             blocks: model.blocks.map {
@@ -1207,7 +1410,7 @@ final class BufferInlineView: NSView {
             translation: translation,
             presentationStyle: presentationStyle,
             shielded: false,
-            isNight: RimeUI.isDark
+            appearance: RimeUI.appearance
         )
         if signature == lastRenderSignature {
             isHidden = false
@@ -1246,6 +1449,7 @@ final class BufferInlineView: NSView {
         )
         normalRailContainer.isHidden = false
         translationContainer.isHidden = true
+        chipRow.addArrangedSubview(inputOptionsButton)
         renderedSelectedStandardBlockCount = signature.allContentSelected
             ? model.blocks.count
             : 0
@@ -1313,6 +1517,7 @@ final class BufferInlineView: NSView {
             }
             chipRow.addArrangedSubview(messageChip(text: message))
         }
+        chipRow.addArrangedSubview(leadingSpacer)
 
         active ? startCaretBlinking() : stopCaretBlinking()
         applyAppearance()
@@ -1338,10 +1543,10 @@ final class BufferInlineView: NSView {
             translation: nil,
             presentationStyle: .liveExpand,
             shielded: true,
-            isNight: RimeUI.isDark
+            appearance: RimeUI.appearance
         )
         if signature == lastRenderSignature {
-            isHidden = true
+            isHidden = false
             applyAppearance()
             return false
         }
@@ -1353,9 +1558,12 @@ final class BufferInlineView: NSView {
         normalRailContainer.isHidden = false
         translationContainer.isHidden = true
         emptyLabel.stringValue = "内容已隐藏"
+        inputOptionsButton.isEnabled = false
+        chipRow.addArrangedSubview(inputOptionsButton)
         chipRow.addArrangedSubview(emptyLabel)
+        chipRow.addArrangedSubview(leadingSpacer)
         stopCaretBlinking()
-        isHidden = true
+        isHidden = false
         applyAppearance()
         return true
     }
@@ -1423,13 +1631,9 @@ final class BufferInlineView: NSView {
         renderedAlternativeCount = showsTargetRail ? alternativeCount : 0
         renderedAlternativeIndex = showsTargetRail ? activeAlternativeIndex : 0
 
-        let sourceRole = translationSourceRoleView
-            ?? translationRoleIcon(snapshot.sourceRole, target: false)
-        translationSourceRoleView = sourceRole
-        updateTranslationRoleIcon(sourceRole,
-                                  role: snapshot.sourceRole,
-                                  target: false)
-        var sourceViews: [NSView] = [sourceRole]
+        var sourceViews: [NSView] = renderedShowsSourceRail
+            ? [inputOptionsButton]
+            : []
         if renderedShowsSourceRail,
            BufferInputPlaceholderRules.shouldShow(
             contentIsEmpty: snapshot.sourceText.isEmpty,
@@ -1466,12 +1670,6 @@ final class BufferInlineView: NSView {
         sourceViews.append(translationSourceSpacer)
         reconcileArrangedSubviews(sourceViews, in: translationSourceRow)
 
-        let targetRole = translationTargetRoleView
-            ?? translationRoleIcon(snapshot.targetRole, target: true)
-        translationTargetRoleView = targetRole
-        updateTranslationRoleIcon(targetRole,
-                                  role: snapshot.targetRole,
-                                  target: true)
         let activeRow = allRows.indices.contains(activeAlternativeIndex)
             ? allRows[activeAlternativeIndex]
             : TranslationOutputRow(key: 0, blocks: snapshot.outputBlocks)
@@ -1563,9 +1761,10 @@ final class BufferInlineView: NSView {
 
         for (rowIndex, rowSnapshot) in rowSnapshots.enumerated() {
             guard let rail = translationTargetRails[rowSnapshot.key] else { continue }
-            var targetViews: [NSView] = [
-                rowIndex == 0 ? targetRole : rail.leadingPlaceholder,
-            ]
+            var targetViews: [NSView] = []
+            if rowIndex == 0, !renderedShowsSourceRail {
+                targetViews.append(inputOptionsButton)
+            }
             if alternativeCount > 1 {
                 targetViews.append(translationPagerView)
             }
@@ -1730,13 +1929,11 @@ final class BufferInlineView: NSView {
 
         let box = NSView()
         box.wantsLayer = true
-        box.layer?.backgroundColor = RimeUI.accentBlue.withAlphaComponent(
-            selected
-                ? (RimeUI.isDark ? 0.34 : 0.24)
-                : (RimeUI.isDark ? 0.22 : 0.14)
-        ).cgColor
+        box.layer?.backgroundColor = (selected
+            ? RimeUI.bufferChipSelected
+            : RimeUI.bufferChip).cgColor
         box.layer?.cornerRadius = BufferInlineMetrics.chipCornerRadius
-        box.layer?.borderColor = (selected ? RimeUI.accentBlue : RimeUI.border).cgColor
+        box.layer?.borderColor = (selected ? RimeUI.accentSecondary : RimeUI.border).cgColor
         box.layer?.borderWidth = selected
             ? 1 / max(window?.backingScaleFactor ?? 2, 1)
             : 0
@@ -1885,7 +2082,6 @@ final class BufferInlineView: NSView {
         translationTargetChipViews.removeAll()
         translationMessageView = nil
         renderedBlockIDs.removeAll(keepingCapacity: true)
-        chipRow.addArrangedSubview(leadingSpacer)
     }
 
     private func updateChipDocumentSize() {
@@ -1992,11 +2188,9 @@ final class BufferInlineView: NSView {
     private func applyAppearance() {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
-        translationSourceScroll.layer?.backgroundColor = RimeUI.surface2
-            .withAlphaComponent(RimeUI.isDark ? 0.70 : 0.78).cgColor
+        translationSourceScroll.layer?.backgroundColor = RimeUI.bufferSourceRail.cgColor
         for rail in translationTargetRails.values {
-            rail.scroll.layer?.backgroundColor = RimeUI.accentBlue
-                .withAlphaComponent(RimeUI.isDark ? 0.13 : 0.08).cgColor
+            rail.scroll.layer?.backgroundColor = RimeUI.bufferTargetRail.cgColor
         }
         caretView.layer?.backgroundColor = RimeUI.accentBlue.cgColor
         preeditView.applyAppearance()
@@ -2005,6 +2199,10 @@ final class BufferInlineView: NSView {
         translationSourceEmptyLabel.textColor = RimeUI.textSecondary
         translationTargetEmptyLabel.textColor = RimeUI.textSecondary
         translationPagerView.applyAppearance()
+        inputOptionsButton.contentTintColor = RimeUI.isRasta
+            ? RimeUI.brandYellow
+            : RimeUI.textSecondary
+        inputOptionsButton.refreshInteractionAppearance()
     }
 
     private func startCaretBlinking() {
@@ -2035,6 +2233,10 @@ final class BufferInlineView: NSView {
 
 }
 
+func runBufferInlineToolbarToggleInteractionProbe() -> Bool {
+    BufferInlineView.runToolbarToggleInteractionProbe()
+}
+
 /// A button that works on the first click inside a never-key panel.
 class FirstMouseButton: NSButton {
     var usesPrimarySurface = false
@@ -2047,6 +2249,9 @@ class FirstMouseButton: NSButton {
         didSet {
             guard oldValue != isEnabled else { return }
             if !isEnabled { pointerPressed = false }
+            if pointerHovered {
+                BufferWorkbenchPointerRules.cursor(enabled: isEnabled).cursor.set()
+            }
             refreshInteractionAppearance()
         }
     }
@@ -2085,11 +2290,13 @@ class FirstMouseButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         pointerHovered = true
+        BufferWorkbenchPointerRules.cursor(enabled: isEnabled).cursor.set()
         refreshInteractionAppearance()
     }
 
     override func mouseExited(with event: NSEvent) {
         pointerHovered = false
+        NSCursor.arrow.set()
         refreshInteractionAppearance()
     }
 

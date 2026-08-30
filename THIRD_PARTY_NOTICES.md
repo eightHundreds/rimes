@@ -32,6 +32,18 @@ revision `54a4a07289412efc54134092c0d945f895a71ed3` and is distributed under
 the GNU Lesser General Public License version 3. The license and source notice
 are included under `rime-data/licenses/`.
 
+## Rime Octagram language model
+
+The Simplified-Chinese language model used by the hidden consciousness-stream
+schema and its upstream `grammar.yaml` come from
+[`lotem/rime-octagram-data`](https://github.com/lotem/rime-octagram-data),
+pinned respectively to master revision
+`8ceef1b42eb77e86501382a52e85c309c0f2f04c` and hans revision
+`f8ce3b534733e489a8470a7c2adf5a154e8ea069`. They are distributed under
+the GNU Lesser General Public License version 3. Exact asset size, checksum,
+source boundary, and license location are recorded in
+`rime-data/licenses/rime-octagram-data-SOURCE.md`.
+
 ## Rime Wubi 86
 
 `rime-data/wubi86.schema.yaml` and `rime-data/wubi86.dict.yaml` are imported

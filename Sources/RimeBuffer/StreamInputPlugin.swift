@@ -801,9 +801,10 @@ struct StreamInputRuntime {
 }
 
 /// Focus-bound source and result storage for the built-in consciousness-stream
-/// plugin. Raw letters never enter Rime, CompositionSession, or BufferModel.
-/// The final result remains inert until BufferDeliveryCoordinator explicitly
-/// sends it to the same exact external focus lease that authored the raw input.
+/// plugin. Raw letters may be decoded by a private inference-only Rime session,
+/// but never enter the active CompositionSession or BufferModel. The final
+/// result remains inert until BufferDeliveryCoordinator explicitly sends it to
+/// the same exact external focus lease that authored the raw input.
 final class StreamInputWorkspace: DerivedBufferWorkspace {
     static let shared = StreamInputWorkspace()
     static let pluginKey = PluginKey(domain: .builtIn,
@@ -844,6 +845,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
     let workbenchDisplayName = "意识流输入"
 
     private let provider: any AITextProvider
+    private let inferenceEngine: any StreamInputInferenceEngine
     private let openAIConfigurationStore: OpenAICompatibleConfigurationStore
     private let runtime: StreamInputRuntime
     private let observesRuntimeNotifications: Bool
@@ -908,10 +910,12 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
     private(set) var outputBlocks: [AITextWorkspaceOutputBlock] = []
     private(set) var selectedAlternativePosition = 0
     private(set) var generation: UInt64 = 0
+    private var inferencePrepared = false
 
     private var activeJob: Job? { inFlightJobs.last?.job }
 
     init(provider: (any AITextProvider)? = nil,
+         inferenceEngine: (any StreamInputInferenceEngine)? = nil,
          openAIConfigurationStore: OpenAICompatibleConfigurationStore = .shared,
          runtime: StreamInputRuntime = .live,
          observesRuntimeNotifications: Bool = true,
@@ -924,15 +928,31 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
                 && openAIConfigurationStore ===
                     OpenAICompatibleConfigurationStore.shared
                 && observesRuntimeNotifications
+        let selectedProvider: any AITextProvider
         if let provider {
-            self.provider = provider
+            selectedProvider = provider
         } else if usesLivePluginConfiguration {
-            self.provider = StreamInputConfiguredAITextProvider.shared
+            selectedProvider = StreamInputConfiguredAITextProvider.shared
         } else {
             // Deterministic/custom-store constructions remain pinned to the
             // historical OpenAI-compatible default used by smoke tests.
-            self.provider = OpenAICompatibleTextProvider(
+            selectedProvider = OpenAICompatibleTextProvider(
                 configurationStore: openAIConfigurationStore
+            )
+        }
+        self.provider = selectedProvider
+        if let inferenceEngine {
+            self.inferenceEngine = inferenceEngine
+        } else if usesLivePluginConfiguration {
+            self.inferenceEngine = StreamInputModularInferenceEngine(modules: [
+                RimeOctagramStreamInputEngine.shared,
+                AIStreamInputInferenceEngine(provider: selectedProvider),
+            ])
+        } else {
+            // Existing provider-based smoke tests intentionally stay AI-only;
+            // local inference has its own deterministic module seams.
+            self.inferenceEngine = AIStreamInputInferenceEngine(
+                provider: selectedProvider
             )
         }
         self.openAIConfigurationStore = openAIConfigurationStore
@@ -1007,12 +1027,12 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         if rawInputAllSelected { return "已全选拼音 · 粘贴可替换" }
         switch phase {
         case let .unavailable(message), let .failed(message): return message
-        case .idle: return "连续输入全拼，AI 将实时猜测"
+        case .idle: return "连续输入全拼，本地引擎将实时解码"
         case .waiting:
-            return activityMessage ?? "等待输入停顿 · 全局猜测"
-        case .running: return activityMessage ?? "AI 正在全局猜测"
+            return activityMessage ?? "等待输入停顿 · 本地解码"
+        case .running: return activityMessage ?? "推断引擎正在解码"
         case .ready:
-            guard !outputBlocks.isEmpty else { return "等待 AI 猜测" }
+            guard !outputBlocks.isEmpty else { return "等待本地解码" }
             if lockedDeliveryAlternativeIndex != nil {
                 let remaining = deliveryPendingBlocks.count
                 return "正在逐块上屏 · 还剩 \(remaining) 块"
@@ -1111,9 +1131,9 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
             sourceRole: "拼",
             targetRole: "文",
             sourceEmptyText: "连续输入全拼",
-            targetEmptyText: "等待 AI 猜测",
+            targetEmptyText: "等待本地解码",
             waitingText: "等待输入停顿",
-            processingText: "AI 正在全局猜测",
+            processingText: "推断引擎正在解码",
             updatingText: "更新猜测"
         )
     }
@@ -1189,6 +1209,8 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         privacyTimer?.invalidate()
         privacyTimer = nil
         invalidate(clearRaw: true, nextPhase: .idle)
+        inferenceEngine.reset()
+        inferencePrepared = false
     }
 
     func setProtected(_ protected: Bool) {
@@ -1242,6 +1264,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         guard canCaptureKeys(focusToken: focusToken,
                              forceOverlayVisibilityRefresh: true),
               Self.isLowercaseASCIILetter(letter) else { return false }
+        prepareInferenceIfNeeded()
         invalidatePendingChord()
         if let boundFocusToken, boundFocusToken != focusToken {
             invalidate(clearRaw: true, nextPhase: .idle)
@@ -1956,7 +1979,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         settings: StreamInputPluginSettings
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
-        switch provider.availability {
+        switch inferenceEngine.availability {
         case .ready:
             break
         case let .unavailable(message):
@@ -1990,7 +2013,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         )
         revokeDeliveryAuthorization()
         phase = .running
-        activityMessage = "正在启动 \(provider.kind.displayName)"
+        activityMessage = "正在启动 \(inferenceEngine.displayName)"
         notifyChange()
 
         let isAlternativeRetry = alternativeRetryRevision == job.inputRevision
@@ -2003,25 +2026,19 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
                 : 0
         )
         inFlightJobs.append(state)
-        let request = AITextProviderRequest(
+        let request = StreamInputInferenceRequest(
             requestID: job.requestID,
             sourceText: job.sourceText,
-            preparedPrompt: StreamInputPrompt.request(
-                for: job.sourceText,
-                automaticSyllableSpaceOffsets: Set(
-                    job.automaticSyllableSpaceOffsets
-                ),
-                maximumGuessCount: job.settings.candidateCount,
-                responsePace: job.settings.responsePace,
-                enforcingMinimumAfterRetry: isAlternativeRetry,
-                excludedGuesses: isAlternativeRetry
-                    ? insufficientAlternatives.map(\.text)
-                    : []
+            automaticSyllableSpaceOffsets: Set(
+                job.automaticSyllableSpaceOffsets
             ),
-            outputContract: .alternativeGuesses,
-            maximumAlternativeGuessCount: job.settings.candidateCount
+            settings: job.settings,
+            enforcingMinimumAfterRetry: isAlternativeRetry,
+            excludedGuesses: isAlternativeRetry
+                ? insufficientAlternatives.map(\.text)
+                : []
         )
-        let task = provider.generate(
+        let task = inferenceEngine.infer(
             request,
             onEvent: { [weak self] event in
                 self?.performOnMain { workspace in
@@ -2165,7 +2182,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
                cancellationRetriedRevision != inputRevision {
                 cancellationRetriedRevision = inputRevision
                 preserveDisplayedResultForNextRequest()
-                activityMessage = "Open API 连接中断，正在重试"
+                activityMessage = "推断连接中断，正在重试"
                 scheduleInference(settings: job.settings)
                 return
             }
@@ -2408,7 +2425,7 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
             invalidate(clearRaw: true, nextPhase: .idle)
             return
         }
-        switch provider.availability {
+        switch inferenceEngine.availability {
         case .ready:
             scheduleInference()
         case let .unavailable(message):
@@ -2443,8 +2460,11 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
             invalidate(clearRaw: true, nextPhase: .idle)
             return
         }
+        if runtime.bufferEnabled() {
+            prepareInferenceIfNeeded()
+        }
         if rawInput.isEmpty {
-            switch provider.availability {
+            switch inferenceEngine.availability {
             case .ready:
                 phase = .idle
             case let .unavailable(message):
@@ -2454,6 +2474,13 @@ final class StreamInputWorkspace: DerivedBufferWorkspace {
         } else {
             focusDidChange()
         }
+    }
+
+    private func prepareInferenceIfNeeded() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !inferencePrepared else { return }
+        inferencePrepared = true
+        inferenceEngine.prepare()
     }
 
     private func bufferStateDidChange() {

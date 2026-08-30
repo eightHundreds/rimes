@@ -416,6 +416,23 @@ final class RimeEngine {
     }
 
     var isHealthy: Bool { BBRimeIsHealthy() }
+    var hasOctagram: Bool { BBRimeHasOctagram() }
+
+    /// Lets an optional in-process engine fail closed when its private product
+    /// data was not bundled. Callers receive only existence, never the shared
+    /// directory path, so ordinary schema/session ownership stays unchanged.
+    func hasSharedDataFile(_ relativePath: String) -> Bool {
+        guard !relativePath.isEmpty,
+              !relativePath.hasPrefix("/"),
+              !relativePath.split(separator: "/").contains("..") else {
+            return false
+        }
+        return FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: sharedDataDir, isDirectory: true)
+                .appendingPathComponent(relativePath)
+                .path
+        )
+    }
 
     func createSession() -> UInt64 { BBRimeCreateSession() }
     func destroySession(_ session: UInt64) {
@@ -443,6 +460,39 @@ final class RimeEngine {
     }
     func selectSchema(_ id: String, session: UInt64) -> Bool {
         id.withCString { BBRimeSelectSchema(session, $0) }
+    }
+
+    /// One-lock, caller-owned full commit previews for a private inference
+    /// session. This avoids exposing the bridge's shared scratch strings or
+    /// dropping an untranslated tail while an ordinary IMK session is active.
+    func decodeCandidateTexts(
+        input: String,
+        maximumCount: Int,
+        session: UInt64
+    ) -> [String]? {
+        let countLimit = min(max(maximumCount, 1), 5)
+        let stride = 4_096
+        var storage = [CChar](
+            repeating: 0,
+            count: countLimit * stride
+        )
+        let count = input.withCString { rawInput in
+            storage.withUnsafeMutableBufferPointer { buffer in
+                BBRimeDecodeCandidateTexts(
+                    session,
+                    rawInput,
+                    buffer.baseAddress,
+                    UInt64(stride),
+                    Int32(countLimit)
+                )
+            }
+        }
+        guard count >= 0 else { return nil }
+        return storage.withUnsafeBufferPointer { buffer in
+            (0..<Int(count)).map { index in
+                String(cString: buffer.baseAddress! + index * stride)
+            }
+        }
     }
 
     func takeCommit(session: UInt64) -> String? { takeString(BBRimeCopyCommit(session)) }

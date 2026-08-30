@@ -22,9 +22,11 @@ final class TypingSpeedSettingsViewController: NSViewController {
     private let subtitleLabel = NSTextField(wrappingLabelWithString: "")
     private let storageIssueLabel = NSTextField(wrappingLabelWithString: "")
     private let storageIssueBox = NSBox()
-    private let repairStorageButton = NSButton(title: "备份损坏文件并重建…",
-                                                target: nil,
-                                                action: nil)
+    private let repairStorageButton = RimePointingHandButton(
+        title: "备份损坏文件并重建…",
+        target: nil,
+        action: nil
+    )
 
     private let todaySectionLabel = NSTextField(labelWithString: "")
     private let todayKeyCount = NSTextField(labelWithString: "0")
@@ -39,9 +41,11 @@ final class TypingSpeedSettingsViewController: NSViewController {
     private let dayRangeLabel = NSTextField(labelWithString: "")
     private let dayRows = NSStackView()
     private let sessionRows = NSStackView()
-    private let clearAllButton = NSButton(title: "清空全部记录",
-                                          target: nil,
-                                          action: nil)
+    private let clearAllButton = RimePointingHandButton(
+        title: "清空全部记录",
+        target: nil,
+        action: nil
+    )
 
     init(subpageID: String, store: TypingSpeedStore = .shared) {
         self.subpageID = subpageID

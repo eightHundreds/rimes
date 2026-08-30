@@ -29,12 +29,13 @@
 |---|---|
 | 输入方案 | 雾凇全拼、自然码双拼、小鹤双拼、五笔 86、英文；可选并击扩展 |
 | 缓冲工作台 | `⌘⇧B` 开关；先暂存、再分块投递 |
-| 剪贴板历史 | `⌘⇧P` 显示 / 隐藏；仅在工作台可见且安全时读取 |
-| Mailbox | `⌘⇧M` 打开/关闭；单行会话列表 + 固定 CLI prompt，以全宽等宽 transcript 本地保存 AI 会话与待审核外部推送；Plain / Markdown / JSON 都可用纯文本临时行流式预览，完整结果再按所选格式安全排版 |
+| Clipboard History | 与 Buffer 同级；`⌘⇧P` 打开屏幕底部独立窗口。收录开启且无安全保护时在后台保存文本、链接、图片、文件与颜色，原始表示只落本机私有数据库；直接输入搜索，`←/→` 选择，Return 直接上屏（富内容按需申请 macOS 粘贴事件权限），`⌘C` 复制 |
+| Mailbox | 与 Buffer 同级；`⌘⇧M` 打开/关闭，独立保存 AI 会话、备注与待审核外部推送。窗口内可“新建对话”并选择已配置的连接器/模型；CLI 只使用各自默认模型，OpenAI 使用本机配置模型，选择只绑定新会话且不改全局设置。草稿不创建空会话，首次 Return 才创建会话并发起生成 |
+| Capsule | 与 Buffer 同级；`⌘⇧C` 打开/关闭，在独立窗口搜索和维护本机 Prompt、Memory、Password、Skill，不进入 Buffer 插件目录 |
 | 设置 | `⌘⇧S` 随时打开设置页面 |
 | 实时翻译 | 默认 Apple 本地翻译（macOS 15+），也可走 AI 渠道 |
-| AI 生成 | Codex CLI / Claude Code CLI / OpenAI 兼容 API；内容格式与原地 / Mailbox 目的地可独立组合 |
-| 意识流输入 | 拼音/并击 → 按配置给出最多 5 个互斥猜测 → 选定后投递 |
+| AI 生成 | Codex CLI / Claude Code CLI / OpenAI 兼容 API；结果只留在 Buffer 内，可选 Plain / Markdown / JSON，再由用户上屏 |
+| 意识流输入 | 拼音/并击 → 本地 Rime + Octagram 低延迟解码，复杂输入回退 AI → 最多 5 个互斥猜测 → 选定后投递 |
 
 <!-- BEGIN PRESET BUFFER PLUGINS -->
 ## 预置缓冲插件
@@ -45,8 +46,7 @@
 |---|---|---:|---|---|
 | AI 生成 | `builtin.ai-text` | 2.1 | 随 RIMES 预装 | 启用 |
 | 实时翻译 | `builtin.apple-translation` | 2.1 | 随 RIMES 预装 | 启用 |
-| 意识流输入 | `builtin.stream-input` | 1.3 | 随 RIMES 预装 | 启用 |
-| Capsule | `builtin.capsule` | 0.3 | 随 RIMES 预装 | 启用 |
+| 意识流输入 | `builtin.stream-input` | 1.4 | 随 RIMES 预装 | 启用 |
 
 表中插件均随 RIMES 预装，并在全新安装后默认启用。
 <!-- END PRESET BUFFER PLUGINS -->

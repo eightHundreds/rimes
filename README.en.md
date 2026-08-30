@@ -29,11 +29,13 @@ Nothing auto-posts, and nothing silently edits the web page. Built for writing, 
 |---|---|
 | Input schemes | Rime Ice full Pinyin, Natural Code and Xiaohe double Pinyin, Wubi 86, English; optional Chording extension |
 | Buffer workbench | Toggle with `⌘⇧B`; stage first, deliver in chunks |
-| Clipboard history | Show / hide with `⌘⇧P`; read only while the workbench is safely visible |
+| Clipboard History | A peer of Buffer; `⌘⇧P` opens a standalone bottom window. While capture is enabled and unprotected, it durably records text, links, images, files, and colors in a private local database even when the window is hidden. Type to search; use `←/→`, Return or `⌘1`–`⌘9` to deliver directly (rich content requests macOS paste-event access when needed), and `⌘C` to copy |
+| Mailbox | A peer of Buffer; toggle with `⌘⇧M` to retain conversations and reviews independently. “New Conversation” selects from configured connectors/models: each CLI exposes only its default model, while OpenAI uses the locally configured model. The selection is frozen per conversation without changing the global setting; the process-local draft creates no empty thread, and the first Return creates the conversation and starts generation |
+| Capsule | A peer of Buffer; toggle with `⌘⇧C` and manage local Prompt, Memory, Password, and Skill records outside the Buffer plug-in catalog |
 | Settings | Open Settings anywhere with `⌘⇧S` |
 | Live translation | Apple on-device translation by default (macOS 15+); AI connector optional |
-| AI generate | Codex CLI / Claude Code CLI / OpenAI-compatible API |
-| Stream input | Pinyin/chords → up to 5 configured mutually exclusive guesses → deliver the chosen one |
+| AI generate | Codex CLI / Claude Code CLI / OpenAI-compatible API; results stay in Buffer with Plain / Markdown / JSON output and are delivered only by the user |
+| Stream input | Pinyin/chords → low-latency local Rime + Octagram, with AI fallback for complex input → up to 5 mutually exclusive guesses → deliver the chosen one |
 | Remote typing | Encrypted Mac ↔ Mac delivery; no shared Wi‑Fi or Apple ID required |
 
 <!-- BEGIN PRESET BUFFER PLUGINS -->
@@ -45,8 +47,7 @@ This table is generated from [`Catalog/buffer-plugins.json`](Catalog/buffer-plug
 |---|---|---:|---|---|
 | AI Generation | `builtin.ai-text` | 2.1 | Bundled with RIMES | Enabled |
 | Real-time Translation | `builtin.apple-translation` | 2.1 | Bundled with RIMES | Enabled |
-| Stream of Consciousness Input | `builtin.stream-input` | 1.3 | Bundled with RIMES | Enabled |
-| Capsule | `builtin.capsule` | 0.3 | Bundled with RIMES | Enabled |
+| Stream of Consciousness Input | `builtin.stream-input` | 1.4 | Bundled with RIMES | Enabled |
 
 Every plug-in in the table is bundled with RIMES and enabled on a clean first run.
 <!-- END PRESET BUFFER PLUGINS -->

@@ -718,17 +718,59 @@ export function ExtensionsSurface({
                   <span>设置…</span>
                 </button>
                 <button
-                  aria-label={`外部来源收件箱，${inboxItems.length} 项待审`}
+                  aria-label="打开 Buffer 工作台"
+                  className="native-input-menu__item"
+                  onClick={() => {
+                    closeMenu();
+                    setActivity("已打开 Buffer 工作台");
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Icon name="tray" size={15} />
+                  <span>Buffer…</span>
+                  <span aria-hidden="true" className="native-input-menu__meta">⌘⇧B</span>
+                </button>
+                <button
+                  aria-label="打开 Clipboard History 独立窗口"
+                  className="native-input-menu__item"
+                  onClick={() => {
+                    closeMenu();
+                    setActivity("已打开 Clipboard History 独立窗口");
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Icon name="clipboard" size={15} />
+                  <span>Clipboard History…</span>
+                  <span aria-hidden="true" className="native-input-menu__meta">⌘⇧P</span>
+                </button>
+                <button
+                  aria-label={`打开 Mailbox，${inboxItems.length} 项待审`}
                   className="native-input-menu__item"
                   onClick={openInbox}
                   role="menuitem"
                   type="button"
                 >
-                  <Icon name="tray" size={15} />
-                  <span>外部来源收件箱…</span>
+                  <Icon name="book" size={15} />
+                  <span>Mailbox…</span>
                   <span aria-hidden="true" className="native-input-menu__meta">
-                    {inboxItems.length}
+                    {inboxItems.length} · ⌘⇧M
                   </span>
+                </button>
+                <button
+                  aria-label="打开 Capsule 本机内容窗口"
+                  className="native-input-menu__item"
+                  onClick={() => {
+                    closeMenu();
+                    setActivity("已打开 Capsule 本机内容窗口");
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Icon name="database" size={15} />
+                  <span>Capsule…</span>
+                  <span aria-hidden="true" className="native-input-menu__meta">⌘⇧C</span>
                 </button>
                 <button
                   className="native-input-menu__item"

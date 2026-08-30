@@ -11,6 +11,7 @@ import {
   metrics,
   serializeDraft,
   themeCSSVariables,
+  themeOptionLabel,
   themes,
   type MetricTokens,
   type ThemeID,
@@ -19,6 +20,7 @@ import {
 import {
   BufferSurface,
   type BufferExternalSource,
+  type BufferPluginConfiguration,
 } from "./surfaces/BufferSurface";
 import { CandidateSurface } from "./surfaces/CandidateSurface";
 import { ClipboardSurface } from "./surfaces/ClipboardSurface";
@@ -31,7 +33,7 @@ import type {
 import { SettingsSurface, type SettingsRouteID } from "./surfaces/SettingsSurface";
 
 const themeOptions = (Object.entries(themes) as [ThemeID, ThemeTokens][]).map(
-  ([value, theme]) => ({ value, label: theme.title }),
+  ([value]) => ({ value, label: themeOptionLabel(value) }),
 );
 
 const zoomOptions = [
@@ -88,6 +90,7 @@ export function App() {
     ))
     .map((plugin) => plugin.id), [plugins]);
   const translationConfiguration = pluginConfigurations["builtin.apple-translation"] ?? {};
+  const aiConfiguration = pluginConfigurations["builtin.ai-text"] ?? {};
   const streamConfiguration = pluginConfigurations["builtin.stream-input"] ?? {};
   const bufferSourceLanguage = typeof translationConfiguration.sourceLanguage === "string"
     ? translationConfiguration.sourceLanguage
@@ -100,6 +103,10 @@ export function App() {
     ? translationConfiguration.translateContinuously
     : true;
   const translationProvider = translationConfiguration.provider === "ai" ? "ai" : "apple";
+  const bufferAIConnector = aiConfiguration.connector === "claude"
+    || aiConfiguration.connector === "openai"
+    ? aiConfiguration.connector
+    : "codex";
   const streamCandidateCount = typeof streamConfiguration.candidateCount === "number"
     && Number.isFinite(streamConfiguration.candidateCount)
     ? Math.min(5, Math.max(1, Math.trunc(streamConfiguration.candidateCount)))
@@ -184,6 +191,34 @@ export function App() {
     setNotice("实时翻译语言已同步到插件设置");
   }, []);
 
+  const updateBufferPluginConfiguration = useCallback((configuration: BufferPluginConfiguration) => {
+    const pluginID = configuration.mode === "ai"
+      ? "builtin.ai-text"
+      : configuration.mode === "translation"
+        ? "builtin.apple-translation"
+        : "builtin.stream-input";
+    setPluginConfigurations((current) => ({
+      ...current,
+      [pluginID]: {
+        ...current[pluginID],
+        ...(configuration.mode === "ai"
+          ? { connector: configuration.connector }
+          : configuration.mode === "translation"
+            ? {
+              sourceLanguage: configuration.sourceLanguage,
+              targetLanguage: configuration.targetLanguage,
+              provider: configuration.provider,
+              translateContinuously: configuration.translateContinuously,
+            }
+            : {
+              candidateCount: configuration.candidateCount,
+              latency: configuration.latency,
+            }),
+      },
+    }));
+    setNotice(`${initialPlugins.find((plugin) => plugin.id === pluginID)?.name ?? "插件"}配置已同步`);
+  }, []);
+
   const acceptInboxItem = useCallback((item: InboxItem) => {
     setBufferExternalSource((current) => ({
       revision: (current?.revision ?? 0) + 1,
@@ -197,6 +232,9 @@ export function App() {
       routeID === "core.maintenance"
       || routeID === "core.appearance"
       || routeID === "core.buffer"
+      || routeID === "core.clipboard"
+      || routeID === "core.mailbox"
+      || routeID === "core.capsule"
       || routeID === "core.connectors"
       || routeID === "core.plugins"
       || routeID === "core.input-method"
@@ -346,10 +384,13 @@ export function App() {
               </div>
               <div hidden={surfaceID !== "buffer"}>
                 <BufferSurface
+                  aiConnector={bufferAIConnector}
                   availablePluginIDs={availableBufferPluginIDs}
                   externalSource={bufferExternalSource}
                   onClose={closeBuffer}
                   onLanguageChange={updateBufferLanguages}
+                  onOpenPluginSettings={() => openSettings("core.plugins")}
+                  onPluginConfigurationChange={updateBufferPluginConfiguration}
                   onSend={sendFromBuffer}
                   paused={bufferPaused}
                   sourceLanguage={bufferSourceLanguage}

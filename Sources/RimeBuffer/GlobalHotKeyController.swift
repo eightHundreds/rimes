@@ -5,6 +5,7 @@ enum GlobalHotKeyRoute: Equatable {
     case toggleWorkbench
     case toggleClipboardHistory
     case openMailbox
+    case openCapsule
     case openSettings
     case ignore
 }
@@ -14,12 +15,14 @@ enum GlobalHotKeyAction: UInt32, CaseIterable, Hashable {
     case openSettings = 2
     case toggleClipboardHistory = 3
     case openMailbox = 4
+    case openCapsule = 5
 
     var shortcutAction: RimeShortcutAction {
         switch self {
         case .toggleWorkbench: return .toggleWorkbench
         case .toggleClipboardHistory: return .toggleClipboardHistory
         case .openMailbox: return .openMailbox
+        case .openCapsule: return .openCapsule
         case .openSettings: return .openSettings
         }
     }
@@ -30,11 +33,13 @@ struct GlobalHotKeyDefinition {
     let keyCode: UInt32
     let modifiers: UInt32
 
-    /// Clipboard visibility is a deliberate global command. Register it
-    /// exclusively so another Carbon listener cannot observe the same chord;
-    /// ordinary AppKit editing events remain outside this handler.
+    /// Content-window visibility is a deliberate global command. Register
+    /// Clip, Mailbox, and Capsule exclusively so another Carbon listener cannot
+    /// observe the same chord; ordinary AppKit editing remains outside here.
     var registrationOptions: OptionBits {
-        action == .toggleClipboardHistory || action == .openMailbox
+        action == .toggleClipboardHistory
+            || action == .openMailbox
+            || action == .openCapsule
             ? OptionBits(kEventHotKeyExclusive)
             : OptionBits(kEventHotKeyNoOptions)
     }
@@ -60,7 +65,10 @@ enum GlobalHotKeyRouting {
 
     static func definitions(defaults: UserDefaults = .standard)
         -> [GlobalHotKeyDefinition] {
-        GlobalHotKeyAction.allCases.map { action in
+        RimeShortcutPreferences.migrateGlobalHotKeyShortcutsIfNeeded(
+            defaults: defaults
+        )
+        return GlobalHotKeyAction.allCases.map { action in
             let shortcut = RimeShortcutPreferences.shortcut(
                 for: action.shortcutAction,
                 defaults: defaults
@@ -75,6 +83,9 @@ enum GlobalHotKeyRouting {
         for action: GlobalHotKeyAction,
         defaults: UserDefaults = .standard
     ) -> GlobalHotKeyDefinition {
+        RimeShortcutPreferences.migrateGlobalHotKeyShortcutsIfNeeded(
+            defaults: defaults
+        )
         let shortcut = RimeShortcutPreferences.shortcut(
             for: action.shortcutAction,
             defaults: defaults
@@ -97,6 +108,7 @@ enum GlobalHotKeyRouting {
         case .toggleWorkbench: return .toggleWorkbench
         case .toggleClipboardHistory: return .toggleClipboardHistory
         case .openMailbox: return .openMailbox
+        case .openCapsule: return .openCapsule
         case .openSettings: return .openSettings
         }
     }
@@ -126,6 +138,7 @@ final class GlobalHotKeyController {
                action != .toggleWorkbench,
                action != .toggleClipboardHistory,
                action != .openMailbox,
+               action != .openCapsule,
                action != .openSettings {
                 return
             }
@@ -280,11 +293,14 @@ final class GlobalHotKeyController {
                 BufferWindowController.shared.toggleVisibility()
                 IMELog.write("global hotkey toggled buffer workbench")
             case .toggleClipboardHistory:
-                BufferWindowController.shared.toggleClipboardHistory()
+                ClipboardHistoryWindowController.shared.toggleVisibility()
                 IMELog.write("global hotkey toggled clipboard history")
             case .openMailbox:
                 let action = MailboxWindowController.shared.toggleVisibility()
                 IMELog.write("global hotkey toggled Mailbox action=\(action)")
+            case .openCapsule:
+                let action = CapsuleWindowController.shared.toggleVisibility()
+                IMELog.write("global hotkey toggled Capsule action=\(action)")
             case .openSettings:
                 SettingsWindowController.shared.show()
                 IMELog.write("global hotkey opened settings")

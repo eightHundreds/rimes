@@ -94,8 +94,8 @@ func runPluginDistributionSmokeTest() -> Bool {
         BuiltInPluginID.aiText,
         BuiltInPluginID.appleTranslation,
         BuiltInPluginID.streamInput,
-        BuiltInPluginID.capsule,
     ]
+    let legacyCapsuleBufferPluginID = "builtin.capsule"
     let expectedOptionalIDs: Set<String> = []
     let retiredProductIDs: Set<String> = [
         BuiltInPluginID.myPrompt,
@@ -105,8 +105,7 @@ func runPluginDistributionSmokeTest() -> Bool {
     let expectedVersions = [
         BuiltInPluginID.aiText: "2.1",
         BuiltInPluginID.appleTranslation: "2.1",
-        BuiltInPluginID.streamInput: "1.3",
-        BuiltInPluginID.capsule: "0.3",
+        BuiltInPluginID.streamInput: "1.4",
     ]
 
     func fail(_ message: String) -> Bool {
@@ -283,15 +282,17 @@ func runPluginDistributionSmokeTest() -> Bool {
             == expectedDefaultIDs,
           Set(PresetBufferPluginCatalog.entries.filter { !$0.defaultInstalled }.map(\.id))
             == expectedOptionalIDs else {
-        return fail("fresh catalog must contain exactly four bundled/enabled presets")
+        return fail("fresh catalog must contain exactly three bundled/enabled presets")
     }
     let registeredIDs = Set(BuiltInPlugins.makeAll().map {
         $0.descriptor.key.rawID
     })
     guard retiredProductIDs.isDisjoint(with: Set(catalogIDs)),
           retiredProductIDs.isDisjoint(with: registeredIDs),
+          !catalogIDs.contains(legacyCapsuleBufferPluginID),
+          !registeredIDs.contains(legacyCapsuleBufferPluginID),
           expectedDefaultIDs.isSubset(of: registeredIDs) else {
-        return fail("retired product plug-ins remain catalogued or registered")
+        return fail("non-Buffer products remain catalogued or registered")
     }
 
     do {

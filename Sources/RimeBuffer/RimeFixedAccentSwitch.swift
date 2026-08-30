@@ -1,10 +1,172 @@
 import AppKit
 
+enum RimePointingHandCursorKind: Equatable {
+    case arrow
+    case pointingHand
+}
+
+/// Shared enabled-aware cursor policy for product-owned AppKit controls.
+/// Settings uses a key window, while the Buffer and Clipboard surfaces may
+/// additionally set the same cursor from their active-always tracking areas.
+enum RimePointingHandCursorRules {
+    static func kind(enabled: Bool) -> RimePointingHandCursorKind {
+        enabled ? .pointingHand : .arrow
+    }
+
+    static func cursor(enabled: Bool) -> NSCursor {
+        switch kind(enabled: enabled) {
+        case .arrow: return .arrow
+        case .pointingHand: return .pointingHand
+        }
+    }
+
+    static func updateTrackingArea(
+        _ current: inout NSTrackingArea?,
+        for view: NSView,
+        options: NSTrackingArea.Options = [
+            .mouseEnteredAndExited,
+            .activeInKeyWindow,
+            .inVisibleRect,
+        ]
+    ) {
+        if let current { view.removeTrackingArea(current) }
+        let replacement = NSTrackingArea(
+            rect: .zero,
+            options: options,
+            owner: view,
+            userInfo: nil
+        )
+        view.addTrackingArea(replacement)
+        current = replacement
+    }
+
+    static func mouseEntered(enabled: Bool) {
+        cursor(enabled: enabled).set()
+    }
+
+    static func mouseExited() {
+        NSCursor.arrow.set()
+    }
+
+    static func enabledDidChange(
+        for view: NSView,
+        pointerInside: Bool,
+        enabled: Bool
+    ) {
+        view.window?.invalidateCursorRects(for: view)
+        if pointerInside { mouseEntered(enabled: enabled) }
+    }
+
+    static func resetCursorRect(for view: NSView, enabled: Bool) {
+        view.addCursorRect(view.bounds, cursor: cursor(enabled: enabled))
+    }
+}
+
+/// Native button behavior with one product-owned, enabled-aware cursor area.
+/// Keep this shared rather than defining page-local button subclasses so views
+/// embedded in Settings retain the same affordance as controls built by the
+/// Settings shell itself.
+class RimePointingHandButton: NSButton {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
+
+    var pointingHandTrackingOptions: NSTrackingArea.Options {
+        [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
+    }
+
+    override var isEnabled: Bool {
+        didSet {
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isEnabled
+            )
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self,
+            options: pointingHandTrackingOptions
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
+}
+
+/// Segmented controls are buttons from the user's point of view but do not
+/// inherit from `NSButton`, so give them the same single tracking-area policy.
+class RimePointingHandSegmentedControl: NSSegmentedControl {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
+
+    override var isEnabled: Bool {
+        didSet {
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isEnabled
+            )
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
+}
+
 /// A product-owned switch that keeps the selected theme accent instead of
 /// inheriting the user's macOS accent preference. It deliberately subclasses `NSControl`:
 /// `NSSwitch` renders through private AppKit internals and does not call an
 /// overridden `draw(_:)`, so it cannot be reliably recolored.
 class RimeFixedAccentSwitch: NSControl {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
+
     var state: NSControl.StateValue = .off {
         didSet {
             let normalized: NSControl.StateValue = state == .off ? .off : .on
@@ -19,7 +181,14 @@ class RimeFixedAccentSwitch: NSControl {
     }
 
     override var isEnabled: Bool {
-        didSet { needsDisplay = true }
+        didSet {
+            needsDisplay = true
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isEnabled
+            )
+        }
     }
 
     override var intrinsicContentSize: NSSize { NSSize(width: 38, height: 22) }
@@ -36,6 +205,34 @@ class RimeFixedAccentSwitch: NSControl {
     }
 
     override func sizeThatFits(_ size: NSSize) -> NSSize { intrinsicContentSize }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
 
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }

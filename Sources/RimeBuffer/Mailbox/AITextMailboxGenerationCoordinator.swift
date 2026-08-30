@@ -33,7 +33,6 @@ protocol AITextMailboxPersisting: AnyObject {
 extension MailboxStore: AITextMailboxPersisting {}
 
 enum AITextMailboxGenerationError: LocalizedError, Equatable {
-    case mailboxDestinationRequired
     case connectorUnavailable(String)
     case unsupportedConversationSource
     case invalidMessage
@@ -42,8 +41,6 @@ enum AITextMailboxGenerationError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .mailboxDestinationRequired:
-            return "当前生成目标不是 Mailbox"
         case let .connectorUnavailable(message), let .persistence(message):
             return message
         case .unsupportedConversationSource:
@@ -66,10 +63,9 @@ enum AITextMailboxGenerationNotice: Equatable {
     case failed(threadID: UUID?, message: String)
 }
 
-/// Owns provider tasks whose destination is Mailbox. It intentionally has no
-/// workbench-pause or owner-selection observer: closing Buffer, changing its
-/// plugin and pausing input capture cannot cancel or tombstone these jobs.
-/// Provider timeout/process failure still terminates a job normally.
+/// Owns provider tasks created by Mailbox's native new-conversation and reply
+/// commands. It has no Buffer source, workbench observer, or source-consumption
+/// path; provider timeout/process failure still terminates a job normally.
 final class AITextMailboxGenerationCoordinator {
     static let shared = AITextMailboxGenerationCoordinator()
 
@@ -91,10 +87,18 @@ final class AITextMailboxGenerationCoordinator {
         }
     }
 
+    private struct RequestPlan {
+        let requestID: UUID
+        let sourceText: String
+        let connectorKind: AITextProviderKind
+        let modelID: String?
+        let format: AITextContentFormat
+        let preparedPrompt: String
+    }
+
     private final class Job {
         let handle: MailboxGenerationHandle
-        let plan: AITextGenerationPlan
-        let consumesBufferSource: Bool
+        let plan: RequestPlan
         let relay: AITextCancellationRelay
         var streamingBlocks: [Int: AITextProviderBlock] = [:]
         var lastPublishedPreview: String?
@@ -103,26 +107,21 @@ final class AITextMailboxGenerationCoordinator {
         var pendingPreviewWorkItem: DispatchWorkItem?
 
         init(handle: MailboxGenerationHandle,
-             plan: AITextGenerationPlan,
-             consumesBufferSource: Bool,
+             plan: RequestPlan,
              relay: AITextCancellationRelay) {
             self.handle = handle
             self.plan = plan
-            self.consumesBufferSource = consumesBufferSource
             self.relay = relay
         }
     }
 
     private static let previewMinimumInterval: TimeInterval = 0.05
 
-    private let sourceModel: BufferModel
     private let dependencies: Dependencies
     /// Main-thread isolated. Provider callbacks are marshalled before access.
     private var jobs: [UUID: Job] = [:]
 
-    init(sourceModel: BufferModel = .shared,
-         dependencies: Dependencies = Dependencies()) {
-        self.sourceModel = sourceModel
+    init(dependencies: Dependencies = Dependencies()) {
         self.dependencies = dependencies
     }
 
@@ -131,37 +130,66 @@ final class AITextMailboxGenerationCoordinator {
         return jobs.count
     }
 
-    func hasActiveJob(for sourceBlockIDs: [UUID]) -> Bool {
+    /// Starts a Mailbox-native conversation without borrowing text, ownership,
+    /// or lifecycle from Buffer. The connector and model are normalized and
+    /// frozen into both the provider request and the durable thread source before
+    /// the background job starts. New conversations are always ordinary plain
+    /// question/answer threads; later replies retain that thread-local source.
+    @discardableResult
+    func startConversation(
+        connectorKind: AITextProviderKind,
+        modelID: String?,
+        prompt: String
+    ) throws -> MailboxGenerationHandle {
         dispatchPrecondition(condition: .onQueue(.main))
-        let ids = Set(sourceBlockIDs)
-        return jobs.values.contains { job in
-            !ids.isEmpty && Set(job.plan.sourceBlocks.map(\.id)) == ids
+        let normalizedPrompt = prompt.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalizedPrompt.isEmpty,
+              normalizedPrompt.utf8.count
+                <= AITextRuntimeLimits.maximumSourceBytes else {
+            throw AITextMailboxGenerationError.invalidMessage
         }
+        let selection = try AITextGenerationPreferenceStore.normalized(
+            AITextGenerationSelection(
+                connectorKind: connectorKind,
+                modelID: modelID,
+                mode: .ask,
+                destination: .inline,
+                format: .plain
+            )
+        )
+        let plan = RequestPlan(
+            requestID: UUID(),
+            sourceText: normalizedPrompt,
+            connectorKind: selection.connectorKind,
+            modelID: selection.modelID,
+            format: .plain,
+            preparedPrompt: try AITextRequestPlanner.initialPrompt(
+                sourceText: normalizedPrompt,
+                mode: .ask,
+                format: .plain
+            )
+        )
+        return try persistAndStartConversation(plan)
     }
 
-    /// The caller may close Buffer immediately after this returns. The handle
-    /// has already been persisted and the coordinator has retained the provider
-    /// task independently from AITextPluginWorkspace.
-    @discardableResult
-    func start(_ plan: AITextGenerationPlan) throws -> MailboxGenerationHandle {
+    private func persistAndStartConversation(
+        _ plan: RequestPlan
+    ) throws -> MailboxGenerationHandle {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard plan.selection.destination == .mailbox else {
-            throw AITextMailboxGenerationError.mailboxDestinationRequired
-        }
-        guard !hasActiveJob(for: plan.sourceBlocks.map(\.id)) else {
-            throw AITextMailboxGenerationError.persistence(
-                MailboxStoreError.generationAlreadyRunning.localizedDescription
-            )
-        }
-        let provider = try resolvedProvider(for: plan.selection.connectorKind)
+        let provider = try resolvedProvider(for: plan.connectorKind)
         let handle: MailboxGenerationHandle
         do {
             handle = try dependencies.store.beginAIConversation(
-                source: mailboxSource(for: plan.selection),
+                source: mailboxSource(
+                    connectorKind: plan.connectorKind,
+                    modelID: plan.modelID
+                ),
                 title: nil,
                 prompt: plan.sourceText,
                 author: "你",
-                format: plan.selection.format
+                format: plan.format
             )
         } catch {
             throw persistenceError(error)
@@ -169,8 +197,7 @@ final class AITextMailboxGenerationCoordinator {
         startProvider(
             plan: plan,
             handle: handle,
-            provider: provider,
-            consumesBufferSource: true
+            provider: provider
         )
         return handle
     }
@@ -221,16 +248,17 @@ final class AITextMailboxGenerationCoordinator {
                 connectorKind: connectorKind,
                 modelID: thread.source.model,
                 mode: .ask,
-                destination: .mailbox,
+                destination: .inline,
                 format: responseFormat
             )
-            let plan = AITextGenerationPlan(
+            let plan = RequestPlan(
                 requestID: UUID(),
                 sourceText: normalized,
-                sourceBlocks: [],
-                selection: try AITextGenerationPreferenceStore.normalized(selection),
-                preparedPrompt: preparedPrompt,
-                createdAt: Date()
+                connectorKind: selection.connectorKind,
+                modelID: try AITextGenerationPreferenceStore.normalized(selection)
+                    .modelID,
+                format: responseFormat,
+                preparedPrompt: preparedPrompt
             )
             let handle: MailboxGenerationHandle
             do {
@@ -246,24 +274,21 @@ final class AITextMailboxGenerationCoordinator {
             startProvider(
                 plan: plan,
                 handle: handle,
-                provider: provider,
-                consumesBufferSource: false
+                provider: provider
             )
             return .generationStarted(handle)
         }
     }
 
     private func startProvider(
-        plan: AITextGenerationPlan,
+        plan: RequestPlan,
         handle: MailboxGenerationHandle,
-        provider: any AITextProvider,
-        consumesBufferSource: Bool
+        provider: any AITextProvider
     ) {
         let relay = AITextCancellationRelay()
         jobs[handle.generationID] = Job(
             handle: handle,
             plan: plan,
-            consumesBufferSource: consumesBufferSource,
             relay: relay
         )
         let task = provider.generate(
@@ -271,7 +296,7 @@ final class AITextMailboxGenerationCoordinator {
                 requestID: plan.requestID,
                 sourceText: plan.sourceText,
                 preparedPrompt: plan.preparedPrompt,
-                modelID: plan.selection.modelID
+                modelID: plan.modelID
             ),
             onEvent: { [weak self] event in
                 self?.performOnMain { coordinator in
@@ -359,7 +384,10 @@ final class AITextMailboxGenerationCoordinator {
             _ = try dependencies.store.updateGenerationPreview(
                 job.handle,
                 response: body,
-                author: mailboxSource(for: job.plan.selection).displayName,
+                author: mailboxSource(
+                    connectorKind: job.plan.connectorKind,
+                    modelID: job.plan.modelID
+                ).displayName,
                 format: .plain
             )
             job.lastPublishedPreview = body
@@ -384,19 +412,17 @@ final class AITextMailboxGenerationCoordinator {
             do {
                 let response = try terminalResponse(
                     from: blocks,
-                    format: job.plan.selection.format
+                    format: job.plan.format
                 )
                 _ = try dependencies.store.completeGeneration(
                     job.handle,
                     response: response,
-                    author: mailboxSource(for: job.plan.selection).displayName,
-                    format: job.plan.selection.format
+                    author: mailboxSource(
+                        connectorKind: job.plan.connectorKind,
+                        modelID: job.plan.modelID
+                    ).displayName,
+                    format: job.plan.format
                 )
-                if job.consumesBufferSource, sourceLeaseMatches(job.plan) {
-                    sourceModel.consumeDelivered(
-                        blockIDs: job.plan.sourceBlocks.map(\.id)
-                    )
-                }
                 dependencies.notice(.completed(
                     threadID: job.handle.threadID,
                     sequence: job.handle.sequence,
@@ -410,9 +436,9 @@ final class AITextMailboxGenerationCoordinator {
         }
     }
 
-    /// Failure never consumes source blocks. If persistence of the failure
-    /// marker itself is unavailable, the notice still reports the provider or
-    /// storage error while Buffer retains the frozen source.
+    /// A failed Mailbox generation never reaches Buffer. If persistence of the
+    /// failure marker itself is unavailable, the notice still reports the
+    /// provider or storage error while the durable user turn remains in Mailbox.
     private func fail(_ job: Job, message: String) {
         var resolvedMessage = message
         do {
@@ -471,20 +497,17 @@ final class AITextMailboxGenerationCoordinator {
         return response
     }
 
-    private func sourceLeaseMatches(_ plan: AITextGenerationPlan) -> Bool {
-        sourceModel.blocks.map(AITextFrozenSourceBlock.init) == plan.sourceBlocks
-    }
-
     private func mailboxSource(
-        for selection: AITextGenerationSelection
+        connectorKind: AITextProviderKind,
+        modelID: String?
     ) -> MailboxSource {
-        switch selection.connectorKind {
+        switch connectorKind {
         case .codexCLI:
-            return .codexCLI(model: selection.modelID)
+            return .codexCLI(model: modelID)
         case .claudeCodeCLI:
-            return .claudeCodeCLI(model: selection.modelID)
+            return .claudeCodeCLI(model: modelID)
         case .openAICompatible:
-            return .openAICompatible(model: selection.modelID)
+            return .openAICompatible(model: modelID)
         }
     }
 
@@ -556,6 +579,44 @@ final class AITextMailboxGenerationCoordinator {
 }
 
 extension AITextMailboxGenerationCoordinator: MailboxAIReplyCoordinating {
+    /// Accepts the first Mailbox turn from either the standalone window's main
+    /// thread or another UI bridge. Success means the trimmed prompt and frozen
+    /// connector/model selection are durable and the provider job is owned by
+    /// this coordinator; the terminal answer is delivered later through Store.
+    func startMailboxConversation(
+        selection: MailboxNewConversationSelection,
+        body: String,
+        completion: @escaping (
+            Result<MailboxGenerationHandle, Error>
+        ) -> Void
+    ) {
+        let submit = { [weak self] in
+            guard let self else {
+                completion(.failure(
+                    AITextMailboxGenerationError.connectorUnavailable(
+                        "AI 连接器暂时不可用"
+                    )
+                ))
+                return
+            }
+            do {
+                let handle = try self.startConversation(
+                    connectorKind: selection.connectorKind,
+                    modelID: selection.modelID,
+                    prompt: body
+                )
+                completion(.success(handle))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+        if Thread.isMainThread {
+            submit()
+        } else {
+            DispatchQueue.main.async(execute: submit)
+        }
+    }
+
     /// The Mailbox composer clears its draft once the continuation has been
     /// durably recorded and its provider task is owned by this coordinator.
     /// Terminal success/failure is delivered later through MailboxStore.

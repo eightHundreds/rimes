@@ -10,11 +10,50 @@ enum CandidatePanelInteractionRules {
     static func mayInteract(hasLogicalCandidates: Bool,
                             hasInteractionTarget: Bool,
                             panelIsVisible: Bool,
-                            panelIsOnActiveSpace: Bool) -> Bool {
+                            panelIsOnActiveSpace: Bool,
+                            transitionAllowsInteraction: Bool = true) -> Bool {
         hasLogicalCandidates
             && hasInteractionTarget
             && panelIsVisible
             && panelIsOnActiveSpace
+            && transitionAllowsInteraction
+    }
+}
+
+enum CandidatePanelVisibilityPhase: Equatable {
+    case hidden
+    case fadingIn
+    case visible
+    case fadingOut
+}
+
+enum CandidatePanelAnimationRules {
+    /// Keep both edges perceptible without making candidate delivery wait on
+    /// decoration. The outgoing edge is deliberately the shorter one.
+    static let fadeInDuration: TimeInterval = 0.06
+    static let fadeOutDuration: TimeInterval = 0.045
+
+    static func shouldFadeIn(panelIsVisible: Bool,
+                             phase: CandidatePanelVisibilityPhase,
+                             reduceMotion: Bool) -> Bool {
+        guard !reduceMotion else { return false }
+        return !panelIsVisible || phase == .hidden || phase == .fadingOut
+    }
+
+    static func shouldFadeOut(panelIsVisible: Bool,
+                              phase: CandidatePanelVisibilityPhase,
+                              reduceMotion: Bool) -> Bool {
+        !reduceMotion && panelIsVisible && phase != .fadingOut
+    }
+
+    static func allowsInteraction(phase: CandidatePanelVisibilityPhase) -> Bool {
+        phase == .fadingIn || phase == .visible
+    }
+
+    static func mayCompleteFadeOut(expectedGeneration: UInt64,
+                                   currentGeneration: UInt64,
+                                   phase: CandidatePanelVisibilityPhase) -> Bool {
+        expectedGeneration == currentGeneration && phase == .fadingOut
     }
 }
 
@@ -343,6 +382,7 @@ struct CandidateSelection {
 enum CandidatePresentationMode {
     case caret
     case bufferCaret
+    case clipboardCaret
 }
 
 enum CandidatePanelPreferredSide: Equatable {
@@ -513,6 +553,9 @@ final class CandidateWindow {
     private var projectionPreedit = ""
     private weak var contentHost: NSView?
     private var contentHostConstraints: [NSLayoutConstraint] = []
+    private var visibilityPhase: CandidatePanelVisibilityPhase = .hidden
+    private var visibilityTransitionGeneration: UInt64 = 0
+    private var scrubRenderedViewsWhenHidden = false
 
     var onSelect: ((FocusToken, CandidateSelection) -> Void)?
     var onSettings: (() -> Void)?
@@ -533,7 +576,9 @@ final class CandidateWindow {
                 InputFocusCoordinator.shared.interactionTarget(expected: $0) != nil
             } ?? false,
             panelIsVisible: presentationIsVisible,
-            panelIsOnActiveSpace: presentationIsOnActiveSpace
+            panelIsOnActiveSpace: presentationIsOnActiveSpace,
+            transitionAllowsInteraction: CandidatePanelAnimationRules
+                .allowsInteraction(phase: visibilityPhase)
         )
     }
     var isVisible: Bool {
@@ -547,7 +592,11 @@ final class CandidateWindow {
         // Rime context. Callers asking whether candidates are visible must see
         // the WindowServer truth, otherwise a hidden panel can keep steering
         // candidate-only key paths indefinitely.
-        guard presentationIsVisible, presentationIsOnActiveSpace else { return false }
+        guard presentationIsVisible,
+              presentationIsOnActiveSpace,
+              CandidatePanelAnimationRules.allowsInteraction(
+                phase: visibilityPhase
+              ) else { return false }
         return !currentContext.candidates.isEmpty || !projectionPreedit.isEmpty
     }
     var isExpanded: Bool { !expandedPages.isEmpty }
@@ -607,6 +656,7 @@ final class CandidateWindow {
         panel.level = CandidatePanelLevelRules.standard
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = CandidatePanelSpaceRules.collectionBehavior
+        panel.ignoresMouseEvents = true
 
         // React CandidateSurface treats preedit as an independent 20pt pill,
         // not as a full-width row painted by the candidate strip. Preserve the
@@ -855,23 +905,36 @@ final class CandidateWindow {
 
     func hide(owner: FocusToken) {
         guard let ownerToken else {
-            hidePanel(reason: "owner-hide-without-presentation",
-                      clearsPresentation: true)
+            // A repeated hide can arrive while the retired pixels are already
+            // fading. Let that transition finish instead of snapping it off.
+            if visibilityPhase != .fadingOut {
+                hidePanel(reason: "owner-hide-without-presentation",
+                          clearsPresentation: true,
+                          animated: false)
+            }
             return
         }
         guard ownerToken == owner else {
             IMELog.write("candidate stale hide ignored owner=\(owner)")
             return
         }
-        hidePanel(reason: "owner-hide", clearsPresentation: true)
+        let mayFade = InputFocusCoordinator.shared.isCurrent(owner)
+            && !IsSecureEventInputEnabled()
+        hidePanel(reason: "owner-hide",
+                  clearsPresentation: true,
+                  animated: mayFade)
     }
 
     func hideAll() {
-        hidePanel(reason: "global-hide", clearsPresentation: true)
+        hidePanel(reason: "global-hide",
+                  clearsPresentation: true,
+                  animated: false)
     }
 
-    private func resetPresentationState() {
-        scrubRenderedCandidateViews()
+    private func resetPresentationState(scrubRenderedViews: Bool = true) {
+        if scrubRenderedViews {
+            scrubRenderedPresentation()
+        }
         visualPageIndex = 0
         selectedIndex = 0
         resetExpandedState()
@@ -884,6 +947,10 @@ final class CandidateWindow {
         lastCaretRect = .zero
         lastBundleId = ""
         lastGoodCaretRect = nil
+    }
+
+    private func scrubRenderedPresentation() {
+        scrubRenderedCandidateViews()
         preeditLabel.stringValue = ""
         preeditPill.isHidden = true
         strip.isHidden = false
@@ -909,7 +976,8 @@ final class CandidateWindow {
                 .inlineInputCaretScreenRect(owner: ownerToken) else {
             if presentationMode == .bufferCaret {
                 hidePanel(reason: "buffer-caret-unavailable",
-                          clearsPresentation: false)
+                          clearsPresentation: false,
+                          animated: false)
             }
             return
         }
@@ -1180,8 +1248,9 @@ final class CandidateWindow {
         } else if presentationMode == .caret,
                   let cached = lastGoodCaretRect {
             anchor = cached
-        } else if presentationMode == .bufferCaret {
-            // A Buffer caret belongs to a short-lived logical surface. Never
+        } else if presentationMode == .bufferCaret
+                    || presentationMode == .clipboardCaret {
+            // A logical-surface caret is short-lived. Never
             // jump to a cached host caret when that surface is hidden/stale.
             return nil
         } else {
@@ -1218,7 +1287,11 @@ final class CandidateWindow {
 
     private func layoutAndShowAccordingToPresentation() {
         guard let ownerToken else {
-            hidePanel(reason: "missing-owner", clearsPresentation: true)
+            if visibilityPhase != .fadingOut {
+                hidePanel(reason: "missing-owner",
+                          clearsPresentation: true,
+                          animated: false)
+            }
             return
         }
         guard let interactionTarget = InputFocusCoordinator.shared.interactionTarget(
@@ -1229,7 +1302,8 @@ final class CandidateWindow {
             // candidate state that looks visible. A later trusted `update`
             // supplies a fresh context and safely reconstructs the panel.
             hidePanel(reason: "interaction-target-unavailable",
-                      clearsPresentation: true)
+                      clearsPresentation: true,
+                      animated: false)
             return
         }
         guard !currentContext.candidates.isEmpty || !projectionPreedit.isEmpty else {
@@ -1239,7 +1313,9 @@ final class CandidateWindow {
         guard CandidatePanelSecurityRules.mayOrderFront(
             secureInputEnabled: IsSecureEventInputEnabled()
         ) else {
-            hidePanel(reason: "secure-input-before-level", clearsPresentation: true)
+            hidePanel(reason: "secure-input-before-level",
+                      clearsPresentation: true,
+                      animated: false)
             return
         }
 
@@ -1247,7 +1323,17 @@ final class CandidateWindow {
             guard let caret = BufferWindowController.shared
                 .inlineInputCaretScreenRect(owner: ownerToken) else {
                 hidePanel(reason: "buffer-caret-unavailable",
-                          clearsPresentation: false)
+                          clearsPresentation: false,
+                          animated: false)
+                return
+            }
+            lastCaretRect = caret
+        } else if presentationMode == .clipboardCaret {
+            guard let caret = ClipboardHistoryWindowController.shared
+                .searchCaretScreenRect(expected: ownerToken) else {
+                hidePanel(reason: "clipboard-caret-unavailable",
+                          clearsPresentation: false,
+                          animated: false)
                 return
             }
             lastCaretRect = caret
@@ -1255,7 +1341,9 @@ final class CandidateWindow {
 
         attachContentToPanel()
         guard layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId) else {
-            hidePanel(reason: "layout-unavailable", clearsPresentation: false)
+            hidePanel(reason: "layout-unavailable",
+                      clearsPresentation: false,
+                      animated: false)
             return
         }
         panel.level = CandidatePanelLevelRules.level(
@@ -1269,12 +1357,78 @@ final class CandidateWindow {
     /// AppKit visibility cannot silently diverge. Reasons are fixed internal
     /// strings; logs contain only counts, geometry, and focus tokens — never
     /// candidate, preedit, input, or bundle text.
-    private func hidePanel(reason: String, clearsPresentation: Bool) {
+    private func hidePanel(reason: String,
+                           clearsPresentation: Bool,
+                           animated: Bool = true) {
         let snapshot = panelLogSnapshot()
-        panel.orderOut(nil)
         panel.level = CandidatePanelLevelRules.standard
+
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let shouldFade = animated && CandidatePanelAnimationRules.shouldFadeOut(
+            panelIsVisible: panel.isVisible,
+            phase: visibilityPhase,
+            reduceMotion: reduceMotion
+        )
+
+        if visibilityPhase == .fadingOut && animated && panel.isVisible {
+            if clearsPresentation {
+                scrubRenderedViewsWhenHidden = true
+                resetPresentationState(scrubRenderedViews: false)
+            }
+            return
+        }
+
+        visibilityTransitionGeneration &+= 1
+        let generation = visibilityTransitionGeneration
+        panel.ignoresMouseEvents = true
+
+        if shouldFade {
+            scrubRenderedViewsWhenHidden = scrubRenderedViewsWhenHidden
+                || clearsPresentation
+            if clearsPresentation {
+                // Retire owner/context synchronously so a host callback cannot
+                // select an already committed candidate while its pixels fade.
+                resetPresentationState(scrubRenderedViews: false)
+            }
+            visibilityPhase = .fadingOut
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = CandidatePanelAnimationRules.fadeOutDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self,
+                      CandidatePanelAnimationRules.mayCompleteFadeOut(
+                        expectedGeneration: generation,
+                        currentGeneration: self.visibilityTransitionGeneration,
+                        phase: self.visibilityPhase
+                      ) else { return }
+                self.panel.orderOut(nil)
+                self.panel.alphaValue = 1
+                self.visibilityPhase = .hidden
+                if self.scrubRenderedViewsWhenHidden {
+                    self.scrubRenderedPresentation()
+                    self.scrubRenderedViewsWhenHidden = false
+                }
+                self.attachContentToPanel()
+                self.logPanelTransition(
+                    action: "hide",
+                    reason: reason,
+                    before: snapshot,
+                    retiredPresentation: clearsPresentation
+                )
+            })
+            return
+        }
+
+        panel.orderOut(nil)
+        panel.alphaValue = 1
+        visibilityPhase = .hidden
+        let shouldScrub = clearsPresentation || scrubRenderedViewsWhenHidden
+        scrubRenderedViewsWhenHidden = false
         if clearsPresentation {
-            resetPresentationState()
+            resetPresentationState(scrubRenderedViews: shouldScrub)
+        } else if shouldScrub {
+            scrubRenderedPresentation()
         }
         attachContentToPanel()
         logPanelTransition(
@@ -1289,7 +1443,9 @@ final class CandidateWindow {
         guard CandidatePanelSecurityRules.mayOrderFront(
             secureInputEnabled: IsSecureEventInputEnabled()
         ) else {
-            hidePanel(reason: "secure-input-before-show", clearsPresentation: true)
+            hidePanel(reason: "secure-input-before-show",
+                      clearsPresentation: true,
+                      animated: false)
             return
         }
         let snapshot = panelLogSnapshot()
@@ -1297,9 +1453,51 @@ final class CandidateWindow {
             isVisible: panel.isVisible,
             isOnActiveSpace: panel.isOnActiveSpace
         ) {
+            visibilityTransitionGeneration &+= 1
             panel.orderOut(nil)
+            panel.alphaValue = 1
+            visibilityPhase = .hidden
         }
-        panel.orderFrontRegardless()
+
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let shouldFade = CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: panel.isVisible,
+            phase: visibilityPhase,
+            reduceMotion: reduceMotion
+        )
+        scrubRenderedViewsWhenHidden = false
+        panel.ignoresMouseEvents = false
+
+        if shouldFade {
+            visibilityTransitionGeneration &+= 1
+            let generation = visibilityTransitionGeneration
+            if !panel.isVisible {
+                panel.alphaValue = 0
+            }
+            visibilityPhase = .fadingIn
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = CandidatePanelAnimationRules.fadeInDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().alphaValue = 1
+            }, completionHandler: { [weak self] in
+                guard let self,
+                      generation == self.visibilityTransitionGeneration,
+                      self.visibilityPhase == .fadingIn else { return }
+                self.panel.alphaValue = 1
+                self.visibilityPhase = .visible
+            })
+        } else {
+            if visibilityPhase == .fadingIn && !reduceMotion {
+                // Frequent Rime updates land inside the 60 ms entrance. Keep
+                // that one transition running instead of flashing from zero.
+            } else if visibilityPhase != .visible {
+                visibilityTransitionGeneration &+= 1
+                visibilityPhase = .visible
+                panel.alphaValue = 1
+            }
+            panel.orderFrontRegardless()
+        }
         logPanelTransition(
             action: "show",
             reason: reason,
@@ -1322,6 +1520,7 @@ final class CandidateWindow {
         switch presentationMode {
         case .caret: presentation = "caret"
         case .bufferCaret: presentation = "buffer-caret"
+        case .clipboardCaret: presentation = "clipboard-caret"
         }
         return PanelLogSnapshot(
             owner: ownerToken?.description ?? "none",
@@ -2256,6 +2455,11 @@ final class CandidateWindow {
     }
 
     @objc private func settingsTapped() {
+        guard CandidatePanelAnimationRules.allowsInteraction(
+                phase: visibilityPhase
+              ),
+              presentationIsVisible,
+              presentationIsOnActiveSpace else { return }
         onSettings?()
     }
 }

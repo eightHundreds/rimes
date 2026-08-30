@@ -3,6 +3,9 @@ import AppKit
 /// Product-owned checkbox/radio control whose selected state always uses the
 /// current theme accent instead of the user's macOS accent preference.
 final class RimeFixedAccentChoiceButton: NSControl {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerInside = false
+
     enum Style {
         case checkbox
         case radio
@@ -14,6 +17,22 @@ final class RimeFixedAccentChoiceButton: NSControl {
     /// Notify that owner whenever the semantic control state changes so the
     /// old card is repainted as well as the newly selected card.
     var onVisualStateChange: (() -> Void)?
+
+    /// Full-card wrappers own one cursor region for their complete hit target.
+    /// They disable this child region to prevent a child `mouseExited` from
+    /// restoring the arrow while the pointer is still inside the parent card.
+    var managesPointingHandCursor = true {
+        didSet {
+            guard oldValue != managesPointingHandCursor else { return }
+            if let pointerTrackingArea {
+                removeTrackingArea(pointerTrackingArea)
+                self.pointerTrackingArea = nil
+            }
+            pointerInside = false
+            if managesPointingHandCursor { updateTrackingAreas() }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
 
     /// Settings choice cards render their title and detail as a richer sibling
     /// label while retaining this control as the sole accessible/action
@@ -51,7 +70,15 @@ final class RimeFixedAccentChoiceButton: NSControl {
     }
 
     override var isEnabled: Bool {
-        didSet { needsDisplay = true }
+        didSet {
+            needsDisplay = true
+            RimePointingHandCursorRules.enabledDidChange(
+                for: self,
+                pointerInside: pointerInside,
+                enabled: isEnabled
+            )
+            if oldValue != isEnabled { onVisualStateChange?() }
+        }
     }
 
     override var acceptsFirstResponder: Bool { isEnabled }
@@ -109,6 +136,47 @@ final class RimeFixedAccentChoiceButton: NSControl {
     }
 
     override func sizeThatFits(_ size: NSSize) -> NSSize { intrinsicContentSize }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if !managesPointingHandCursor {
+            if let pointerTrackingArea {
+                removeTrackingArea(pointerTrackingArea)
+                self.pointerTrackingArea = nil
+            }
+            return
+        }
+        RimePointingHandCursorRules.updateTrackingArea(
+            &pointerTrackingArea,
+            for: self
+        )
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard managesPointingHandCursor else { return }
+        RimePointingHandCursorRules.resetCursorRect(
+            for: self,
+            enabled: isEnabled
+        )
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        guard managesPointingHandCursor else { return }
+        pointerInside = true
+        RimePointingHandCursorRules.mouseEntered(enabled: isEnabled)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard managesPointingHandCursor else {
+            super.mouseExited(with: event)
+            return
+        }
+        pointerInside = false
+        RimePointingHandCursorRules.mouseExited()
+        super.mouseExited(with: event)
+    }
 
     override func mouseDown(with event: NSEvent) {
         guard isEnabled, let window else { return }

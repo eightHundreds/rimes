@@ -19,6 +19,14 @@ if let status = CapsulePasswordCLI.handleIfRequested(
     exit(status)
 }
 
+// Clipboard migration/audit commands are aggregate-only, run before AppKit
+// and IMK startup, and never share clipboard text through stdout or logs.
+if let status = PasteClipboardHistoryCLI.handleIfRequested(
+    arguments: CommandLine.arguments
+) {
+    exit(status)
+}
+
 // Installer reconciliation deliberately runs each TIS mutation/verification
 // in a fresh process. Handle those private phases before any smoke, AppKit,
 // IMK, or librime bootstrap.
@@ -538,6 +546,21 @@ if CommandLine.arguments.contains("clipboard-history-smoke") {
     _ = NSApplication.shared
     exit(MainActor.assumeIsolated { ClipboardHistorySmoke.run() } ? 0 : 1)
 }
+if let previewIndex = CommandLine.arguments.firstIndex(of: "clipboard-window-preview"),
+   CommandLine.arguments.indices.contains(previewIndex + 1) {
+    _ = NSApplication.shared
+    let path = CommandLine.arguments[previewIndex + 1]
+    exit(MainActor.assumeIsolated {
+        ClipboardHistorySmoke.renderPreview(to: path)
+    } ? 0 : 1)
+}
+if let previewIndex = CommandLine.arguments.firstIndex(
+    of: "mailbox-new-conversation-preview"
+), CommandLine.arguments.indices.contains(previewIndex + 1) {
+    _ = NSApplication.shared
+    let path = CommandLine.arguments[previewIndex + 1]
+    exit(MailboxPaneVisualSmoke.renderNewConversationPreview(to: path) ? 0 : 1)
+}
 if CommandLine.arguments.contains("global-hotkey-registration-smoke") {
     _ = NSApplication.shared
     let suite = "RimeBuffer.GlobalHotKeyRegistrationSmoke.\(UUID().uuidString)"
@@ -602,6 +625,9 @@ if CommandLine.arguments.contains("mailbox-store-smoke") {
 }
 if CommandLine.arguments.contains("mailbox-window-smoke") {
     exit(runMailboxWindowSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("capsule-window-smoke") {
+    exit(runCapsuleWindowSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("mailbox-toast-smoke") {
     exit(runMailboxToastSmokeTest() ? 0 : 1)
@@ -726,7 +752,7 @@ if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
         : "failed to render one or more settings routes")
     exit(rendered ? 0 : 1)
 }
-// Dev-only: `ETInput panel-render <path> [translation|marine|candidate]
+// Dev-only: `ETInput panel-render <path> [translation|marine|candidate|toolbar]
 // [hover=<control>]` renders the actual compact workbench.
 if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
    i + 1 < CommandLine.arguments.count {
@@ -743,6 +769,7 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
     let translation = options.contains("translation")
     let marine = options.contains("marine")
     let candidatePreview = options.contains("candidate")
+    let toolbarExpanded = options.contains("toolbar")
     if marine { model.discardForPrivacy() }
     let scaleValue = options.first { Double($0) != nil }.flatMap { Double($0) }
     let scale = CGFloat(scaleValue ?? 2)
@@ -789,7 +816,8 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
         translationSnapshot: translationSnapshot,
         statusIndicators: previewStatuses,
         hoveredControl: hoveredControl,
-        candidatePreview: candidatePreview
+        candidatePreview: candidatePreview,
+        toolbarExpanded: toolbarExpanded
     )
     print(rendered
         ? "rendered \(candidatePreview ? "candidate " : (marine ? "marine " : (translation ? "translation " : "")))expanded workbench @\(scale)x"
@@ -939,17 +967,20 @@ InputFocusCoordinator.shared.onChange = {
     ActionPluginHost.shared.focusDidChange()
     StreamInputWorkspace.shared.focusDidChange()
     BufferWindowController.shared.refresh()
+    ClipboardHistoryWindowController.shared.focusDidChange()
 }
 InputFocusCoordinator.shared.onInvalidated = { owner in
     BufferModel.shared.clearAllContentSelection()
     candidateWindow.hide(owner: owner)
     ActionPluginHost.shared.focusInvalidated(owner)
     StreamInputWorkspace.shared.focusInvalidated(owner)
+    ClipboardHistoryWindowController.shared.focusInvalidated(owner)
 }
 ActionPluginHost.shared.onChange = {
     BufferWindowController.shared.refresh()
 }
 BufferWindowController.shared.showOnLaunchIfNeeded()
+ClipboardHistoryWindowController.shared.start()
 
 // Local gateway: accept MCP / HTTP pushes from local agents into the inbound
 // bus (loopback-only, token-gated). Off is a one-line setting.
@@ -957,7 +988,7 @@ MailboxInteractionBridge.shared.aiReplyCoordinator =
     AITextMailboxGenerationCoordinator.shared
 _ = InboundToast.shared
 InboundBus.shared.onChange = {
-    InboundTrayWindow.refreshIfOpen()
+    MailboxWindowController.refreshIfOpen()
 }
 LocalGateway.shared.startIfEnabled()
 
@@ -1014,6 +1045,8 @@ let inputSourceChangedObserver = DistributedNotificationCenter.default().addObse
     object: nil,
     queue: .main
 ) { _ in
+    ClipboardHistoryWindowController.shared
+        .cancelPendingHostPasteForInputSourceChange()
     let now = ProcessInfo.processInfo.systemUptime
     let modifierFlags = NSEvent.modifierFlags
         .intersection(.deviceIndependentFlagsMask)
@@ -1112,6 +1145,12 @@ NotificationCenter.default.addObserver(
     object: NSApp,
     queue: .main
 ) { _ in
+    let clipboardFlushed = ClipboardHistoryWindowController.shared
+        .flushPersistenceBeforeTermination()
+    IMELog.write(
+        "clipboard persistence termination flush="
+            + (clipboardFlushed ? "complete" : "timed_out_or_failed")
+    )
     InputMetricsPersistence.saveNow()
 }
 
@@ -1248,7 +1287,7 @@ func runEngineSmokeTest() -> Bool {
     print("== \(ProductIdentity.displayName) engine smoke test ==")
     let ok = engine.start()
     print("start:", ok, "healthy:", engine.isHealthy)
-    guard ok, engine.isHealthy else {
+    guard ok, engine.isHealthy, engine.hasOctagram else {
         print("FAILED: engine start:", engine.lastError())
         return false
     }
@@ -1302,6 +1341,100 @@ func runEngineSmokeTest() -> Bool {
     print("committed:", chineseCommit)
     guard chineseCommit == "你好" else {
         print("FAILED: unexpected Chinese commit '\(chineseCommit)'")
+        return false
+    }
+
+    // The consciousness-stream module uses a hidden schema plus the atomic
+    // set-input/copy-candidates bridge. It must decode without committing or
+    // sharing bridge-owned candidate memory with the ordinary IMK session.
+    let streamSession = engine.createSession()
+    guard streamSession != 0 else {
+        print("FAILED: no private stream inference session")
+        return false
+    }
+    defer { engine.destroySession(streamSession) }
+    guard engine.selectSchema("stream_input_local", session: streamSession),
+          engine.getStatus(session: streamSession).schemaId
+            == "stream_input_local",
+          let streamCandidates = engine.decodeCandidateTexts(
+            input: "nihao",
+            maximumCount: 5,
+            session: streamSession
+          ),
+          streamCandidates.contains("你好") else {
+        print("FAILED: hidden stream schema or atomic decoder unavailable")
+        return false
+    }
+    let usableStreamCandidates = streamCandidates.compactMap(
+        RimeOctagramStreamInputEngine.usableCandidate
+    )
+    guard usableStreamCandidates == ["你好", "拟好"] else {
+        print("FAILED: stream local filter accepted an unconverted raw tail")
+        return false
+    }
+
+    // A menu candidate may translate only a prefix while raw input remains.
+    // The atomic bridge must return the full highlighted commit preview; using
+    // candidate.text here would silently truncate both fixtures to `你好`.
+    guard let tailedCandidates = engine.decodeCandidateTexts(
+        input: "nihaox",
+        maximumCount: 5,
+        session: streamSession
+    ), let longerTailedCandidates = engine.decodeCandidateTexts(
+        input: "nihaoabc",
+        maximumCount: 5,
+        session: streamSession
+    ) else {
+        print("FAILED: stream decoder could not decode tail fixtures")
+        return false
+    }
+    guard tailedCandidates.first == "你好像",
+          tailedCandidates.last == "你好x",
+          !tailedCandidates.contains("你好"),
+          longerTailedCandidates.first == "你好啊不错",
+          longerTailedCandidates.contains("你好abc"),
+          !longerTailedCandidates.contains("你好") else {
+        print("tail candidates:", tailedCandidates, longerTailedCandidates)
+        print("FAILED: stream decoder returned a partial candidate without its tail")
+        return false
+    }
+
+    // Warm-query evidence is diagnostic rather than a brittle hosted-runner
+    // threshold. Product code independently bounds raw input and candidate
+    // count; this verifies the hot path stays a single atomic bridge call.
+    var streamDurationsMicros: [UInt64] = []
+    for _ in 0..<30 {
+        let began = DispatchTime.now().uptimeNanoseconds
+        guard engine.decodeCandidateTexts(
+            input: "xiufuyigewenti",
+            maximumCount: 5,
+            session: streamSession
+        )?.isEmpty == false else {
+            print("FAILED: warm stream decode returned no candidates")
+            return false
+        }
+        streamDurationsMicros.append(
+            (DispatchTime.now().uptimeNanoseconds - began) / 1_000
+        )
+    }
+    streamDurationsMicros.sort()
+    let streamP50 = streamDurationsMicros[streamDurationsMicros.count / 2]
+    let streamP95 = streamDurationsMicros[
+        Int(Double(streamDurationsMicros.count - 1) * 0.95)
+    ]
+    print(
+        "stream local decode: candidates=\(usableStreamCandidates) p50=\(streamP50)us p95=\(streamP95)us"
+    )
+
+    let ordinaryProbe = engine.createSession()
+    guard ordinaryProbe != 0 else {
+        print("FAILED: no ordinary post-stream session")
+        return false
+    }
+    defer { engine.destroySession(ordinaryProbe) }
+    guard engine.getStatus(session: ordinaryProbe).schemaId
+            != "stream_input_local" else {
+        print("FAILED: hidden stream schema leaked into ordinary session")
         return false
     }
 
@@ -1962,6 +2095,149 @@ func runSchemaListStoreSmokeTest() -> Bool {
           InputConfigurationResolver.profile(schemaID: "my_combo")?.configuration
             == .init(encoding: .fullPinyin, keyingMode: .mutual) else {
         print("FAILED: input configuration reducer")
+        return false
+    }
+
+    // 0.4 moved the chord window from squirrel.yaml to UserDefaults. Existing
+    // users must keep their tuned interval exactly once; an explicit new
+    // preference always wins, and malformed legacy data freezes the default
+    // instead of being imported unpredictably on a later launch.
+    let chordMigrationRoot = root.appendingPathComponent(
+        "chord-duration-migration",
+        isDirectory: true
+    )
+    let legacyUserDirectory = chordMigrationRoot.appendingPathComponent(
+        "RimeBuffer",
+        isDirectory: true
+    )
+    let legacySquirrelDirectory = chordMigrationRoot.appendingPathComponent(
+        "Rime",
+        isDirectory: true
+    )
+    do {
+        try FileManager.default.createDirectory(
+            at: legacyUserDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: legacySquirrelDirectory,
+            withIntermediateDirectories: true
+        )
+    } catch {
+        print("FAILED: could not create chord migration fixtures", error)
+        return false
+    }
+    let legacyChordConfig = legacyUserDirectory.appendingPathComponent(
+        "squirrel.custom.yaml"
+    )
+    let chordMigrationSuites = (0..<5).map {
+        "RimeBuffer.ChordDurationMigrationSmoke.\($0).\(UUID().uuidString)"
+    }
+    let chordMigrationDefaults = chordMigrationSuites.compactMap {
+        UserDefaults(suiteName: $0)
+    }
+    guard chordMigrationDefaults.count == chordMigrationSuites.count else {
+        print("FAILED: could not create chord migration defaults")
+        return false
+    }
+    defer {
+        for (suite, defaults) in zip(
+            chordMigrationSuites,
+            chordMigrationDefaults
+        ) {
+            defaults.removePersistentDomain(forName: suite)
+        }
+    }
+    do {
+        try "patch:\n  chord_duration: 0.05 # legacy tuning\n".write(
+            to: legacyChordConfig,
+            atomically: true,
+            encoding: .utf8
+        )
+        let migrated = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[0],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+        // Changing the legacy file after the first read must not change the
+        // persisted migration result.
+        try "chord_duration: 0.20\n".write(
+            to: legacyChordConfig,
+            atomically: true,
+            encoding: .utf8
+        )
+        let migratedAgain = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[0],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+
+        chordMigrationDefaults[1].set(0.08, forKey: "chord.duration")
+        let explicitPreference = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[1],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+
+        try "chord_duration: invalid\n".write(
+            to: legacyChordConfig,
+            atomically: true,
+            encoding: .utf8
+        )
+        let invalidFallback = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[2],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+        try "chord_duration: 0.03\n".write(
+            to: legacyChordConfig,
+            atomically: true,
+            encoding: .utf8
+        )
+        let invalidStillFrozen = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[2],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+
+        try "chord_duration: 0.80\n".write(
+            to: legacyChordConfig,
+            atomically: true,
+            encoding: .utf8
+        )
+        let clampedLegacy = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[3],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+
+        chordMigrationDefaults[4].set(Double.nan, forKey: "chord.duration")
+        let corruptPreference = ChordSettings.resolvedDuration(
+            defaults: chordMigrationDefaults[4],
+            userDirectory: legacyUserDirectory,
+            squirrelDirectory: legacySquirrelDirectory
+        )
+        guard migrated == 0.05,
+              migratedAgain == 0.05,
+              explicitPreference == 0.08,
+              invalidFallback == ChordSettings.defaultDuration,
+              invalidStillFrozen == ChordSettings.defaultDuration,
+              clampedLegacy == ChordSettings.range.upperBound,
+              corruptPreference == ChordSettings.defaultDuration else {
+            print(
+                "FAILED: chord duration legacy migration",
+                migrated,
+                migratedAgain,
+                explicitPreference,
+                invalidFallback,
+                invalidStillFrozen,
+                clampedLegacy,
+                corruptPreference
+            )
+            return false
+        }
+    } catch {
+        print("FAILED: could not write chord migration fixtures", error)
         return false
     }
 
@@ -5147,6 +5423,20 @@ func runBufferSmokeTest() -> Bool {
             keycode: 0x76,
             mask: RimeKey.superMask | RimeKey.controlMask
           ) == nil,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x63, mask: RimeKey.superMask
+          ) == .copyGeneratedResult,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x63, mask: RimeKey.controlMask
+          ) == nil,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x63,
+            mask: RimeKey.superMask | RimeKey.shiftMask
+          ) == nil,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x63,
+            mask: RimeKey.superMask | RimeKey.lockMask
+          ) == nil,
           BufferClipboardPhysicalShortcutRules.shortcut(
             aKeyDown: false,
             vKeyDown: true,
@@ -5166,6 +5456,18 @@ func runBufferSmokeTest() -> Bool {
             aKeyDown: false,
             vKeyDown: true,
             mask: RimeKey.controlMask | RimeKey.shiftMask
+          ) == nil,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: false,
+            vKeyDown: false,
+            cKeyDown: true,
+            mask: RimeKey.superMask
+          ) == .copyGeneratedResult,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: true,
+            vKeyDown: false,
+            cKeyDown: true,
+            mask: RimeKey.superMask
           ) == nil,
           BufferClipboardCommandRules.shortcut(
             selectorName: "pageDown:",
@@ -5187,9 +5489,18 @@ func runBufferSmokeTest() -> Bool {
             selectorName: "paste:",
             physicalShortcut: nil
           ) == .paste,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "copy:",
+            physicalShortcut: .copyGeneratedResult
+          ) == .copyGeneratedResult,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "copy:",
+            physicalShortcut: nil
+          ) == nil,
           BufferClipboardTextRules.validated("可粘贴") == "可粘贴",
           BufferClipboardTextRules.validated("") == nil,
           BufferClipboardTextRules.validated("a\0b") == nil,
+          runBufferGeneratedResultCopyRulesProbe(),
           BufferPluginKeyboardShortcutRules.direction(
             keycode: RimeKey.up,
             mask: RimeKey.superMask | RimeKey.shiftMask
@@ -5826,6 +6137,32 @@ func runBufferWindowSmokeTest() -> Bool {
         return false
     }
 
+    var commitRetirementOrder: [String] = []
+    CommitPresentationRetirement.perform(
+        owner: "focus-1",
+        clearInline: { owner in
+            commitRetirementOrder.append("inline:\(owner)")
+        },
+        hideCandidates: { owner in
+            commitRetirementOrder.append("candidates:\(owner)")
+        }
+    )
+    // Models the synchronous Delivery.insert boundary. Both projections must
+    // already be retired when host code can re-enter the controller.
+    commitRetirementOrder.append("insert")
+    var missingOwnerRetirement: [String] = []
+    CommitPresentationRetirement.perform(
+        owner: Optional<String>.none,
+        clearInline: { _ in missingOwnerRetirement.append("inline") },
+        hideCandidates: { _ in missingOwnerRetirement.append("candidates") }
+    )
+    guard commitRetirementOrder
+            == ["inline:focus-1", "candidates:focus-1", "insert"],
+          missingOwnerRetirement.isEmpty else {
+        print("FAILED: commit presentation was not retired before insertion")
+        return false
+    }
+
     guard InputSourceChangeDiagnosticRules.elapsedMilliseconds(
             previousUptime: 10.0,
             now: 10.025
@@ -5944,8 +6281,8 @@ func runBufferWindowSmokeTest() -> Bool {
     defer { hotKeyDefaults.removePersistentDomain(forName: hotKeyDefaultsSuite) }
 
     // Upgrade fixture: preserve a pre-existing custom Command-Shift-P binding
-    // and give Clipboard the deterministic first free fallback instead of
-    // registering the same Carbon hot key twice in one process.
+    // and give Clipboard the deterministic first free fallback, while reserving
+    // Command-Shift-C for Capsule, instead of registering a duplicate hot key.
     let migrationDefaultsSuite =
         "RimeBuffer.ClipboardShortcutMigrationSmoke.\(UUID().uuidString)"
     guard let migrationDefaults = UserDefaults(suiteName: migrationDefaultsSuite),
@@ -5974,7 +6311,7 @@ func runBufferWindowSmokeTest() -> Bool {
         defaults: migrationDefaults
     )
     guard migratedClipboardShortcut == RimeKeyboardShortcut(
-            keyCode: UInt16(kVK_ANSI_C),
+            keyCode: UInt16(kVK_ANSI_D),
             modifiers: [.command, .shift]
           ),
           RimeShortcutPreferences.shortcut(
@@ -5984,7 +6321,7 @@ func runBufferWindowSmokeTest() -> Bool {
             keyCode: UInt16(kVK_ANSI_P),
             modifiers: [.command, .shift]
           ),
-          migratedClipboardHotKey.keyCode == UInt32(kVK_ANSI_C),
+          migratedClipboardHotKey.keyCode == UInt32(kVK_ANSI_D),
           migratedClipboardHotKey.modifiers == UInt32(cmdKey | shiftKey) else {
         print("FAILED: Clipboard shortcut migration overwrote an existing binding")
         return false
@@ -6030,6 +6367,96 @@ func runBufferWindowSmokeTest() -> Bool {
         return false
     }
 
+    let capsuleMigrationSuite =
+        "RimeBuffer.CapsuleShortcutMigrationSmoke.\(UUID().uuidString)"
+    guard let capsuleMigrationDefaults = UserDefaults(suiteName: capsuleMigrationSuite),
+          let legacyCommandShiftC = try? JSONEncoder().encode(
+            RimeKeyboardShortcut(
+                keyCode: UInt16(kVK_ANSI_C),
+                modifiers: [.command, .shift]
+            )
+          ) else {
+        print("FAILED: could not create Capsule shortcut migration fixture")
+        return false
+    }
+    defer {
+        capsuleMigrationDefaults.removePersistentDomain(
+            forName: capsuleMigrationSuite
+        )
+    }
+    capsuleMigrationDefaults.set(
+        legacyCommandShiftC,
+        forKey: "keyboardShortcut.v1.\(RimeShortcutAction.toggleClipboardHistory.rawValue)"
+    )
+    // Match production cold start: materialize the whole Carbon batch before
+    // reading any individual shortcut. The old ordering returned Clipboard=C
+    // and Capsule=C in this array even though Capsule migration persisted
+    // Clipboard=D later in the same call.
+    let coldStartDefinitions = GlobalHotKeyRouting.definitions(
+        defaults: capsuleMigrationDefaults
+    )
+    let coldStartDefinitionsByAction = Dictionary(
+        uniqueKeysWithValues: coldStartDefinitions.map { ($0.action, $0) }
+    )
+    let coldStartPhysicalShortcuts = coldStartDefinitions.map {
+        "\($0.keyCode)/\($0.modifiers)"
+    }
+    guard coldStartDefinitionsByAction[.openCapsule]?.keyCode
+            == UInt32(kVK_ANSI_C),
+          coldStartDefinitionsByAction[.toggleClipboardHistory]?.keyCode
+            == UInt32(kVK_ANSI_D),
+          Set(coldStartPhysicalShortcuts).count == coldStartDefinitions.count,
+          RimeShortcutPreferences.shortcut(
+            for: .openCapsule,
+            defaults: capsuleMigrationDefaults
+          ) == RimeKeyboardShortcut(
+            keyCode: UInt16(kVK_ANSI_C),
+            modifiers: [.command, .shift]
+          ),
+          RimeShortcutPreferences.shortcut(
+            for: .toggleClipboardHistory,
+            defaults: capsuleMigrationDefaults
+          ) == RimeKeyboardShortcut(
+            keyCode: UInt16(kVK_ANSI_D),
+            modifiers: [.command, .shift]
+          ) else {
+        print("FAILED: Capsule shortcut migration overwrote an existing binding")
+        return false
+    }
+
+    let capsuleDefinitionMigrationSuite =
+        "RimeBuffer.CapsuleDefinitionMigrationSmoke.\(UUID().uuidString)"
+    guard let capsuleDefinitionMigrationDefaults = UserDefaults(
+        suiteName: capsuleDefinitionMigrationSuite
+    ) else {
+        print("FAILED: could not create Capsule definition migration fixture")
+        return false
+    }
+    defer {
+        capsuleDefinitionMigrationDefaults.removePersistentDomain(
+            forName: capsuleDefinitionMigrationSuite
+        )
+    }
+    capsuleDefinitionMigrationDefaults.set(
+        legacyCommandShiftC,
+        forKey: "keyboardShortcut.v1.\(RimeShortcutAction.toggleClipboardHistory.rawValue)"
+    )
+    let migratedClipboardDefinition = GlobalHotKeyRouting.definition(
+        for: .toggleClipboardHistory,
+        defaults: capsuleDefinitionMigrationDefaults
+    )
+    let migratedCapsuleDefinition = GlobalHotKeyRouting.definition(
+        for: .openCapsule,
+        defaults: capsuleDefinitionMigrationDefaults
+    )
+    guard migratedClipboardDefinition.keyCode == UInt32(kVK_ANSI_D),
+          migratedClipboardDefinition.modifiers == UInt32(cmdKey | shiftKey),
+          migratedCapsuleDefinition.keyCode == UInt32(kVK_ANSI_C),
+          migratedCapsuleDefinition.modifiers == UInt32(cmdKey | shiftKey) else {
+        print("FAILED: individual hot key definition skipped Capsule migration")
+        return false
+    }
+
     let workbenchHotKey = GlobalHotKeyRouting.definition(
         for: .toggleWorkbench,
         defaults: hotKeyDefaults
@@ -6046,10 +6473,15 @@ func runBufferWindowSmokeTest() -> Bool {
         for: .openMailbox,
         defaults: hotKeyDefaults
     )
+    let capsuleHotKey = GlobalHotKeyRouting.definition(
+        for: .openCapsule,
+        defaults: hotKeyDefaults
+    )
     let workbenchHotKeyID = workbenchHotKey.identifier
     let clipboardHotKeyID = clipboardHotKey.identifier
     let settingsHotKeyID = settingsHotKey.identifier
     let mailboxHotKeyID = mailboxHotKey.identifier
+    let capsuleHotKeyID = capsuleHotKey.identifier
     let unrelatedHotKeyID = EventHotKeyID(
         signature: GlobalHotKeyRouting.signature,
         id: UInt32.max
@@ -6209,12 +6641,19 @@ func runBufferWindowSmokeTest() -> Bool {
           mailboxHotKey.keyCode == UInt32(kVK_ANSI_M),
           mailboxHotKey.modifiers == UInt32(cmdKey | shiftKey),
           mailboxHotKey.registrationOptions == OptionBits(kEventHotKeyExclusive),
+          capsuleHotKey.keyCode == UInt32(kVK_ANSI_C),
+          capsuleHotKey.modifiers == UInt32(cmdKey | shiftKey),
+          capsuleHotKey.registrationOptions == OptionBits(kEventHotKeyExclusive),
           workbenchHotKeyID.id != settingsHotKeyID.id,
           clipboardHotKeyID.id != workbenchHotKeyID.id,
           clipboardHotKeyID.id != settingsHotKeyID.id,
           mailboxHotKeyID.id != workbenchHotKeyID.id,
           mailboxHotKeyID.id != clipboardHotKeyID.id,
           mailboxHotKeyID.id != settingsHotKeyID.id,
+          capsuleHotKeyID.id != workbenchHotKeyID.id,
+          capsuleHotKeyID.id != clipboardHotKeyID.id,
+          capsuleHotKeyID.id != settingsHotKeyID.id,
+          capsuleHotKeyID.id != mailboxHotKeyID.id,
           reloadedSettingsHotKey.keyCode == UInt32(kVK_ANSI_G),
           reloadedSettingsHotKey.modifiers == UInt32(controlKey | optionKey),
           reloadedClipboardHotKey.keyCode == UInt32(kVK_ANSI_H),
@@ -6255,6 +6694,11 @@ func runBufferWindowSmokeTest() -> Bool {
           ) == .openMailbox,
           GlobalHotKeyRouting.route(
             eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed),
+            identifier: capsuleHotKeyID
+          ) == .openCapsule,
+          GlobalHotKeyRouting.route(
+            eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyReleased),
             identifier: workbenchHotKeyID
           ) == .ignore,
@@ -6263,7 +6707,7 @@ func runBufferWindowSmokeTest() -> Bool {
             eventKind: UInt32(kEventHotKeyPressed),
             identifier: unrelatedHotKeyID
           ) == .ignore else {
-        print("FAILED: global workbench/Clipboard/Mailbox/settings hotkey routing")
+        print("FAILED: global workbench/Clipboard/Mailbox/Capsule/settings hotkey routing")
         return false
     }
 
@@ -6365,13 +6809,13 @@ func runBufferWindowSmokeTest() -> Bool {
         phase: .ready
     )
     guard BufferWorkbenchLayout.mainBar
-            == [.bufferRail, .send],
+            == [.bufferRail, .copyResult, .send],
           BufferWorkbenchLayout.toolbar
             == [.status, .pluginActions, .exchangeEdit, .close],
           BufferWorkbenchLayout.hoverControls
-            == [.send, .pluginActions, .exchangeEdit, .close],
+            == [.copyResult, .send, .pluginActions, .exchangeEdit, .close],
           BufferWorkbenchLayout.passiveControls == [.bufferRail, .status],
-          BufferWorkbenchLayout.toolbarAlwaysExpanded,
+          !BufferWorkbenchLayout.toolbarInitiallyExpanded,
           BufferWorkbenchLayout.toolbarEmptySpaceDraggable,
           BufferWorkbenchToolbarDragRules.disposition(
             hitIsInteractiveControl: false
@@ -6380,6 +6824,7 @@ func runBufferWindowSmokeTest() -> Bool {
             hitIsInteractiveControl: true
           ) == .interactWithControl,
           runBufferWorkbenchToolbarHitTestProbe(),
+          runBufferInlineToolbarToggleInteractionProbe(),
           BufferWorkbenchPointerRules.state(
             enabled: true, hovered: false, pressed: false
           ) == .idle,
@@ -7111,8 +7556,76 @@ func runBufferWindowSmokeTest() -> Bool {
             hasInteractionTarget: false,
             panelIsVisible: true,
             panelIsOnActiveSpace: true
+          ),
+          !CandidatePanelInteractionRules.mayInteract(
+            hasLogicalCandidates: true,
+            hasInteractionTarget: true,
+            panelIsVisible: true,
+            panelIsOnActiveSpace: true,
+            transitionAllowsInteraction: false
           ) else {
         print("FAILED: hidden candidate panel must not capture local interaction")
+        return false
+    }
+    guard CandidatePanelAnimationRules.fadeInDuration > 0,
+          CandidatePanelAnimationRules.fadeInDuration <= 0.1,
+          CandidatePanelAnimationRules.fadeOutDuration > 0,
+          CandidatePanelAnimationRules.fadeOutDuration <= 0.1,
+          CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: false,
+            phase: .hidden,
+            reduceMotion: false
+          ),
+          !CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: true,
+            phase: .fadingIn,
+            reduceMotion: false
+          ),
+          !CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: true,
+            phase: .visible,
+            reduceMotion: false
+          ),
+          CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: true,
+            phase: .fadingOut,
+            reduceMotion: false
+          ),
+          !CandidatePanelAnimationRules.shouldFadeIn(
+            panelIsVisible: false,
+            phase: .hidden,
+            reduceMotion: true
+          ),
+          CandidatePanelAnimationRules.shouldFadeOut(
+            panelIsVisible: true,
+            phase: .visible,
+            reduceMotion: false
+          ),
+          !CandidatePanelAnimationRules.shouldFadeOut(
+            panelIsVisible: true,
+            phase: .fadingOut,
+            reduceMotion: false
+          ),
+          !CandidatePanelAnimationRules.shouldFadeOut(
+            panelIsVisible: true,
+            phase: .visible,
+            reduceMotion: true
+          ),
+          CandidatePanelAnimationRules.allowsInteraction(phase: .fadingIn),
+          CandidatePanelAnimationRules.allowsInteraction(phase: .visible),
+          !CandidatePanelAnimationRules.allowsInteraction(phase: .fadingOut),
+          !CandidatePanelAnimationRules.allowsInteraction(phase: .hidden),
+          CandidatePanelAnimationRules.mayCompleteFadeOut(
+            expectedGeneration: 4,
+            currentGeneration: 4,
+            phase: .fadingOut
+          ),
+          !CandidatePanelAnimationRules.mayCompleteFadeOut(
+            expectedGeneration: 4,
+            currentGeneration: 5,
+            phase: .fadingIn
+          ) else {
+        print("FAILED: candidate panel fade transition policy")
         return false
     }
 
@@ -8453,6 +8966,7 @@ func runBufferWindowSmokeTest() -> Bool {
     _ = rail.renderStandardForPreview()
     let renderedPassiveEmptyPlaceholder = rail.renderedInputPlaceholderVisible
         && !rail.renderedInputCaretVisible
+        && rail.renderedInputControlCount == 1
         && rail.renderedTextFragments.contains("等待暂存内容")
     model.enabled = true
     _ = rail.renderStandardForPreview()
@@ -8487,8 +9001,10 @@ func runBufferWindowSmokeTest() -> Bool {
     rail.setEnterHoldProgress(0.6)
     let showedEnterHoldProgress = rail.isEnterHoldProgressVisible
     _ = rail.renderStandardForPreview(shielded: true)
-    let scrubbedByShield = rail.isHidden
+    let scrubbedByShield = !rail.isHidden
         && rail.renderedBlockCount == 0
+        && rail.renderedInputControlCount == 1
+        && rail.renderedTextFragments == ["内容已隐藏"]
         && !rail.isEnterHoldProgressVisible
     model.enabled = oldEnabled
     model.discardForPrivacy()
@@ -8811,6 +9327,9 @@ func runBufferWindowSmokeTest() -> Bool {
 
     _ = translationRail.refresh(shielded: true)
     let translationShielded = translationRail.translationRailCount == 0
+        && !translationRail.isHidden
+        && translationRail.renderedInputControlCount == 1
+        && translationRail.renderedTextFragments == ["内容已隐藏"]
         && !translationRail.renderedTextFragments.contains(sourcePreview)
         && !translationRail.renderedTextFragments.contains("方案")
         && !translationRail.renderedTextFragments.contains("尚未投递的结果")
@@ -8870,92 +9389,75 @@ func runBufferWindowSmokeTest() -> Bool {
         return false
     }
 
-    let clipboardEligible = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardEligible = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: false,
         screenLocked: false,
         sessionInactive: false,
         sleeping: false
     )
-    let clipboardOff = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: false,
+    let clipboardOff = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: false,
         secureInput: false,
         screenLocked: false,
         sessionInactive: false,
         sleeping: false
     )
-    let clipboardOffSpace = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: false,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardHidden = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: false,
+        captureEnabled: true,
         secureInput: false,
         screenLocked: false,
         sessionInactive: false,
         sleeping: false
     )
-    let clipboardHidden = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: true,
-        railEnabled: true,
-        secureInput: false,
-        screenLocked: false,
-        sessionInactive: false,
-        sleeping: false
-    )
-    let clipboardSecure = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardSecure = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: true,
         screenLocked: false,
         sessionInactive: false,
         sleeping: false
     )
-    let clipboardLocked = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardLocked = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: false,
         screenLocked: true,
         sessionInactive: false,
         sleeping: false
     )
-    let clipboardSessionInactive = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardSessionInactive = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: false,
         screenLocked: false,
         sessionInactive: true,
         sleeping: false
     )
-    let clipboardSleeping = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardSleeping = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: false,
         screenLocked: false,
         sessionInactive: false,
         sleeping: true
     )
-    let clipboardStackedProtection = ClipboardWorkbenchIntegrationRules.captureState(
-        workbenchVisibleOnActiveSpace: true,
-        hiddenForSession: false,
-        railEnabled: true,
+    let clipboardStackedProtection = ClipboardHistoryWindowLifecycleRules.captureState(
+        windowVisibleOnActiveSpace: true,
+        captureEnabled: true,
         secureInput: true,
         screenLocked: true,
         sessionInactive: true,
         sleeping: true
     )
     guard clipboardEligible.allowsClipboardObservation,
-          ClipboardWorkbenchIntegrationRules.allowsAddToBuffer(clipboardEligible),
+          clipboardEligible.allowsContentPresentation,
           !clipboardOff.allowsClipboardObservation,
-          !clipboardOffSpace.allowsClipboardObservation,
-          !clipboardHidden.allowsClipboardObservation,
+          clipboardHidden.allowsClipboardObservation,
+          !clipboardHidden.allowsContentPresentation,
           !clipboardSecure.allowsClipboardObservation,
           !clipboardLocked.allowsClipboardObservation,
           !clipboardSessionInactive.allowsClipboardObservation,
@@ -8966,10 +9468,8 @@ func runBufferWindowSmokeTest() -> Bool {
           clipboardSleeping.protection == [.sessionInactive],
           clipboardStackedProtection.protection
             == [.secureInput, .screenLocked, .sessionInactive],
-          !ClipboardWorkbenchIntegrationRules.allowsAddToBuffer(
-            clipboardStackedProtection
-          ) else {
-        print("FAILED: Clipboard workbench capture/activation gates")
+          !clipboardStackedProtection.allowsContentPresentation else {
+        print("FAILED: standalone Clipboard capture/presentation gates")
         return false
     }
 
@@ -9086,7 +9586,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let openingFrame = NSRect(x: 200,
                               y: 200,
                               width: 680,
-                              height: BufferWindowGeometry.expandedHeight)
+                              height: BufferWindowGeometry.collapsedHeight)
     let middleCaret = NSRect(x: 720, y: 500, width: 0, height: 22)
     let belowCaret = BufferWindowGeometry.openingPlacement(
         currentFrame: openingFrame,
@@ -9095,20 +9595,15 @@ func runBufferWindowSmokeTest() -> Bool {
         fallback: primary
     )
     let runtimeHeights = [
-        BufferWindowGeometry.expandedHeight,
-        BufferWindowGeometry.height(expanded: true),
+        BufferWindowGeometry.collapsedHeight,
+        BufferWindowGeometry.height(expanded: false),
+        BufferWindowGeometry.translationCollapsedHeight,
         BufferWindowGeometry.height(
-            expanded: true,
-            clipboardRailEnabled: true
-        ),
-        BufferWindowGeometry.translationExpandedHeight,
-        BufferWindowGeometry.height(
-            expanded: true,
-            mode: .derived(targetRows: 2),
-            clipboardRailEnabled: true
+            expanded: false,
+            mode: .derived(targetRows: 2)
         ),
         BufferWindowGeometry.maximumRuntimeHeight,
-        BufferWindowGeometry.expandedHeight,
+        BufferWindowGeometry.collapsedHeight,
     ]
     let belowResizes = runtimeHeights.reduce(into: [belowCaret.frame]) { frames, height in
         frames.append(BufferWindowGeometry.resizedOutward(
@@ -9161,11 +9656,11 @@ func runBufferWindowSmokeTest() -> Bool {
         preferredSide: .below,
         strictPreferredSide: true
     )
-    // Current 78pt height fits below, but the largest derived + Clipboard
-    // forecast does not. Choose the roomy upper side before either rail appears.
+    // Current 44pt height fits below, but the largest two-rail 78pt forecast
+    // does not. Choose the roomy upper side before the result rail appears.
     let forecastAwareOpening = BufferWindowGeometry.openingPlacement(
         currentFrame: openingFrame,
-        targetRect: NSRect(x: 720, y: 120, width: 0, height: 22),
+        targetRect: NSRect(x: 720, y: 90, width: 0, height: 22),
         visibleFrames: [primary],
         fallback: primary
     )
@@ -9188,7 +9683,7 @@ func runBufferWindowSmokeTest() -> Bool {
             y: openingFrame.minY,
             width: openingFrame.width,
             height: BufferWindowGeometry.height(
-                expanded: true,
+                expanded: false,
                 mode: .derived(targetRows: 3)
             )
         ),
@@ -9256,7 +9751,7 @@ func runBufferWindowSmokeTest() -> Bool {
           strictUnavailableAboveCandidate == nil,
           strictUnavailableBelowCandidate == nil,
           forecastAwareOpening.side == .aboveTarget,
-          forecastAwareOpening.frame.minY == 120 + 22
+          forecastAwareOpening.frame.minY == 90 + 22
             + BufferWindowGeometry.inputAnchorGap,
           !aboveCaret.frame.intersects(bottomCaret),
           leftScreenOpening.side == .belowTarget,
@@ -9266,7 +9761,7 @@ func runBufferWindowSmokeTest() -> Bool {
           maximumHeightOpening.side == .belowTarget,
           maximumHeightOpening.frame.height
             == BufferWindowGeometry.height(
-                expanded: true,
+                expanded: false,
                 mode: .derived(targetRows: 3)
             ),
           noTargetOpening.side == .bottomFallback,
@@ -9277,7 +9772,7 @@ func runBufferWindowSmokeTest() -> Bool {
           offscreenTargetOpening == noTargetOpening,
           transientPersistence.origin == manualOrigin,
           transientPersistence.width == belowCaret.frame.width,
-          transientPersistence.height == BufferWindowGeometry.expandedHeight,
+          transientPersistence.height == BufferWindowGeometry.collapsedHeight,
           userPersistence.origin == belowCaret.frame.origin else {
         print("FAILED: focus-aware workbench opening geometry",
               belowCaret, aboveCaret, leftScreenOpening, rightEdgeOpening,
@@ -9289,13 +9784,13 @@ func runBufferWindowSmokeTest() -> Bool {
     let offscreen = NSRect(x: 4000, y: -900, width: 680, height: 230)
     let restored = BufferWindowGeometry.clampedFrame(
         offscreen,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         visibleFrames: [primary, secondary],
         fallback: primary
     )
     guard primary.contains(restored),
           restored.width >= BufferWindowGeometry.standardMinimumWidth,
-          restored.height == BufferWindowGeometry.expandedHeight else {
+          restored.height == BufferWindowGeometry.collapsedHeight else {
         print("FAILED: offscreen frame was not restored to fallback screen", restored)
         return false
     }
@@ -9303,7 +9798,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let legacyWorkbench = NSRect(x: 120, y: 220, width: 680, height: 340)
     let migrated = BufferWindowGeometry.clampedFrame(
         legacyWorkbench,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         visibleFrames: [primary],
         fallback: primary
     )
@@ -9315,7 +9810,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let oldCompact = NSRect(x: 180, y: 240, width: 680, height: 52)
     let migratedOldCompact = BufferWindowGeometry.clampedFrame(
         oldCompact,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         visibleFrames: [primary],
         fallback: primary
     )
@@ -9327,78 +9822,47 @@ func runBufferWindowSmokeTest() -> Bool {
     )
     let translationExpanded = BufferWindowGeometry.clampedFrame(
         migratedOldCompact,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .translation,
         visibleFrames: [primary],
         fallback: primary
     )
     let compactDerivedExpanded = BufferWindowGeometry.clampedFrame(
         translationExpanded,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .singleDerived,
         visibleFrames: [primary],
         fallback: primary
     )
     let streamCandidatesTwoExpanded = BufferWindowGeometry.clampedFrame(
         translationExpanded,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .derived(targetRows: 2),
         visibleFrames: [primary],
         fallback: primary
     )
     let streamCandidatesExpanded = BufferWindowGeometry.clampedFrame(
         streamCandidatesTwoExpanded,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .derived(targetRows: 3),
         visibleFrames: [primary],
         fallback: primary
     )
     let standardAfterTranslation = BufferWindowGeometry.clampedFrame(
         translationExpanded,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .standard,
-        visibleFrames: [primary],
-        fallback: primary
-    )
-    let clipboardStandardExpanded = BufferWindowGeometry.clampedFrame(
-        migratedOldCompact,
-        expanded: true,
-        clipboardRailEnabled: true,
-        visibleFrames: [primary],
-        fallback: primary
-    )
-    let clipboardDerivedExpanded = BufferWindowGeometry.clampedFrame(
-        migratedOldCompact,
-        expanded: true,
-        mode: .translation,
-        clipboardRailEnabled: true,
-        visibleFrames: [primary],
-        fallback: primary
-    )
-    let clipboardStandardCollapsed = BufferWindowGeometry.clampedFrame(
-        clipboardStandardExpanded,
-        expanded: false,
-        clipboardRailEnabled: true,
-        visibleFrames: [primary],
-        fallback: primary
-    )
-    let clipboardDerivedCollapsed = BufferWindowGeometry.clampedFrame(
-        clipboardDerivedExpanded,
-        expanded: false,
-        mode: .translation,
-        clipboardRailEnabled: true,
         visibleFrames: [primary],
         fallback: primary
     )
     let floatingCandidateInvariant = BufferWindowGeometry.clampedFrame(
         migratedOldCompact,
-        expanded: true,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         mode: .translation,
-        clipboardRailEnabled: true,
         visibleFrames: [primary],
         fallback: primary
     )
-    let clipboardCanonicalFrame = BufferWindowGeometry.canonicalPersistedFrame(
+    let canonicalFrame = BufferWindowGeometry.canonicalPersistedFrame(
         floatingCandidateInvariant,
         persistedOrigin: nil,
         transientOpeningOrigin: false
@@ -9407,37 +9871,31 @@ func runBufferWindowSmokeTest() -> Bool {
         NSRect(x: 10.24, y: 20.26, width: 680.24, height: 44),
         scale: 2
     )
-    guard migrated.height == BufferWindowGeometry.expandedHeight,
+    guard migrated.height == BufferWindowGeometry.collapsedHeight,
           migrated.maxY == legacyWorkbench.maxY,
           migratedOldCompact.minY == oldCompact.minY,
-          migratedOldCompact.height == BufferWindowGeometry.expandedHeight,
+          migratedOldCompact.height == BufferWindowGeometry.collapsedHeight,
           legacyCollapsed.height == BufferWindowGeometry.collapsedHeight,
           legacyCollapsed.minY == migratedOldCompact.minY,
-          translationExpanded.height == BufferWindowGeometry.translationExpandedHeight,
+          translationExpanded.height == BufferWindowGeometry.translationCollapsedHeight,
           translationExpanded.minY == migratedOldCompact.minY,
-          compactDerivedExpanded.height == BufferWindowGeometry.expandedHeight,
+          compactDerivedExpanded.height == BufferWindowGeometry.collapsedHeight,
           compactDerivedExpanded.minY == translationExpanded.minY,
           streamCandidatesTwoExpanded.height
-            == BufferWindowGeometry.translationExpandedHeight,
+            == BufferWindowGeometry.translationCollapsedHeight,
           streamCandidatesTwoExpanded.minY == translationExpanded.minY,
           streamCandidatesExpanded.height
-            == BufferWindowGeometry.translationExpandedHeight,
+            == BufferWindowGeometry.translationCollapsedHeight,
           streamCandidatesExpanded.minY == streamCandidatesTwoExpanded.minY,
-          standardAfterTranslation.height == BufferWindowGeometry.expandedHeight,
+          standardAfterTranslation.height == BufferWindowGeometry.collapsedHeight,
           standardAfterTranslation.minY == translationExpanded.minY,
-          BufferWindowGeometry.clipboardSectionHeight == 41,
+          BufferWindowGeometry.height(expanded: false) == 44,
+          BufferWindowGeometry.height(expanded: false, mode: .translation) == 78,
           BufferWindowGeometry.height(expanded: true) == 78,
           BufferWindowGeometry.height(expanded: true, mode: .translation) == 112,
-          clipboardStandardExpanded.height == 119,
-          clipboardStandardExpanded.minY == migratedOldCompact.minY,
-          clipboardDerivedExpanded.height == 153,
-          clipboardDerivedExpanded.minY == migratedOldCompact.minY,
-          clipboardStandardCollapsed.height == 85,
-          clipboardDerivedCollapsed.height == 119,
-          floatingCandidateInvariant.height == 153,
+          floatingCandidateInvariant.height == 78,
           floatingCandidateInvariant.minY == migratedOldCompact.minY,
-          floatingCandidateInvariant == clipboardDerivedExpanded,
-          clipboardCanonicalFrame.height == BufferWindowGeometry.expandedHeight,
+          canonicalFrame.height == BufferWindowGeometry.collapsedHeight,
           clampedCandidate.x + candidateSize.width <= primary.maxX - 6,
           aligned.minX * 2 == (aligned.minX * 2).rounded(),
           aligned.minY * 2 == (aligned.minY * 2).rounded() else {
@@ -9448,12 +9906,12 @@ func runBufferWindowSmokeTest() -> Bool {
     let oversized = NSRect(x: 1500, y: 40, width: 3000, height: 2000)
     let fitted = BufferWindowGeometry.clampedFrame(
         oversized,
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         visibleFrames: [primary, secondary],
         fallback: primary
     )
     guard fitted.width <= secondary.width,
-          fitted.height == BufferWindowGeometry.expandedHeight,
+          fitted.height == BufferWindowGeometry.collapsedHeight,
           secondary.contains(fitted) else {
         print("FAILED: oversized frame was not clamped to its screen", fitted)
         return false
@@ -9462,7 +9920,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let tiny = NSRect(x: -480, y: 0, width: 480, height: 160)
     let tinyFitted = BufferWindowGeometry.clampedFrame(
         NSRect(x: -900, y: -500, width: 680, height: 230),
-        expanded: BufferWorkbenchLayout.toolbarAlwaysExpanded,
+        expanded: BufferWorkbenchLayout.toolbarInitiallyExpanded,
         visibleFrames: [tiny],
         fallback: tiny
     )
@@ -9472,7 +9930,7 @@ func runBufferWindowSmokeTest() -> Bool {
             y: 20,
             width: 680,
             height: BufferWindowGeometry.height(
-                expanded: true,
+                expanded: false,
                 mode: .derived(targetRows: 3)
             )
         ),
@@ -9532,6 +9990,15 @@ func runBufferWindowSmokeTest() -> Bool {
             standardAfterPath: transitionRoot
                 .appendingPathComponent("03-standard-after.png").path
         )
+    let toolbarTransition = BufferWindowController.shared
+        .exerciseToolbarToggleForSmoke(
+            collapsedPath: transitionRoot
+                .appendingPathComponent("04-toolbar-collapsed.png").path,
+            expandedPath: transitionRoot
+                .appendingPathComponent("05-toolbar-expanded.png").path,
+            collapsedAgainPath: transitionRoot
+                .appendingPathComponent("06-toolbar-collapsed-again.png").path
+        )
     let transitionEpsilon: CGFloat = 0.5
     guard transition.renderedAllFrames,
           abs(transition.standardBefore.height
@@ -9545,12 +10012,29 @@ func runBufferWindowSmokeTest() -> Bool {
           abs(transition.standardAfter.minY
               - transition.standardBefore.minY) <= transitionEpsilon,
           abs(transition.standardAfter.width
-              - transition.standardBefore.width) <= transitionEpsilon else {
+              - transition.standardBefore.width) <= transitionEpsilon,
+          toolbarTransition.renderedAllFrames,
+          toolbarTransition.toolbarHiddenInitially,
+          toolbarTransition.toolbarVisibleWhenExpanded,
+          toolbarTransition.toolbarHiddenAfterCollapse,
+          abs(toolbarTransition.collapsed.height
+              - BufferWindowGeometry.collapsedHeight) <= transitionEpsilon,
+          abs(toolbarTransition.expanded.height
+              - BufferWindowGeometry.expandedHeight) <= transitionEpsilon,
+          abs(toolbarTransition.collapsedAgain.height
+              - BufferWindowGeometry.collapsedHeight) <= transitionEpsilon,
+          abs(toolbarTransition.collapsed.minY
+              - toolbarTransition.expanded.minY) <= transitionEpsilon,
+          abs(toolbarTransition.collapsedAgain.minY
+              - toolbarTransition.collapsed.minY) <= transitionEpsilon else {
         print("FAILED: live workbench layout transition",
               "before=\(transition.standardBefore)",
               "derived=\(transition.derived)",
               "after=\(transition.standardAfter)",
-              "repaired=\(transition.repairedStandard)")
+              "repaired=\(transition.repairedStandard)",
+              "toolbar=\(toolbarTransition.collapsed) -> "
+                + "\(toolbarTransition.expanded) -> "
+                + "\(toolbarTransition.collapsedAgain)")
         return false
     }
 
@@ -9755,7 +10239,7 @@ func runCandidateMetricsSmokeTest() -> Bool {
     return ok
 }
 
-/// Guards the fixed 墨竹 / 翡翠 / 静谧 palettes against regressions to a
+/// Guards the Classic colorways and the Rasta theme against regressions to a
 /// system-owned accent or foregrounds that disappear on small UI text.
 func runThemeSmokeTest() -> Bool {
     print("== \(ProductIdentity.displayName) theme contrast smoke test ==")
@@ -9773,6 +10257,8 @@ func runThemeSmokeTest() -> Bool {
           "翡翠 must preserve the persisted day raw value")
     check(RimeAppearanceMode.quiet.rawValue == "quiet",
           "静谧 must use a stable persisted quiet raw value")
+    check(RimeAppearanceMode.rasta.rawValue == "rasta",
+          "拉斯塔 must use a stable persisted rasta raw value")
     check(RimeAppearanceMode(rawValue: "night") == .night,
           "the legacy night preference must still load as 墨竹")
     check(RimeAppearanceMode(rawValue: "day") == .day,
@@ -9785,12 +10271,20 @@ func runThemeSmokeTest() -> Bool {
           "day's visible theme name should be 翡翠")
     check(RimeAppearanceMode.quiet.title == "静谧",
           "quiet's visible theme name should be 静谧")
-    check(RimeAppearanceMode.allCases == [.night, .day, .quiet],
-          "theme order should preserve the two existing themes before 静谧")
+    check(RimeAppearanceMode.rasta.title == "拉斯塔",
+          "rasta's visible theme name should be 拉斯塔")
+    check(RimeAppearanceMode.allCases == [.night, .day, .quiet, .rasta],
+          "theme order should keep Classic colorways before Rasta")
+    check(RimeAppearanceMode.night.family == .classic
+            && RimeAppearanceMode.day.family == .classic
+            && RimeAppearanceMode.quiet.family == .classic
+            && RimeAppearanceMode.rasta.family == .rasta,
+          "three legacy palettes must be Classic colorways while Rasta is independent")
 
     let day = RimeThemePalettes.day
     let night = RimeThemePalettes.night
     let quiet = RimeThemePalettes.quiet
+    let rasta = RimeThemePalettes.rasta
     let productGreen = RimeThemePalettes.productGreen
     check(productGreen == 0x22C55E,
           "the product accent should remain the approved fixed green")
@@ -9805,6 +10299,12 @@ func runThemeSmokeTest() -> Bool {
           "静谧 should use the approved neutral accent in both legacy slots")
     check(quiet.accentGreen != productGreen,
           "静谧 must not leak the product green into its normal theme accent")
+    check(Set([rasta.brandRed, rasta.brandYellow, rasta.brandGreen]).count == 3,
+          "拉斯塔 must expose distinct red, yellow, and green brand roles")
+    check(rasta.accentBlue == rasta.brandGreen
+            && rasta.accentSecondary == rasta.brandYellow
+            && rasta.accentTertiary == rasta.brandRed,
+          "拉斯塔 semantic accents must map to green, yellow, and red")
     check(quiet.accentForeground == 0x000000,
           "静谧 accent controls should choose their higher-contrast black foreground")
     check(KeyboardHeatmapColorRules.sRGBHex(
@@ -10058,6 +10558,12 @@ func runThemeSmokeTest() -> Bool {
     check(RimeAppearanceMode.quiet.appKitAppearanceName(increasedContrast: true)
             == .accessibilityHighContrastDarkAqua,
           "quiet mode should preserve increased contrast")
+    check(RimeAppearanceMode.rasta.appKitAppearanceName(increasedContrast: false)
+            == .darkAqua,
+          "rasta mode should force Dark Aqua")
+    check(RimeAppearanceMode.rasta.appKitAppearanceName(increasedContrast: true)
+            == .accessibilityHighContrastDarkAqua,
+          "rasta mode should preserve increased contrast")
 
     if ok { print("theme contrast smoke: OK") }
     return ok

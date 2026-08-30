@@ -58,6 +58,7 @@ enum CapsulePasswordStoreError: LocalizedError, Equatable {
     case missingMasterKey
     case invalidMasterKey
     case recordNotFound
+    case revisionConflict
     case encryptionFailed
     case decryptionFailed
     case fileOperation(String)
@@ -76,6 +77,8 @@ enum CapsulePasswordStoreError: LocalizedError, Equatable {
             return "Capsule 主密钥格式无效"
         case .recordNotFound:
             return "未找到 Capsule 密码记录"
+        case .revisionConflict:
+            return "Capsule 密码记录已被其他窗口更新"
         case .encryptionFailed:
             return "Capsule 密码加密失败"
         case .decryptionFailed:
@@ -164,20 +167,35 @@ final class CapsulePasswordStore {
     }
 
     @discardableResult
-    func put(_ request: CapsulePasswordWriteRequest) throws
+    func put(_ request: CapsulePasswordWriteRequest,
+             expectedRevision: String? = nil) throws
         -> CapsulePasswordSummary {
         let normalized = try Self.validate(request)
         return try withStoreLock {
             try prepareDirectoriesWithoutLock()
-            let existing = try summariesWithoutLock()
             let id = normalized.id ?? UUID()
-            if normalized.id == nil,
-               existing.count >= Self.maximumRecordCount {
-                throw CapsulePasswordStoreError.invalidRequest("记录数量超过上限")
-            }
-            if normalized.id != nil,
-               !existing.contains(where: { $0.id == id }) {
-                throw CapsulePasswordStoreError.recordNotFound
+            let hasExistingRecords: Bool
+            if normalized.id == nil {
+                let existing = try summariesWithoutLock()
+                guard existing.count < Self.maximumRecordCount else {
+                    throw CapsulePasswordStoreError.invalidRequest("记录数量超过上限")
+                }
+                hasExistingRecords = !existing.isEmpty
+            } else {
+                let destination = passwordDirectoryURL.appendingPathComponent(
+                    "\(id.uuidString.lowercased()).md"
+                )
+                guard fileManager.fileExists(atPath: destination.path) else {
+                    throw CapsulePasswordStoreError.recordNotFound
+                }
+                let values = try safeValues(for: destination)
+                guard values.isRegularFile == true,
+                      values.isSymbolicLink != true else {
+                    throw CapsulePasswordStoreError.unsafeStorage(
+                        destination.path
+                    )
+                }
+                hasExistingRecords = true
             }
 
             let updatedAt = now()
@@ -189,7 +207,7 @@ final class CapsulePasswordStore {
                 previousPasswords: normalized.previousPasswords
             )
             let key = try loadOrCreateMasterKeyWithoutLock(
-                hasExistingRecords: !existing.isEmpty
+                hasExistingRecords: hasExistingRecords
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -223,6 +241,12 @@ final class CapsulePasswordStore {
             }
             let destination = passwordDirectoryURL
                 .appendingPathComponent("\(id.uuidString.lowercased()).md")
+            if let expectedRevision {
+                guard try fileRevisionWithoutLock(destination)
+                        == expectedRevision else {
+                    throw CapsulePasswordStoreError.revisionConflict
+                }
+            }
             try writePrivateFileWithoutLock(data, to: destination)
             return CapsulePasswordSummary(
                 id: id,
@@ -277,7 +301,7 @@ final class CapsulePasswordStore {
         }
     }
 
-    func remove(id: UUID) throws {
+    func remove(id: UUID, expectedRevision: String? = nil) throws {
         try withStoreLock {
             let url = passwordDirectoryURL
                 .appendingPathComponent("\(id.uuidString.lowercased()).md")
@@ -289,6 +313,11 @@ final class CapsulePasswordStore {
                   values.isSymbolicLink != true else {
                 throw CapsulePasswordStoreError.unsafeStorage(url.path)
             }
+            if let expectedRevision {
+                guard try fileRevisionWithoutLock(url) == expectedRevision else {
+                    throw CapsulePasswordStoreError.revisionConflict
+                }
+            }
             do {
                 try fileManager.removeItem(at: url)
             } catch {
@@ -297,6 +326,27 @@ final class CapsulePasswordStore {
                 )
             }
         }
+    }
+
+    private func fileRevisionWithoutLock(_ url: URL) throws -> String {
+        let values = try safeValues(for: url)
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size <= Self.maximumDocumentBytes else {
+            throw CapsulePasswordStoreError.unsafeStorage(url.path)
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw CapsulePasswordStoreError.fileOperation(
+                error.localizedDescription
+            )
+        }
+        return SHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
     }
 
     private struct ParsedDocument {
@@ -335,6 +385,10 @@ final class CapsulePasswordStore {
         return try urls.compactMap { url in
             guard url.pathExtension.lowercased() == "md" else { return nil }
             let parsed = try parseDocumentWithoutLock(url)
+            guard url.deletingPathExtension().lastPathComponent
+                    == parsed.id.uuidString.lowercased() else {
+                throw CapsulePasswordStoreError.malformedDocument(url.path)
+            }
             return CapsulePasswordSummary(
                 id: parsed.id,
                 title: parsed.title,

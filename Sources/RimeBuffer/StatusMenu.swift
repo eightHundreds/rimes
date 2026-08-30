@@ -46,33 +46,39 @@ final class StatusMenu {
         settings.target = target
         menu.addItem(settings)
 
-        let inbox = NSMenuItem(
-            title: mailboxTitle,
-            action: #selector(RimeBufferController.openInboundTrayFromInputMenu(_:)),
-            keyEquivalent: "")
-        inbox.target = target
-        menu.addItem(inbox)
-
-        let maintenance = NSMenuItem(title: "维护…", action: nil, keyEquivalent: "")
-        let maintenanceMenu = NSMenu(title: "维护")
-
-        let workbench = NSMenuItem(
-            title: BufferWindowController.shared.isVisible ? "关闭缓冲工作台（保留内容）" : "显示缓冲工作台",
+        let buffer = NSMenuItem(
+            title: bufferTitle,
             action: #selector(RimeBufferController.toggleBufferWindowFromInputMenu(_:)),
             keyEquivalent: "")
-        workbench.target = target
-        maintenanceMenu.addItem(workbench)
+        buffer.target = target
+        menu.addItem(buffer)
 
         let clipboardShortcut = RimeShortcutPreferences
             .shortcut(for: .toggleClipboardHistory)
             .displayTitle
         let clipboard = NSMenuItem(
-            title: "剪贴板历史（\(clipboardShortcut)；仅工作台显示时读取）",
+            title: "Clipboard History…（\(clipboardShortcut)）",
             action: #selector(RimeBufferController.toggleClipboardHistoryFromInputMenu(_:)),
             keyEquivalent: "")
         clipboard.target = target
-        clipboard.state = BufferWindowController.shared.clipboardRailEnabled ? .on : .off
-        maintenanceMenu.addItem(clipboard)
+        menu.addItem(clipboard)
+
+        let mailbox = NSMenuItem(
+            title: mailboxTitle,
+            action: #selector(RimeBufferController.openMailboxFromInputMenu(_:)),
+            keyEquivalent: "")
+        mailbox.target = target
+        menu.addItem(mailbox)
+
+        let capsule = NSMenuItem(
+            title: capsuleTitle,
+            action: #selector(RimeBufferController.openCapsuleFromInputMenu(_:)),
+            keyEquivalent: "")
+        capsule.target = target
+        menu.addItem(capsule)
+
+        let maintenance = NSMenuItem(title: "维护…", action: nil, keyEquivalent: "")
+        let maintenanceMenu = NSMenu(title: "维护")
 
         let pin = NSMenuItem(
             title: "常显于所有桌面与全屏空间",
@@ -139,6 +145,13 @@ final class StatusMenu {
         return menu
     }
 
+    private var bufferTitle: String {
+        let shortcut = RimeShortcutPreferences
+            .shortcut(for: .toggleWorkbench)
+            .displayTitle
+        return "Buffer…（\(shortcut)）"
+    }
+
     private var mailboxTitle: String {
         let unreadCount = MailboxStore.shared.snapshot.unreadCount
         let shortcut = RimeShortcutPreferences
@@ -147,6 +160,13 @@ final class StatusMenu {
         return unreadCount > 0
             ? "Mailbox…（\(unreadCount) 条未读 · \(shortcut)）"
             : "Mailbox…（\(shortcut)）"
+    }
+
+    private var capsuleTitle: String {
+        let shortcut = RimeShortcutPreferences
+            .shortcut(for: .openCapsule)
+            .displayTitle
+        return "Capsule…（\(shortcut)）"
     }
 
     func openSettings() {
@@ -158,7 +178,7 @@ final class StatusMenu {
     }
 
     func toggleClipboardHistory() {
-        BufferWindowController.shared.toggleClipboardHistory()
+        ClipboardHistoryWindowController.shared.toggleVisibility()
     }
 
     func toggleBufferPinned() {
@@ -170,9 +190,13 @@ final class StatusMenu {
         BufferWindowController.shared.moveToCurrentScreen()
     }
 
-    func openInboundTray() {
+    func openMailbox() {
         let threadID = MailboxStore.shared.selectLatestUnreadOrMostRecent()
-        InboundTrayWindow.shared.show(selecting: threadID)
+        MailboxWindowController.shared.show(selecting: threadID)
+    }
+
+    func openCapsule() {
+        CapsuleWindowController.shared.show()
     }
 
     func checkUpdate() {

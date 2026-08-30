@@ -10,7 +10,6 @@ enum BuiltInPluginID {
     static let remarkable = "builtin.remarkable"
     static let marineChrome = "builtin.marine-chrome"
     static let streamInput = "builtin.stream-input"
-    static let capsule = "builtin.capsule"
     static let aiText = AITextBuiltInPluginID.aiText
     // Provider-specific IDs are retained for preference/source compatibility.
     static let codexCLI = AITextBuiltInPluginID.codexCLI
@@ -27,7 +26,6 @@ enum BuiltInPlugins {
             AppleTranslationInternalPlugin(),
             StreamInputInternalPlugin(),
             AITextInternalPlugin(),
-            CapsuleInternalPlugin(),
         ]
     }
 }
@@ -376,36 +374,6 @@ private final class MyPromptInternalPlugin:
     func makePluginConfigurationModel() throws
         -> PluginConfigurationModel {
         try PluginConfigurationCatalog.makeMyPromptModel()
-    }
-}
-
-private final class CapsuleInternalPlugin: InternalPlugin {
-    private static let catalog = PresetBufferPluginCatalog.entry(
-        id: BuiltInPluginID.capsule
-    )!
-    let descriptor = PluginDescriptor(
-        key: CapsuleWorkspace.pluginKey,
-        wireID: nil,
-        name: catalog.nameZH,
-        symbolName: "archivebox",
-        version: catalog.version,
-        summary: catalog.summaryZH,
-        source: .builtIn,
-        capabilities: [.bufferAction, .localStorage],
-        settings: nil,
-        canUninstall: false
-    )
-
-    func start() {
-        CapsuleWorkspace.shared.start()
-    }
-
-    func stop() {
-        CapsuleWorkspace.shared.stop()
-    }
-
-    func makeSettingsViewController(subpageID: String) -> NSViewController? {
-        nil
     }
 }
 
