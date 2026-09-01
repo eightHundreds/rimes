@@ -104,7 +104,7 @@ const coreRoutes: readonly SettingsRoute[] = [
   {
     id: "core.capsule",
     title: "Capsule",
-    description: "独立管理 Prompt、Memory、Password 与 Skill 本机条目。",
+    description: "独立管理八类本机条目，并可选择 iCloud Drive 同步六类可迁移内容与媒体。",
     icon: "database",
     section: "设置",
     subpages: [{ id: "capsule", title: "Capsule" }],
@@ -828,8 +828,9 @@ export function SettingsSurface({
     if (currentRoute.id === "core.capsule") {
       return (
         <SettingsSection title="Capsule" description="Capsule 是核心本机内容库，不再出现在 Buffer 插件目录或启停状态中。">
-          <SettingRow title="内容类型" detail="Prompt · Memory · Password · Skill" icon="database" control={<Badge tone="accent">4 TYPES</Badge>} />
-          <SettingRow title="本机 Markdown" detail="普通条目兼容 Obsidian；密码字段保持本机密文。" icon="lock" control={<Badge tone="neutral">LOCAL</Badge>} />
+          <SettingRow title="内容类型" detail="Prompt · Memory · Password · Skill · Note · URL · Image · PDF" icon="database" control={<Badge tone="accent">8 TYPES</Badge>} />
+          <SettingRow title="本机 Markdown" detail="普通条目兼容 Obsidian；密码字段保持本机密文；图片和 PDF 提供有界预览。" icon="lock" control={<Badge tone="neutral">LOCAL</Badge>} />
+          <SettingRow title="iCloud Drive" detail="用户选择同步文件夹；Password、Skill 路径与主密钥不上传，媒体使用内容寻址附件。" icon="database" control={<Badge tone="neutral">OPTIONAL</Badge>} />
           <Button icon="eye" kind="secondary" onClick={() => setStatus("已模拟打开 Capsule 独立窗口")}>打开 Capsule</Button>
         </SettingsSection>
       );

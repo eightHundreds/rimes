@@ -58,9 +58,32 @@ enum ClipboardHistoryScrollRules {
         } else {
             scale = precise ? 1.35 : 32
         }
-        let scaled = raw * scale
+        // Shift turns a vertical wheel gesture into horizontal timeline
+        // movement. Reverse that mapped direction so the content follows the
+        // user's left/right expectation instead of moving against it.
+        let signedRaw = shiftHeld ? -raw : raw
+        let scaled = signedRaw * scale
         let maximumStep: CGFloat = precise ? 180 : 240
         return min(maximumStep, max(-maximumStep, scaled))
+    }
+}
+
+struct ClipboardHistoryCardActionContext {
+    let modifiers: NSEvent.ModifierFlags
+    let clickCount: Int
+
+    static let keyboard = ClipboardHistoryCardActionContext(
+        modifiers: [],
+        clickCount: 1
+    )
+
+    init(modifiers: NSEvent.ModifierFlags, clickCount: Int) {
+        self.modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        self.clickCount = max(1, clickCount)
+    }
+
+    init(event: NSEvent) {
+        self.init(modifiers: event.modifierFlags, clickCount: event.clickCount)
     }
 }
 
@@ -266,7 +289,13 @@ final class ClipboardHistoryPaneView: NSView {
             moveFilteredSelection(delta: 1, extending: true)
             return true
         case UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter):
-            _ = activateSelectedItems()
+            let selectedCount = selectedFilteredItems.count
+            let activated = activateSelectedItems()
+            IMELog.write(
+                "clipboard surface activation selected=\(selectedCount) "
+                    + "query=\(query.count) composing=\(composingText.count) "
+                    + "started=\(activated)"
+            )
             return true
         case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete):
             if model.selectedIDs.count > 1
@@ -407,6 +436,7 @@ final class ClipboardHistoryPaneView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Clipboard History")
+        setAccessibilityHelp("输入以搜索；左右键选择；回车上屏；Command-C 复制；Delete 删除；Escape 关闭")
 
         titleLabel.font = .monospacedSystemFont(ofSize: 15, weight: .bold)
         countLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
@@ -822,10 +852,11 @@ final class ClipboardHistoryPaneView: NSView {
     }
 
     @objc private func cardPressed(_ sender: ClipboardHistoryCardButton) {
+        let actionContext = sender.actionContext
         _ = handleCardInteraction(
             itemID: sender.itemID,
-            modifiers: NSApp.currentEvent?.modifierFlags ?? [],
-            clickCount: NSApp.currentEvent?.clickCount ?? 1
+            modifiers: actionContext.modifiers,
+            clickCount: actionContext.clickCount
         )
     }
 
@@ -943,6 +974,7 @@ private final class ClipboardHistoryCardButton: NSButton {
     private var selectedItem = false
     private var focusedItem = false
     private var itemKind: ClipboardItemKind = .unknown
+    private(set) var actionContext = ClipboardHistoryCardActionContext.keyboard
     private(set) var renderedBorderWidth: CGFloat = 1
     var isRenderedSelected: Bool { selectedItem }
     var isThumbnailRendered: Bool {
@@ -987,6 +1019,15 @@ private final class ClipboardHistoryCardButton: NSButton {
 
     required init?(coder: NSCoder) { fatalError() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // NSButton sends its target/action synchronously while super is tracking
+        // this press. Freeze the originating event here instead of consulting
+        // NSApp.currentEvent later, where another event may already be current.
+        actionContext = ClipboardHistoryCardActionContext(event: event)
+        defer { actionContext = .keyboard }
+        super.mouseDown(with: event)
+    }
 
     override func layout() {
         super.layout()

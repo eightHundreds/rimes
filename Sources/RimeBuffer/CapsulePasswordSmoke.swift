@@ -53,6 +53,10 @@ func runCapsulePasswordSmokeTest() -> Bool {
         }
 
         instant.addTimeInterval(1)
+        let imageFixture = root.appendingPathComponent("example.png")
+        let pdfFixture = root.appendingPathComponent("example.pdf")
+        try Data([0x89, 0x50, 0x4e, 0x47]).write(to: imageFixture)
+        try Data("%PDF-1.4\n".utf8).write(to: pdfFixture)
         let prompt = try contentStore.put(CapsuleContentWriteRequest(
             type: .prompt,
             title: "总结论文",
@@ -68,6 +72,26 @@ func runCapsulePasswordSmokeTest() -> Bool {
             title: "示例技能",
             content: "/tmp/example-skill"
         ))
+        let note = try contentStore.put(CapsuleContentWriteRequest(
+            type: .note,
+            title: "会议笔记",
+            content: "# 决策\n\n每个 Capsule 文件保存一条记录。"
+        ))
+        let webURL = try contentStore.put(CapsuleContentWriteRequest(
+            type: .url,
+            title: "项目主页",
+            content: "https://example.invalid/project?private=redacted#section"
+        ))
+        let image = try contentStore.put(CapsuleContentWriteRequest(
+            type: .image,
+            title: "示例图片",
+            content: imageFixture.path
+        ))
+        let pdf = try contentStore.put(CapsuleContentWriteRequest(
+            type: .pdf,
+            title: "示例文档",
+            content: pdfFixture.path
+        ))
         guard try contentStore.record(id: prompt.id).content
                 == "请总结这篇论文的核心贡献。",
               try contentStore.search("核心贡献", kind: .memory, limit: 5)
@@ -77,8 +101,17 @@ func runCapsulePasswordSmokeTest() -> Bool {
               try contentStore.search("Markdown", limit: 5)
                 .map(\.summary.id) == [memory.id],
               try contentStore.record(id: skill.id).content
-                == "/tmp/example-skill" else {
-            return fail("Prompt Memory Skill Markdown round trip")
+                == "/tmp/example-skill",
+              try contentStore.record(id: note.id).content.contains("# 决策"),
+              try contentStore.record(id: webURL.id).snippet
+                == "example.invalid/project",
+              try contentStore.record(id: image.id).snippet
+                == "Image · example.png",
+              try contentStore.record(id: pdf.id).snippet
+                == "PDF · example.pdf",
+              Set(try contentStore.listRecords().map(\.summary.type))
+                == Set([.prompt, .memory, .skill, .note, .url, .image, .pdf]) else {
+            return fail("all ordinary Capsule kinds Markdown round trip")
         }
         instant.addTimeInterval(1)
         let updatedPrompt = try contentStore.put(CapsuleContentWriteRequest(
@@ -102,6 +135,35 @@ func runCapsulePasswordSmokeTest() -> Bool {
             return fail("relative Skill path accepted")
         } catch CapsuleContentStoreError.invalidRequest {
             // Expected.
+        }
+        for invalid in [
+            CapsuleContentWriteRequest(
+                type: .url,
+                title: "脚本网址",
+                content: "javascript:alert(1)"
+            ),
+            CapsuleContentWriteRequest(
+                type: .url,
+                title: "无主机网址",
+                content: "https:missing-host"
+            ),
+            CapsuleContentWriteRequest(
+                type: .image,
+                title: "错误图片类型",
+                content: pdfFixture.path
+            ),
+            CapsuleContentWriteRequest(
+                type: .pdf,
+                title: "错误 PDF 类型",
+                content: imageFixture.path
+            ),
+        ] {
+            do {
+                _ = try contentStore.put(invalid)
+                return fail("invalid URL/media entry accepted")
+            } catch CapsuleContentStoreError.invalidRequest {
+                // Expected.
+            }
         }
 
         let firstRequest = CapsulePasswordWriteRequest(

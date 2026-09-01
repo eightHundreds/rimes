@@ -170,7 +170,7 @@ enum RimeShortcutAction: String, CaseIterable {
         case .openMailbox:
             return "在任何应用中打开或关闭本地保存的外部来源与 AI 会话"
         case .openCapsule:
-            return "在任何应用中打开或关闭本地 Prompt、Memory、Password 与 Skill"
+            return "在任何应用中打开或关闭本地 Prompt、Memory、Password、Skill、Note、URL、Image 与 PDF"
         case .openSettings:
             return "在任何应用中打开 RIMES 设置"
         case .previousPlugin:

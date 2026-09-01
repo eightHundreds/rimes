@@ -2,11 +2,15 @@ import Darwin
 import CryptoKit
 import Foundation
 
-enum CapsuleEntryKind: String, Codable, CaseIterable {
+enum CapsuleEntryKind: String, Codable, CaseIterable, Hashable {
     case prompt
     case memory
     case password
     case skill
+    case note
+    case url
+    case image
+    case pdf
 
     var displayName: String {
         switch self {
@@ -14,6 +18,43 @@ enum CapsuleEntryKind: String, Codable, CaseIterable {
         case .memory: return "Memory"
         case .password: return "Password"
         case .skill: return "Skill"
+        case .note: return "Note"
+        case .url: return "URL"
+        case .image: return "Image"
+        case .pdf: return "PDF"
+        }
+    }
+
+    /// The Capsule sidebar is intentionally narrow. Keep the type selector
+    /// readable as the local library grows beyond the original four kinds.
+    var tabLabel: String {
+        switch self {
+        case .prompt: return "提示"
+        case .memory: return "记忆"
+        case .password: return "密码"
+        case .skill: return "技能"
+        case .note: return "笔记"
+        case .url: return "网址"
+        case .image: return "图片"
+        case .pdf: return "PDF"
+        }
+    }
+
+    var storesMarkdownText: Bool {
+        switch self {
+        case .prompt, .memory, .note:
+            return true
+        case .password, .skill, .url, .image, .pdf:
+            return false
+        }
+    }
+
+    var storesLocalPath: Bool {
+        switch self {
+        case .skill, .image, .pdf:
+            return true
+        case .prompt, .memory, .password, .note, .url:
+            return false
         }
     }
 }
@@ -48,11 +89,63 @@ struct CapsuleContentRecord: Equatable {
     let content: String
 
     var snippet: String {
+        switch summary.type {
+        case .image:
+            return "Image · " + URL(fileURLWithPath: content).lastPathComponent
+        case .pdf:
+            return "PDF · " + URL(fileURLWithPath: content).lastPathComponent
+        case .url:
+            guard let components = URLComponents(string: content),
+                  let host = components.host else {
+                return "Web link"
+            }
+            let path = components.path == "/" ? "" : components.path
+            let value = host + path
+            guard value.count > 72 else { return value }
+            return String(value.prefix(72)) + "…"
+        case .prompt, .memory, .password, .skill, .note:
+            break
+        }
         let flattened = content
             .split(whereSeparator: \Character.isWhitespace)
             .joined(separator: " ")
         guard flattened.count > 72 else { return flattened }
         return String(flattened.prefix(72)) + "…"
+    }
+}
+
+/// One immutable, lock-consistent view of a local Markdown entry for the
+/// optional cloud mirror. Keeping the original bytes preserves Obsidian edits
+/// and `updated_at`; the revision is content-addressed and contains no secret.
+struct CapsuleContentSyncDocument: Equatable {
+    let record: CapsuleContentRecord
+    let data: Data
+    let revision: String
+}
+
+struct CapsuleContentImportResult: Equatable {
+    let received: Int
+    let uniqueInput: Int
+    let inserted: Int
+    let skippedExisting: Int
+    let skippedInputDuplicates: Int
+}
+
+private struct CapsuleContentIdentity: Hashable {
+    let type: CapsuleEntryKind
+    let title: String
+    let content: String
+
+    init(_ request: CapsuleContentWriteRequest) {
+        type = request.type
+        title = request.title
+        content = request.content
+    }
+
+    init(_ record: CapsuleContentRecord) {
+        type = record.summary.type
+        title = record.summary.title
+        content = record.content
     }
 }
 
@@ -84,8 +177,10 @@ enum CapsuleContentStoreError: LocalizedError, Equatable {
 
 /// Obsidian-readable local store for non-secret Capsule units. Passwords keep
 /// their authenticated encrypted format in `passwords/`; Prompt, Memory and
-/// Skill path units live here as ordinary Markdown so Obsidian can read, edit
-/// and graph them without a product-specific database.
+/// Skill/Image/PDF path units live here as ordinary Markdown so Obsidian can
+/// read, edit and graph them without a product-specific database. The binary
+/// asset remains at its user-managed local path; Capsule never copies it into
+/// the executable or the repository.
 final class CapsuleContentStore {
     static let shared = CapsuleContentStore()
 
@@ -101,6 +196,7 @@ final class CapsuleContentStore {
 
     let rootURL: URL
     let entryDirectoryURL: URL
+    let conflictDirectoryURL: URL
     let seedMarkerURL: URL
 
     private let fileManager: FileManager
@@ -112,6 +208,10 @@ final class CapsuleContentStore {
         self.rootURL = rootURL.standardizedFileURL
         entryDirectoryURL = self.rootURL.appendingPathComponent(
             "entries",
+            isDirectory: true
+        )
+        conflictDirectoryURL = self.rootURL.appendingPathComponent(
+            "conflicts",
             isDirectory: true
         )
         seedMarkerURL = self.rootURL.appendingPathComponent("content-seed-v1")
@@ -189,6 +289,7 @@ final class CapsuleContentStore {
              expectedRevision: String? = nil) throws
         -> CapsuleContentSummary {
         let normalized = try Self.validate(request)
+        try requireAvailableAssetIfNeeded(normalized)
         return try withStoreLock {
             try prepareDirectoriesWithoutLock()
             try seedDefaultsWithoutLockIfNeeded()
@@ -196,6 +297,64 @@ final class CapsuleContentStore {
                 normalized,
                 requiresExistingID: normalized.id != nil,
                 expectedRevision: expectedRevision
+            )
+        }
+    }
+
+    /// Keeps read/deduplicate/write under one process-wide flock so two CLI
+    /// importers cannot both insert the same ordinary Capsule entry.
+    func importUnique(_ requests: [CapsuleContentWriteRequest]) throws
+        -> CapsuleContentImportResult {
+        guard requests.count <= Self.maximumRecordCount,
+              requests.allSatisfy({ $0.id == nil }) else {
+            throw CapsuleContentStoreError.invalidRequest(
+                "导入数量超过上限或包含记录 ID"
+            )
+        }
+        let normalized = try requests.map(Self.validate)
+        for request in normalized {
+            try requireAvailableAssetIfNeeded(request)
+        }
+        return try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            try seedDefaultsWithoutLockIfNeeded()
+            let records = try recordsWithoutLock()
+            var existing = Set(records.map(CapsuleContentIdentity.init))
+            var uniqueInput = Set<CapsuleContentIdentity>()
+            var inserted = 0
+            var skippedExisting = 0
+            var skippedInputDuplicates = 0
+            var recordCount = records.count
+            for request in normalized {
+                let identity = CapsuleContentIdentity(request)
+                guard uniqueInput.insert(identity).inserted else {
+                    skippedInputDuplicates += 1
+                    continue
+                }
+                guard !existing.contains(identity) else {
+                    skippedExisting += 1
+                    continue
+                }
+                guard recordCount < Self.maximumRecordCount else {
+                    throw CapsuleContentStoreError.invalidRequest(
+                        "记录数量超过上限"
+                    )
+                }
+                _ = try writeRecordWithoutLock(
+                    request,
+                    requiresExistingID: false,
+                    knownRecordCount: recordCount
+                )
+                existing.insert(identity)
+                inserted += 1
+                recordCount += 1
+            }
+            return CapsuleContentImportResult(
+                received: normalized.count,
+                uniqueInput: uniqueInput.count,
+                inserted: inserted,
+                skippedExisting: skippedExisting,
+                skippedInputDuplicates: skippedInputDuplicates
             )
         }
     }
@@ -213,6 +372,193 @@ final class CapsuleContentStore {
                 throw CapsuleContentStoreError.malformedDocument(url.path)
             }
             return record
+        }
+    }
+
+    /// Reads all ordinary entries and their exact Markdown bytes while holding
+    /// the same cross-process lock used by CRUD. Password documents are owned
+    /// by `CapsulePasswordStore` and can never enter this snapshot.
+    func synchronizationDocuments() throws -> [CapsuleContentSyncDocument] {
+        try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            try seedDefaultsWithoutLockIfNeeded()
+            return try recordsWithoutLock().compactMap { record in
+                // Skill bodies are device-local absolute paths. Uploading them
+                // would disclose the Mac's directory layout while producing a
+                // record that cannot be resolved safely on another device.
+                guard record.summary.type != .skill else { return nil }
+                let url = record.summary.fileURL
+                try requireSafeRegularFile(
+                    url,
+                    maximumBytes: Self.maximumDocumentBytes
+                )
+                let data: Data
+                do {
+                    data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                } catch {
+                    throw CapsuleContentStoreError.fileOperation(
+                        error.localizedDescription
+                    )
+                }
+                return CapsuleContentSyncDocument(
+                    record: record,
+                    data: data,
+                    revision: Self.revision(of: data)
+                )
+            }
+        }
+    }
+
+    /// Before a cloud tombstone or winner consumes an unavailable local media
+    /// edit, retain its exact Markdown under the same private store lock. This
+    /// local copy may contain an absolute path and therefore never enters the
+    /// iCloud mirror or sync state.
+    @discardableResult
+    func archiveSynchronizedConflict(
+        _ data: Data,
+        id: UUID,
+        origin: String
+    ) throws -> URL {
+        guard !data.isEmpty,
+              data.count <= Self.maximumDocumentBytes else {
+            throw CapsuleContentStoreError.invalidRequest(
+                "冲突 Markdown 为空或超过大小上限"
+            )
+        }
+        return try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            let validationURL = entryURL(id: id)
+            let record = try parseDocumentDataWithoutLock(
+                data,
+                fileURL: validationURL
+            )
+            guard record.summary.id == id,
+                  record.summary.type != .password else {
+                throw CapsuleContentStoreError.malformedDocument(
+                    validationURL.path
+                )
+            }
+            let itemDirectory = conflictDirectoryURL.appendingPathComponent(
+                id.uuidString.lowercased(),
+                isDirectory: true
+            )
+            try preparePrivateDirectory(itemDirectory)
+            let existing = try fileManager.contentsOfDirectory(
+                at: itemDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            guard existing.count < 10_000 else {
+                throw CapsuleContentStoreError.unsafeStorage(
+                    itemDirectory.path
+                )
+            }
+            let safeOrigin = origin.filter {
+                $0.isLetter || $0.isNumber || $0 == "-"
+            }
+            let milliseconds = Int(now().timeIntervalSince1970 * 1_000)
+            let destination = itemDirectory.appendingPathComponent(
+                "\(milliseconds)-\(safeOrigin)-"
+                    + "\(UUID().uuidString.lowercased()).md"
+            )
+            try writePrivateFileWithoutLock(
+                data,
+                to: destination,
+                additionalAllowedDirectory: itemDirectory
+            )
+            return destination
+        }
+    }
+
+    /// Applies a fully validated remote Markdown document under the local
+    /// store lock. Media sync materializes its asset first, so the canonical
+    /// local body remains an absolute path as required by the editor.
+    @discardableResult
+    func applySynchronizedDocument(
+        _ data: Data,
+        id: UUID,
+        expectedRevision: String?
+    ) throws
+        -> CapsuleContentRecord {
+        guard !data.isEmpty, data.count <= Self.maximumDocumentBytes else {
+            throw CapsuleContentStoreError.invalidRequest(
+                "同步 Markdown 为空或超过大小上限"
+            )
+        }
+        return try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            try seedDefaultsWithoutLockIfNeeded()
+            let destination = entryURL(id: id)
+            let destinationExists = fileManager.fileExists(
+                atPath: destination.path
+            )
+            if destinationExists {
+                guard let expectedRevision,
+                      try fileRevisionWithoutLock(destination)
+                        == expectedRevision else {
+                    throw CapsuleContentStoreError.revisionConflict
+                }
+            } else if expectedRevision != nil {
+                throw CapsuleContentStoreError.revisionConflict
+            } else if try recordsWithoutLock().count
+                        >= Self.maximumRecordCount {
+                throw CapsuleContentStoreError.invalidRequest(
+                    "记录数量超过上限"
+                )
+            }
+            let record = try parseDocumentDataWithoutLock(
+                data,
+                fileURL: destination
+            )
+            guard record.summary.id == id else {
+                throw CapsuleContentStoreError.malformedDocument(
+                    destination.path
+                )
+            }
+            try requireAvailableAssetIfNeeded(
+                CapsuleContentWriteRequest(
+                    id: id,
+                    type: record.summary.type,
+                    title: record.summary.title,
+                    content: record.content
+                )
+            )
+            try writePrivateFileWithoutLock(data, to: destination)
+            return record
+        }
+    }
+
+    /// A tombstone may arrive after this device already removed the entry.
+    /// Treat that as an idempotent success while retaining the store lock.
+    func removeSynchronizedRecord(
+        id: UUID,
+        expectedRevision: String?
+    ) throws {
+        try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            let destination = entryURL(id: id)
+            guard fileManager.fileExists(atPath: destination.path) else {
+                guard expectedRevision == nil else {
+                    throw CapsuleContentStoreError.revisionConflict
+                }
+                return
+            }
+            guard let expectedRevision,
+                  try fileRevisionWithoutLock(destination)
+                    == expectedRevision else {
+                throw CapsuleContentStoreError.revisionConflict
+            }
+            try requireSafeRegularFile(
+                destination,
+                maximumBytes: Self.maximumDocumentBytes
+            )
+            do {
+                try fileManager.removeItem(at: destination)
+            } catch {
+                throw CapsuleContentStoreError.fileOperation(
+                    error.localizedDescription
+                )
+            }
         }
     }
 
@@ -254,9 +600,7 @@ final class CapsuleContentStore {
                 error.localizedDescription
             )
         }
-        return SHA256.hash(data: data).map {
-            String(format: "%02x", $0)
-        }.joined()
+        return Self.revision(of: data)
     }
 
     private func seedDefaultsWithoutLockIfNeeded() throws {
@@ -285,7 +629,8 @@ final class CapsuleContentStore {
     private func writeRecordWithoutLock(
         _ request: CapsuleContentWriteRequest,
         requiresExistingID: Bool,
-        expectedRevision: String? = nil
+        expectedRevision: String? = nil,
+        knownRecordCount: Int? = nil
     ) throws -> CapsuleContentSummary {
         let normalized = try Self.validate(request)
         let id = normalized.id ?? UUID()
@@ -299,9 +644,8 @@ final class CapsuleContentStore {
                 maximumBytes: Self.maximumDocumentBytes
             )
         } else {
-            let existing = try recordsWithoutLock()
-            if !existing.contains(where: { $0.summary.id == id }),
-               existing.count >= Self.maximumRecordCount {
+            let recordCount = try knownRecordCount ?? recordsWithoutLock().count
+            if recordCount >= Self.maximumRecordCount {
                 throw CapsuleContentStoreError.invalidRequest("记录数量超过上限")
             }
         }
@@ -396,7 +740,15 @@ final class CapsuleContentStore {
                 error.localizedDescription
             )
         }
-        guard let text = String(data: data, encoding: .utf8),
+        return try parseDocumentDataWithoutLock(data, fileURL: url)
+    }
+
+    private func parseDocumentDataWithoutLock(
+        _ data: Data,
+        fileURL url: URL
+    ) throws -> CapsuleContentRecord {
+        guard !data.isEmpty, data.count <= Self.maximumDocumentBytes,
+              let text = String(data: data, encoding: .utf8),
               !text.contains("\0") else {
             throw CapsuleContentStoreError.malformedDocument(url.path)
         }
@@ -435,7 +787,7 @@ final class CapsuleContentStore {
               title.count <= Self.maximumTitleCharacters,
               let updatedRaw = fields["updated_at"],
               let updatedString = try? Self.decodeJSONScalar(updatedRaw),
-              let updatedAt = Self.iso8601.date(from: updatedString) else {
+              let updatedAt = Self.parseDate(updatedString) else {
             throw CapsuleContentStoreError.malformedDocument(url.path)
         }
         var bodyStart = end + 1
@@ -465,6 +817,12 @@ final class CapsuleContentStore {
         )
     }
 
+    private static func revision(of data: Data) -> String {
+        SHA256.hash(data: data).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     private func entryURL(id: UUID) -> URL {
         entryDirectoryURL.appendingPathComponent(
             "\(id.uuidString.lowercased()).md"
@@ -474,6 +832,7 @@ final class CapsuleContentStore {
     private func prepareDirectoriesWithoutLock() throws {
         try preparePrivateDirectory(rootURL)
         try preparePrivateDirectory(entryDirectoryURL)
+        try preparePrivateDirectory(conflictDirectoryURL)
     }
 
     private func preparePrivateDirectory(_ url: URL) throws {
@@ -532,11 +891,44 @@ final class CapsuleContentStore {
         }
     }
 
-    private func writePrivateFileWithoutLock(_ data: Data, to url: URL) throws {
-        guard url.deletingLastPathComponent().standardizedFileURL
-                == rootURL.standardizedFileURL
-                || url.deletingLastPathComponent().standardizedFileURL
-                    == entryDirectoryURL.standardizedFileURL else {
+    /// New media records must point at a real ordinary file. Parsing an
+    /// existing record deliberately does not repeat this availability gate so
+    /// a moved/offline asset remains editable and can render a missing-file
+    /// placeholder instead of making the entire Markdown store unreadable.
+    private func requireAvailableAssetIfNeeded(
+        _ request: CapsuleContentWriteRequest
+    ) throws {
+        guard request.type == .image || request.type == .pdf else { return }
+        let url = URL(fileURLWithPath: request.content).standardizedFileURL
+        let values: URLResourceValues
+        do {
+            values = try url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ])
+        } catch {
+            throw CapsuleContentStoreError.invalidRequest(
+                "\(request.type.displayName) 文件不可用"
+            )
+        }
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            throw CapsuleContentStoreError.invalidRequest(
+                "\(request.type.displayName) 必须指向普通、非符号链接文件"
+            )
+        }
+    }
+
+    private func writePrivateFileWithoutLock(
+        _ data: Data,
+        to url: URL,
+        additionalAllowedDirectory: URL? = nil
+    ) throws {
+        let parent = url.deletingLastPathComponent().standardizedFileURL
+        let allowedParents = [rootURL, entryDirectoryURL]
+            .map(\.standardizedFileURL)
+            + [additionalAllowedDirectory?.standardizedFileURL].compactMap { $0 }
+        guard allowedParents.contains(parent) else {
             throw CapsuleContentStoreError.unsafeStorage(url.path)
         }
         let directory = url.deletingLastPathComponent()
@@ -611,9 +1003,46 @@ final class CapsuleContentStore {
               !request.content.contains("\0") else {
             throw CapsuleContentStoreError.invalidRequest("内容为空或过长")
         }
-        if request.type == .skill,
-           !NSString(string: request.content).isAbsolutePath {
-            throw CapsuleContentStoreError.invalidRequest("Skill 必须是绝对路径")
+        if request.type.storesLocalPath {
+            guard NSString(string: request.content).isAbsolutePath,
+                  !request.content.contains("\n"),
+                  !request.content.contains("\r") else {
+                throw CapsuleContentStoreError.invalidRequest(
+                    "\(request.type.displayName) 必须是单行绝对路径"
+                )
+            }
+        }
+        if request.type == .image {
+            let allowed = Set([
+                "png", "jpg", "jpeg", "heic", "webp", "tif", "tiff",
+                "gif", "bmp",
+            ])
+            let ext = URL(fileURLWithPath: request.content)
+                .pathExtension.lowercased()
+            guard allowed.contains(ext) else {
+                throw CapsuleContentStoreError.invalidRequest("Image 文件类型不受支持")
+            }
+        }
+        if request.type == .pdf,
+           URL(fileURLWithPath: request.content).pathExtension.lowercased()
+                != "pdf" {
+            throw CapsuleContentStoreError.invalidRequest("PDF 条目必须指向 .pdf 文件")
+        }
+        if request.type == .url {
+            let value = request.content.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard value == request.content,
+                  !value.contains("\n"),
+                  !value.contains("\r"),
+                  let components = URLComponents(string: value),
+                  let scheme = components.scheme,
+                  ["http", "https"].contains(scheme.lowercased()),
+                  components.host?.isEmpty == false else {
+                throw CapsuleContentStoreError.invalidRequest(
+                    "URL 必须是完整的 HTTP 或 HTTPS 网址"
+                )
+            }
         }
         return CapsuleContentWriteRequest(
             id: request.id,
@@ -659,4 +1088,14 @@ final class CapsuleContentStore {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
+
+    private static let plainISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static func parseDate(_ value: String) -> Date? {
+        iso8601.date(from: value) ?? plainISO8601.date(from: value)
+    }
 }

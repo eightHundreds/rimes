@@ -29,9 +29,9 @@
 |---|---|
 | 输入方案 | 雾凇全拼、自然码双拼、小鹤双拼、五笔 86、英文；可选并击扩展 |
 | 缓冲工作台 | `⌘⇧B` 开关；先暂存、再分块投递 |
-| Clipboard History | 与 Buffer 同级；`⌘⇧P` 打开屏幕底部独立窗口。收录开启且无安全保护时在后台保存文本、链接、图片、文件与颜色，原始表示只落本机私有数据库；直接输入搜索，`←/→` 选择，Return 直接上屏（富内容按需申请 macOS 粘贴事件权限），`⌘C` 复制 |
+| Clipboard History | 与 Buffer 同级；仅在当前输入源属于 RIMES 时由 `⌘⇧P` 打开屏幕底部独立窗口。收录开启且无安全保护时在后台保存文本、链接、图片、文件与颜色，原始表示只落本机私有数据库。单击只选择，双击、Return 或 `⌘1`–`⌘9` 激活：文本/链接经 exact-focus IMK 直接上屏并提升到历史首位；图片、RTF、HTML、文件等只无损恢复到系统剪贴板、提升到首位并静默关闭，由用户自行按 `⌘V`。RIMES 不会自动 Paste、右键或发送 `⌘V`，也不请求 Accessibility/Post Event；`⌘C` 仍只复制所选内容 |
 | Mailbox | 与 Buffer 同级；`⌘⇧M` 打开/关闭，独立保存 AI 会话、备注与待审核外部推送。窗口内可“新建对话”并选择已配置的连接器/模型；CLI 只使用各自默认模型，OpenAI 使用本机配置模型，选择只绑定新会话且不改全局设置。草稿不创建空会话，首次 Return 才创建会话并发起生成 |
-| Capsule | 与 Buffer 同级；`⌘⇧C` 打开/关闭，在独立窗口搜索和维护本机 Prompt、Memory、Password、Skill，不进入 Buffer 插件目录 |
+| Capsule | 与 Buffer 同级；`⌘⇧C` 打开/关闭，逐条维护八类内容并预览图片/PDF；可选择 iCloud Drive 文件夹自动双向同步六类普通条目与媒体资产，Password、Skill 路径及主密钥保持本机 |
 | 设置 | `⌘⇧S` 随时打开设置页面 |
 | 实时翻译 | 默认 Apple 本地翻译（macOS 15+），也可走 AI 渠道 |
 | AI 生成 | Codex CLI / Claude Code CLI / OpenAI 兼容 API；结果只留在 Buffer 内，可选 Plain / Markdown / JSON，再由用户上屏 |

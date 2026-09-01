@@ -51,6 +51,41 @@ struct CapsulePasswordRecord: Equatable {
     let secret: CapsulePasswordSecret
 }
 
+struct CapsulePasswordImportResult: Equatable {
+    let received: Int
+    let uniqueInput: Int
+    let inserted: Int
+    let skippedExisting: Int
+    let skippedInputDuplicates: Int
+}
+
+private struct CapsulePasswordIdentity: Hashable {
+    let title: String
+    let url: String?
+    let app: String?
+    let username: String?
+    let password: String
+    let previousPasswords: [String]
+
+    init(_ request: CapsulePasswordWriteRequest) {
+        title = request.title
+        url = request.url
+        app = request.app
+        username = request.username
+        password = request.password
+        previousPasswords = request.previousPasswords
+    }
+
+    init(_ record: CapsulePasswordRecord) {
+        title = record.summary.title
+        url = record.secret.url
+        app = record.secret.app
+        username = record.secret.username
+        password = record.secret.password
+        previousPasswords = record.secret.previousPasswords
+    }
+}
+
 enum CapsulePasswordStoreError: LocalizedError, Equatable {
     case unsafeStorage(String)
     case invalidRequest(String)
@@ -173,131 +208,75 @@ final class CapsulePasswordStore {
         let normalized = try Self.validate(request)
         return try withStoreLock {
             try prepareDirectoriesWithoutLock()
-            let id = normalized.id ?? UUID()
-            let hasExistingRecords: Bool
-            if normalized.id == nil {
-                let existing = try summariesWithoutLock()
-                guard existing.count < Self.maximumRecordCount else {
-                    throw CapsulePasswordStoreError.invalidRequest("记录数量超过上限")
+            return try writeRecordWithoutLock(
+                normalized,
+                expectedRevision: expectedRevision
+            )
+        }
+    }
+
+    /// Imports a batch while holding the store's process-wide flock for the
+    /// complete read/deduplicate/write transaction. This makes repeated and
+    /// concurrent CLI imports converge on one encrypted record per identity.
+    func importUnique(_ requests: [CapsulePasswordWriteRequest]) throws
+        -> CapsulePasswordImportResult {
+        guard requests.count <= Self.maximumRecordCount,
+              requests.allSatisfy({ $0.id == nil }) else {
+            throw CapsulePasswordStoreError.invalidRequest(
+                "导入数量超过上限或包含记录 ID"
+            )
+        }
+        let normalized = try requests.map(Self.validate)
+        return try withStoreLock {
+            try prepareDirectoriesWithoutLock()
+            let summaries = try summariesWithoutLock()
+            var existing = Set<CapsulePasswordIdentity>()
+            for summary in summaries {
+                existing.insert(CapsulePasswordIdentity(
+                    try recordWithoutLock(id: summary.id)
+                ))
+            }
+            var uniqueInput = Set<CapsulePasswordIdentity>()
+            var inserted = 0
+            var skippedExisting = 0
+            var skippedInputDuplicates = 0
+            var recordCount = summaries.count
+            for request in normalized {
+                let identity = CapsulePasswordIdentity(request)
+                guard uniqueInput.insert(identity).inserted else {
+                    skippedInputDuplicates += 1
+                    continue
                 }
-                hasExistingRecords = !existing.isEmpty
-            } else {
-                let destination = passwordDirectoryURL.appendingPathComponent(
-                    "\(id.uuidString.lowercased()).md"
-                )
-                guard fileManager.fileExists(atPath: destination.path) else {
-                    throw CapsulePasswordStoreError.recordNotFound
+                guard !existing.contains(identity) else {
+                    skippedExisting += 1
+                    continue
                 }
-                let values = try safeValues(for: destination)
-                guard values.isRegularFile == true,
-                      values.isSymbolicLink != true else {
-                    throw CapsulePasswordStoreError.unsafeStorage(
-                        destination.path
+                guard recordCount < Self.maximumRecordCount else {
+                    throw CapsulePasswordStoreError.invalidRequest(
+                        "记录数量超过上限"
                     )
                 }
-                hasExistingRecords = true
-            }
-
-            let updatedAt = now()
-            let secret = CapsulePasswordSecret(
-                url: normalized.url,
-                app: normalized.app,
-                username: normalized.username,
-                password: normalized.password,
-                previousPasswords: normalized.previousPasswords
-            )
-            let key = try loadOrCreateMasterKeyWithoutLock(
-                hasExistingRecords: hasExistingRecords
-            )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            guard let secretData = try? encoder.encode(secret),
-                  secretData.count <= Self.maximumDocumentBytes else {
-                throw CapsulePasswordStoreError.encryptionFailed
-            }
-            let aad = Self.authenticatedMetadata(
-                id: id,
-                title: normalized.title
-            )
-            let sealed: ChaChaPoly.SealedBox
-            do {
-                sealed = try ChaChaPoly.seal(
-                    secretData,
-                    using: key,
-                    authenticating: aad
+                _ = try writeRecordWithoutLock(
+                    request,
+                    knownRecordCount: recordCount
                 )
-            } catch {
-                throw CapsulePasswordStoreError.encryptionFailed
+                existing.insert(identity)
+                inserted += 1
+                recordCount += 1
             }
-            let document = Self.markdownDocument(
-                id: id,
-                title: normalized.title,
-                updatedAt: updatedAt,
-                ciphertext: sealed.combined.base64EncodedString()
-            )
-            let data = Data(document.utf8)
-            guard data.count <= Self.maximumDocumentBytes else {
-                throw CapsulePasswordStoreError.invalidRequest("密码文档超过大小上限")
-            }
-            let destination = passwordDirectoryURL
-                .appendingPathComponent("\(id.uuidString.lowercased()).md")
-            if let expectedRevision {
-                guard try fileRevisionWithoutLock(destination)
-                        == expectedRevision else {
-                    throw CapsulePasswordStoreError.revisionConflict
-                }
-            }
-            try writePrivateFileWithoutLock(data, to: destination)
-            return CapsulePasswordSummary(
-                id: id,
-                title: normalized.title,
-                updatedAt: updatedAt,
-                fileURL: destination
+            return CapsulePasswordImportResult(
+                received: normalized.count,
+                uniqueInput: uniqueInput.count,
+                inserted: inserted,
+                skippedExisting: skippedExisting,
+                skippedInputDuplicates: skippedInputDuplicates
             )
         }
     }
 
     func record(id: UUID) throws -> CapsulePasswordRecord {
         try withStoreLock {
-            let url = passwordDirectoryURL
-                .appendingPathComponent("\(id.uuidString.lowercased()).md")
-            let parsed = try parseDocumentWithoutLock(url)
-            guard parsed.id == id else {
-                throw CapsulePasswordStoreError.malformedDocument(url.path)
-            }
-            let key = try loadMasterKeyWithoutLock()
-            guard let combined = Data(base64Encoded: parsed.ciphertext) else {
-                throw CapsulePasswordStoreError.malformedDocument(url.path)
-            }
-            let secretData: Data
-            do {
-                let sealed = try ChaChaPoly.SealedBox(combined: combined)
-                secretData = try ChaChaPoly.open(
-                    sealed,
-                    using: key,
-                    authenticating: Self.authenticatedMetadata(
-                        id: parsed.id,
-                        title: parsed.title
-                    )
-                )
-            } catch {
-                throw CapsulePasswordStoreError.decryptionFailed
-            }
-            guard let secret = try? JSONDecoder().decode(
-                CapsulePasswordSecret.self,
-                from: secretData
-            ) else {
-                throw CapsulePasswordStoreError.decryptionFailed
-            }
-            return CapsulePasswordRecord(
-                summary: CapsulePasswordSummary(
-                    id: parsed.id,
-                    title: parsed.title,
-                    updatedAt: parsed.updatedAt,
-                    fileURL: url
-                ),
-                secret: secret
-            )
+            try recordWithoutLock(id: id)
         }
     }
 
@@ -326,6 +305,132 @@ final class CapsulePasswordStore {
                 )
             }
         }
+    }
+
+    private func writeRecordWithoutLock(
+        _ normalized: CapsulePasswordWriteRequest,
+        expectedRevision: String? = nil,
+        knownRecordCount: Int? = nil
+    ) throws -> CapsulePasswordSummary {
+        let id = normalized.id ?? UUID()
+        let hasExistingRecords: Bool
+        if normalized.id == nil {
+            let recordCount = try knownRecordCount ?? summariesWithoutLock().count
+            guard recordCount < Self.maximumRecordCount else {
+                throw CapsulePasswordStoreError.invalidRequest("记录数量超过上限")
+            }
+            hasExistingRecords = recordCount > 0
+        } else {
+            let destination = passwordDirectoryURL.appendingPathComponent(
+                "\(id.uuidString.lowercased()).md"
+            )
+            guard fileManager.fileExists(atPath: destination.path) else {
+                throw CapsulePasswordStoreError.recordNotFound
+            }
+            let values = try safeValues(for: destination)
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                throw CapsulePasswordStoreError.unsafeStorage(destination.path)
+            }
+            hasExistingRecords = true
+        }
+
+        let updatedAt = now()
+        let secret = CapsulePasswordSecret(
+            url: normalized.url,
+            app: normalized.app,
+            username: normalized.username,
+            password: normalized.password,
+            previousPasswords: normalized.previousPasswords
+        )
+        let key = try loadOrCreateMasterKeyWithoutLock(
+            hasExistingRecords: hasExistingRecords
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let secretData = try? encoder.encode(secret),
+              secretData.count <= Self.maximumDocumentBytes else {
+            throw CapsulePasswordStoreError.encryptionFailed
+        }
+        let aad = Self.authenticatedMetadata(id: id, title: normalized.title)
+        let sealed: ChaChaPoly.SealedBox
+        do {
+            sealed = try ChaChaPoly.seal(
+                secretData,
+                using: key,
+                authenticating: aad
+            )
+        } catch {
+            throw CapsulePasswordStoreError.encryptionFailed
+        }
+        let document = Self.markdownDocument(
+            id: id,
+            title: normalized.title,
+            updatedAt: updatedAt,
+            ciphertext: sealed.combined.base64EncodedString()
+        )
+        let data = Data(document.utf8)
+        guard data.count <= Self.maximumDocumentBytes else {
+            throw CapsulePasswordStoreError.invalidRequest("密码文档超过大小上限")
+        }
+        let destination = passwordDirectoryURL.appendingPathComponent(
+            "\(id.uuidString.lowercased()).md"
+        )
+        if let expectedRevision {
+            guard try fileRevisionWithoutLock(destination) == expectedRevision else {
+                throw CapsulePasswordStoreError.revisionConflict
+            }
+        }
+        try writePrivateFileWithoutLock(data, to: destination)
+        return CapsulePasswordSummary(
+            id: id,
+            title: normalized.title,
+            updatedAt: updatedAt,
+            fileURL: destination
+        )
+    }
+
+    private func recordWithoutLock(id: UUID) throws -> CapsulePasswordRecord {
+        let url = passwordDirectoryURL.appendingPathComponent(
+            "\(id.uuidString.lowercased()).md"
+        )
+        let parsed = try parseDocumentWithoutLock(url)
+        guard parsed.id == id else {
+            throw CapsulePasswordStoreError.malformedDocument(url.path)
+        }
+        let key = try loadMasterKeyWithoutLock()
+        guard let combined = Data(base64Encoded: parsed.ciphertext) else {
+            throw CapsulePasswordStoreError.malformedDocument(url.path)
+        }
+        let secretData: Data
+        do {
+            let sealed = try ChaChaPoly.SealedBox(combined: combined)
+            secretData = try ChaChaPoly.open(
+                sealed,
+                using: key,
+                authenticating: Self.authenticatedMetadata(
+                    id: parsed.id,
+                    title: parsed.title
+                )
+            )
+        } catch {
+            throw CapsulePasswordStoreError.decryptionFailed
+        }
+        guard let secret = try? JSONDecoder().decode(
+            CapsulePasswordSecret.self,
+            from: secretData
+        ) else {
+            throw CapsulePasswordStoreError.decryptionFailed
+        }
+        return CapsulePasswordRecord(
+            summary: CapsulePasswordSummary(
+                id: parsed.id,
+                title: parsed.title,
+                updatedAt: parsed.updatedAt,
+                fileURL: url
+            ),
+            secret: secret
+        )
     }
 
     private func fileRevisionWithoutLock(_ url: URL) throws -> String {

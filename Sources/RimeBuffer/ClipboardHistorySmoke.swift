@@ -233,8 +233,8 @@ enum ClipboardHistorySmoke {
                 deltaY: 1,
                 precise: false,
                 shiftHeld: true
-            ) == 48,
-            "Shift discrete-wheel acceleration"
+            ) == -48,
+            "Shift discrete-wheel reversed acceleration"
         )
         expect(
             ClipboardHistoryScrollRules.horizontalDelta(
@@ -242,8 +242,35 @@ enum ClipboardHistorySmoke {
                 deltaY: 4,
                 precise: true,
                 shiftHeld: true
-            ) == 10,
-            "Shift precise-wheel acceleration"
+            ) == -10,
+            "Shift precise-wheel reversed acceleration"
+        )
+        expect(
+            ClipboardHistoryScrollRules.horizontalDelta(
+                deltaX: 0,
+                deltaY: -10,
+                precise: false,
+                shiftHeld: true
+            ) == 240,
+            "Shift reversed wheel clamp"
+        )
+        expect(
+            ClipboardHistoryScrollRules.horizontalDelta(
+                deltaX: 5,
+                deltaY: 100,
+                precise: true,
+                shiftHeld: false
+            ) == 5,
+            "native horizontal delta direction"
+        )
+        expect(
+            ClipboardHistoryScrollRules.horizontalDelta(
+                deltaX: 0,
+                deltaY: 1,
+                precise: false,
+                shiftHeld: false
+            ) == 32,
+            "unmodified vertical timeline direction"
         )
 
         let pasteboard = ClipboardHistoryPasteboardDouble()
@@ -458,6 +485,106 @@ enum ClipboardHistorySmoke {
         expect(boundedModel.itemCount == 2, "item bound failed")
         expect(boundedModel.storedByteCount == 8, "byte bound failed")
         expect(!boundedModel.ingest("123456789"), "per-item byte cap failed")
+
+        do {
+            let promotionPasteboard = ClipboardHistoryPasteboardDouble()
+            promotionPasteboard.usesAsynchronousArchive = true
+            promotionPasteboard.stubChangeCount = 70
+            let promotionModel = ClipboardHistoryModel(
+                configuration: .init(
+                    maximumItems: 10,
+                    maximumItemBytes: 1_024 * 1_024,
+                    maximumTotalBytes: 4 * 1_024 * 1_024,
+                    pollingInterval: 1
+                ),
+                pasteboard: promotionPasteboard,
+                schedulesAutomaticPolling: false
+            )
+            promotionModel.start()
+            promotionModel.update(
+                windowVisible: true,
+                captureEnabled: true,
+                protection: []
+            )
+            expect(
+                promotionModel.ingest("older selected companion"),
+                "manual-paste promotion companion fixture"
+            )
+            let companionID = promotionModel.items.first?.id
+            guard let fixturePNG = makeFixturePNG() else {
+                expect(false, "manual-paste promotion PNG fixture")
+                throw ClipboardHistoryStoreError.corruptRecord
+            }
+            promotionPasteboard.stubArchive = try ClipboardPasteboardArchive(items: [
+                .init(
+                    types: [NSPasteboard.PasteboardType.png.rawValue],
+                    dataByType: [
+                        NSPasteboard.PasteboardType.png.rawValue: fixturePNG,
+                    ]
+                ),
+            ])
+            promotionPasteboard.stubChangeCount = 71
+            expect(
+                promotionModel.pollNow(),
+                "manual-paste promotion image capture was not scheduled"
+            )
+            promotionPasteboard.completeAsynchronousRead()
+            let promotionCaptureDeadline = Date(timeIntervalSinceNow: 2)
+            while !promotionModel.items.contains(where: { $0.kind == .image }),
+                  Date() < promotionCaptureDeadline {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+            }
+            let richID = promotionModel.items.first(where: { $0.kind == .image })?.id
+            expect(
+                promotionModel.ingest("newer unselected sentinel"),
+                "manual-paste promotion sentinel fixture"
+            )
+            let sentinelID = promotionModel.items.first?.id
+            if let richID, let companionID, let sentinelID {
+                expect(
+                    promotionModel.items.first?.id == sentinelID
+                        && promotionModel.items.firstIndex(where: { $0.id == richID }) != 0,
+                    "manual-paste rich fixture was already first"
+                )
+                let activationOrder = [richID, companionID]
+                expect(
+                    promotionModel.select(
+                        ids: activationOrder,
+                        focusedID: activationOrder.first
+                    ),
+                    "manual-paste activation selection fixture"
+                )
+                expect(
+                    promotionModel.promote(ids: activationOrder),
+                    "manual-paste activation promotion"
+                )
+                expect(
+                    Array(promotionModel.items.prefix(2).map(\.id))
+                        == activationOrder,
+                    "manual-paste activation changed selection order"
+                )
+                expect(
+                    promotionModel.items.map(\.id)
+                        == activationOrder + [sentinelID],
+                    "manual-paste activation changed unselected order"
+                )
+                expect(
+                    promotionModel.selectedIDs == Set(activationOrder),
+                    "manual-paste activation lost selected items"
+                )
+                expect(
+                    promotionModel.selectedID == activationOrder.first,
+                    "manual-paste activation lost focused item"
+                )
+            } else {
+                expect(false, "manual-paste promotion fixture IDs")
+            }
+        } catch {
+            expect(
+                false,
+                "manual-paste promotion fixture threw: \(error.localizedDescription)"
+            )
+        }
 
         let imageSearchItem = ClipboardHistoryItem(
             id: UUID(),
@@ -690,7 +817,7 @@ enum ClipboardHistorySmoke {
             )
             expect(
                 decoded.requiresPasteboardRestorationForTextInsertion,
-                "HTML archive must not flatten through plain insertion"
+                "HTML archive must require restoration for lossless copy"
             )
             let reconstructed = try decoded.makePasteboardItems()
             expect(
@@ -812,72 +939,19 @@ enum ClipboardHistorySmoke {
                 "plain-text activation classification"
             )
             expect(
+                ClipboardHistoryActivationRules.canInsertEveryItemAsPlainText(
+                    items: [directTextItem],
+                    archives: [decoded]
+                ),
+                "text activation should use canonical text despite rich archive"
+            )
+            expect(
                 !ClipboardHistoryActivationRules.canInsertEveryItemAsPlainText(
                     items: [directTextItem, richImageItem],
                     archives: [plainArchive, imageArchive]
                 ),
                 "mixed rich activation classification"
             )
-            let pasteMarker = ClipboardHistoryHostPasteRules.makeMarker()
-            let otherPasteMarker = ClipboardHistoryHostPasteRules.makeMarker()
-            expect(
-                ClipboardHistoryHostPasteRules.sequenceDecision(
-                    eventType: .keyDown,
-                    keyDownAccepted: false
-                ) == .passAndArmKeyDown,
-                "host paste sequence arms only its first keyDown"
-            )
-            expect(
-                ClipboardHistoryHostPasteRules.sequenceDecision(
-                    eventType: .keyUp,
-                    keyDownAccepted: false
-                ) == .consumeAndFinish,
-                "host paste sequence rejects a missing keyDown"
-            )
-            expect(
-                ClipboardHistoryHostPasteRules.sequenceDecision(
-                    eventType: .keyUp,
-                    keyDownAccepted: true
-                ) == .passAndFinish,
-                "host paste sequence completes an armed keyUp"
-            )
-            if let pasteEvents = ClipboardHistoryHostPasteRules.makeEventPair(
-                marker: pasteMarker
-            ),
-               let pasteDown = NSEvent(cgEvent: pasteEvents.keyDown),
-               let pasteUp = NSEvent(cgEvent: pasteEvents.keyUp) {
-                expect(
-                    ClipboardHistoryHostPasteRules.isTaggedPasteEvent(pasteDown),
-                    "tagged host paste keyDown"
-                )
-                expect(
-                    ClipboardHistoryHostPasteRules.isTaggedPasteEvent(pasteUp),
-                    "tagged host paste keyUp"
-                )
-                expect(
-                    ClipboardHistoryHostPasteRules.matches(
-                        pasteDown,
-                        marker: pasteMarker
-                    ),
-                    "tagged host paste nonce match"
-                )
-                expect(
-                    pasteMarker == otherPasteMarker
-                        || !ClipboardHistoryHostPasteRules.matches(
-                            pasteDown,
-                            marker: otherPasteMarker
-                        ),
-                    "tagged host paste nonce mismatch"
-                )
-                expect(
-                    pasteDown.keyCode == UInt16(kVK_ANSI_V)
-                        && pasteDown.modifierFlags.contains(.command),
-                    "host paste event shape"
-                )
-            } else {
-                expect(false, "host paste event construction")
-            }
-
             let record = ClipboardHistoryImportRecord(
                 kind: .text,
                 displayText: "durable fixture",
@@ -1174,15 +1248,59 @@ enum ClipboardHistorySmoke {
             return model.promote(ids: items.map(\.id))
         }
         guard let left = keyEvent(keyCode: 123),
-              let enter = keyEvent(keyCode: 36) else {
+              let enter = keyEvent(keyCode: UInt16(kVK_Return)),
+              let keypadEnter = keyEvent(keyCode: UInt16(kVK_ANSI_KeypadEnter)) else {
             expect(false, "navigation event creation")
             return
         }
+        expect(
+            !ClipboardHistoryWindowController.shouldRouteSearchCompositionEventToRime(
+                enter,
+                compositionActive: true
+            ),
+            "active search composition retained plain Return"
+        )
+        expect(
+            !ClipboardHistoryWindowController.shouldRouteSearchCompositionEventToRime(
+                keypadEnter,
+                compositionActive: true
+            ),
+            "active search composition retained keypad Enter"
+        )
+        expect(
+            ClipboardHistoryWindowController.shouldRouteSearchCompositionEventToRime(
+                left,
+                compositionActive: true
+            ),
+            "active search composition lost editing arrow"
+        )
+        expect(
+            !ClipboardHistoryWindowController.shouldRouteSearchCompositionEventToRime(
+                left,
+                compositionActive: false
+            ),
+            "inactive search composition claimed editing arrow"
+        )
         expect(pane.handleKeyDown(left), "left navigation not consumed")
         let expectedID = model.selectedID
         expect(pane.handleKeyDown(enter), "activation not consumed")
         expect(activatedID == expectedID, "activation returned wrong item")
         expect(model.items.first?.id == expectedID, "activation did not promote")
+
+        var rejectedActivationCount = 0
+        pane.onActivate = { _ in
+            rejectedActivationCount += 1
+            return false
+        }
+        expect(
+            pane.handleKeyDown(enter),
+            "failed activation leaked Return to the host"
+        )
+        expect(
+            pane.handleKeyDown(keypadEnter),
+            "failed activation leaked keypad Enter to the host"
+        )
+        expect(rejectedActivationCount == 2, "failed activation was not attempted")
 
         var copiedID: UUID?
         pane.onCopy = { items in
@@ -1252,6 +1370,18 @@ enum ClipboardHistorySmoke {
             ) == [UInt16(kVK_Tab)],
             "Tab callback ownership mapping"
         )
+        for selectorName in [
+            "insertNewline:", "insertLineBreak:",
+            "insertNewlineIgnoringFieldEditor:",
+            "insertParagraphSeparator:",
+        ] {
+            expect(
+                ClipboardHistoryWindowController.hardwareKeyCodes(
+                    for: NSSelectorFromString(selectorName)
+                ) == [UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter)],
+                "Return callback ownership mapping \(selectorName)"
+            )
+        }
         expect(pane.handleKeyDown(commandOne), "Command-1 was not consumed")
         expect(!pane.handleKeyDown(commandRight), "modified arrow was consumed")
 
@@ -1273,6 +1403,60 @@ enum ClipboardHistorySmoke {
         expect(
             pane.snapshotForSmoke().selectedCardCount == 2,
             "multi-selection rendering"
+        )
+
+        guard let doubleClickEvent = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 2,
+            pressure: 1
+        ) else {
+            expect(false, "double-click event creation")
+            return
+        }
+        let doubleClickContext = ClipboardHistoryCardActionContext(
+            event: doubleClickEvent
+        )
+        expect(doubleClickContext.clickCount == 2, "button double-click capture")
+        expect(
+            doubleClickContext.modifiers.contains(.command),
+            "button modifier capture"
+        )
+        expect(
+            ClipboardHistoryCardActionContext(
+                modifiers: [],
+                clickCount: 0
+            ).clickCount == 1,
+            "button click-count normalization"
+        )
+
+        var plainClickActivationCount = 0
+        pane.onActivate = { _ in
+            plainClickActivationCount += 1
+            return true
+        }
+        _ = model.select(id: multiIDs[0])
+        expect(
+            pane.handleCardInteraction(
+                itemID: multiIDs[1],
+                modifiers: [],
+                clickCount: 1
+            ),
+            "plain single-click selection"
+        )
+        expect(
+            model.selectedID == multiIDs[1]
+                && model.selectedIDs == Set([multiIDs[1]]),
+            "plain single-click selected the wrong item"
+        )
+        expect(
+            plainClickActivationCount == 0,
+            "plain single-click activated an item"
         )
 
         _ = model.select(id: multiIDs[0])

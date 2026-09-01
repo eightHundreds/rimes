@@ -449,6 +449,53 @@ func runSettingsRoutingSmokeTest() -> Bool {
     }
 
     do {
+        let own = StandaloneWindowFocusIdentity(
+            bundleID: "com.isaac.inputmethod.RimeBuffer",
+            processIdentifier: 900
+        )
+        let external = StandaloneWindowFocusIdentity(
+            bundleID: "com.example.Editor",
+            processIdentifier: 101
+        )
+        let shouldRestoreAfterClosingWindow: (Int) -> Bool = { remainingCount in
+            StandaloneWindowFocusReturnRules.shouldRestore(
+                closeCompleted: true,
+                remainingTrackedWindowCount: remainingCount,
+                frontmost: own,
+                own: own,
+                returnTarget: external,
+                returnTargetIsRunning: true,
+                returnTargetIdentityMatches: true,
+                hasOtherVisibleKeyCapableOwnWindow: false
+            )
+        }
+        guard SettingsWindowPresentationRules.allowsShow(
+                currentInputSourceIsOwn: true,
+                isStandaloneShowCommand: false
+              ),
+              !SettingsWindowPresentationRules.allowsShow(
+                currentInputSourceIsOwn: false,
+                isStandaloneShowCommand: false
+              ),
+              SettingsWindowPresentationRules.allowsShow(
+                currentInputSourceIsOwn: false,
+                isStandaloneShowCommand: true
+              ),
+              SettingsWindowPresentationRules.isStandaloneShowCommand(
+                arguments: ["ETInput", "settings-preview"]
+              ),
+              SettingsWindowPresentationRules.isStandaloneShowCommand(
+                arguments: ["ETInput", "theme-appkit-smoke"]
+              ),
+              !SettingsWindowPresentationRules.isStandaloneShowCommand(
+                arguments: ["ETInput"]
+              ),
+              !shouldRestoreAfterClosingWindow(2),
+              !shouldRestoreAfterClosingWindow(1),
+              shouldRestoreAfterClosingWindow(0) else {
+            return fail("input-source gate or shared focus-return lifecycle")
+        }
+
         let statistics = contribution(
             pluginID: "statistics",
             pageID: "statistics",

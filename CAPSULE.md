@@ -1,32 +1,92 @@
 # Capsule
 
-Capsule 是与 Buffer、Mailbox 同级的 RIMES 本机内容库。当前支持 `Prompt`、`Memory`、`Password` 与 `Skill` 四类条目，并在独立 Capsule 窗口中提供搜索和增删改查。Capsule 不属于 Buffer 插件目录，也不受 Buffer 插件启停或工作台生命周期控制。
+Capsule 是与 Buffer、Mailbox 同级的 RIMES 本机内容库。当前支持 `Prompt`、`Memory`、`Password`、`Skill`、`Note`、`URL`、`Image` 与 `PDF` 八类条目，并在独立 Capsule 窗口中提供搜索和增删改查。Capsule 不属于 Buffer 插件目录，也不受 Buffer 插件启停或工作台生命周期控制。
 
 ## 本机数据
 
 默认目录：
 
 ```text
-~/Library/RimeBuffer/capsule/
-├── content-seed-v1
-├── entries/
-│   └── <uuid>.md
-├── master-key
-└── passwords/
-    └── <uuid>.md
+~/Library/RimeBuffer/
+├── capsule/
+│   ├── content-seed-v1
+│   ├── content-library-v1.json
+│   ├── entries/
+│   │   └── <uuid>.md
+│   ├── assets/
+│   │   └── <sha256>.<ext>
+│   ├── conflicts/
+│   │   └── <uuid>/<timestamp>-<origin>-<uuid>.md
+│   ├── master-key
+│   └── passwords/
+│       └── <uuid>.md
+└── capsule-sync/
+    ├── config-v1.json
+    └── state-<library-id>.json
 ```
 
-- `entries/*.md` 是 Obsidian 可直接读取和编辑的普通 Markdown，front matter 保存 `capsule` 类型、版本、UUID、标题和更新时间，正文保存 Prompt/Memory 内容或 Skill 的绝对路径。
+- `entries/*.md` 是 Obsidian 可直接读取和编辑的普通 Markdown，front matter 保存 `capsule` 类型、版本、UUID、标题和更新时间。正文保存 Prompt/Memory/Note 内容、HTTP(S) URL，或 Skill/Image/PDF 的绝对路径。
+- 用户新建 Image/PDF 条目时，原始二进制仍位于用户管理的本机目录；从 iCloud 下载的媒体经 SHA-256 校验后按内容寻址 materialize 到 `capsule/assets/`。两者都不复制到仓库或应用包。编辑器只在选中条目后读取：图片通过 ImageIO 在后台生成最长边不超过 1600 px 的缩略图；PDF 通过 Core Graphics 在全局串行队列中只渲染第 1 页缩略图，并显示总页数，避免把整本大 PDF 交给输入法进程持续布局。迟到结果必须通过 generation、类型和路径复验后才能显示。
 - 首次初始化会加入一条 Memory：标题 `RIMES 默认词条`，正文 `RIMES`。`content-seed-v1` 保证只预设一次；用户删除后不会自动复活。
+- `content-library-v1.json` 保存本机 Capsule 库 UUID。选择 iCloud 文件夹后，`capsule-sync/config-v1.json` 保存该文件夹的本机书签与库 UUID，`state-<library-id>.json` 保存逐条 revision、tombstone 与本机媒体 fingerprint；这些文件不保存 Password 明文、密文或 `master-key`。未设置同步时，相应文件或目录可以不存在。
 - `passwords/*.md` 只暴露标题、UUID 和更新时间。网址、App、用户名、当前密码与曾用密码都位于 ChaCha20-Poly1305 密文块中。
-- Capsule 根目录和子目录权限为 `0700`，主密钥、seed marker 与 Markdown 文档为 `0600`。整个目录位于用户资料目录，不进入仓库。
+- `capsule/`、`capsule-sync/` 及其子目录权限为 `0700`，主密钥、marker、配置、状态、资产与 Markdown 文档为 `0600`。这些数据都位于用户资料目录，不进入仓库。
 - 当前开发版以同一 macOS 用户为信任边界；同用户权限下的恶意进程不在防护范围内。
+
+## iCloud Drive 自动同步
+
+Capsule 的本机目录始终是权威副本。用户在 Capsule 顶部选择一个真实的
+iCloud Drive 文件夹后，RIMES 会在后台维护独立的 `v1` 镜像；不会移动或
+软链接 `~/Library/RimeBuffer/capsule`，也不会把整个目录直接复制到云端。
+启动、窗口打开、本机条目变更、系统唤醒与低频定时检查都会触发一次逐条
+reconcile，用户也可以手动点击「立即同步」。关闭同步只停止自动任务并保留
+两端数据。
+
+云端镜像按 UUID 保存普通 Markdown，并为删除写 tombstone；同时编辑产生的
+败者版本进入 `conflicts/`，不会被静默覆盖。Image/PDF 会复制到按 SHA-256
+寻址的 `assets/`，另一台设备下载并校验后落入本机 Capsule 资产缓存，再把
+本机条目正文恢复为可预览的绝对路径。Skill 的正文是设备本地绝对路径；为
+避免把本机目录结构泄露到 iCloud，同时避免在另一台 Mac 制造不可用绑定，
+Skill 与 Password 一样只保留在本机，不进入镜像或同步状态。
+`v1` 的 tombstone 是永久删除事实；已经消费删除的设备发现云端 tombstone
+丢失或同步根被重建时会恢复它，避免长期离线设备把旧副本重新上传复活。
+
+本机 Image/PDF 路径暂时离线、未挂载或不可读，而该条本轮需要上传时，只有
+这个 UUID 进入 `deferred`；状态会显示等待本机媒体，其他条目继续同步。同步器
+不会把暂时不可用当作删除，不会为它写 tombstone，也不会用空内容覆盖云端。
+文件重新可读后，后续自动或手动同步会继续处理。
+
+如果离线媒体的本机版本在并发或 tombstone 收敛中成为败者，同步器会先把
+完整原始 Markdown 保存到私有 `capsule/conflicts/<uuid>/`，再覆盖或删除正式
+entry；云端冲突区只保存不含绝对路径的脱敏摘要。若 iCloud 媒体本身仍是未
+下载占位，这一个 UUID 会 deferred，其他文本与删除仍继续。已下载到
+`capsule/assets/` 的托管缓存若意外丢失，则会从仍有效的云端 asset 自动恢复；
+外部磁盘上的用户原文件离线时不会被擅自改写为缓存路径。
+
+删除 Image/PDF 条目时，同步层只删除对应 entry 并写 tombstone；不会删除用户
+管理的原始文件。为保证跨设备并发编辑、迟到设备和 `conflicts/` 的恢复安全，
+本版本也不会自动回收已经上传的内容寻址 asset，或 `capsule/assets/` 中已经
+materialize 的本机缓存，因此这些文件会继续留存。不要手工删除仍被有效 entry
+或冲突副本引用的 asset；自动垃圾回收需要先具备跨设备可证明的全局引用信息，
+不属于当前 `v1` 协议。
+
+Password 与 Skill 当前明确不参加 iCloud 同步。`passwords/`、裸 `master-key`
+和 Skill 的绝对路径均不进入同步扫描、状态文件、日志或云端目录；把前两者
+一起上传会失去现有密文边界，而上传 Skill 会暴露本机目录结构。
+未来只有在提供用户恢复短语包装密钥或正式签名的 iCloud Keychain 密钥传递后，
+才能安全开启跨设备密码解锁。Prompt、Memory、Note、URL、Image 与 PDF 六类
+普通条目可以同步。
+
+当前本地开发签名没有 iCloud container entitlement，因此实现采用用户选择的
+iCloud Drive 文件夹，不硬编码隐藏的 CloudDocs 路径。所选目录必须是普通、
+非符号链接、可写且被 macOS 标记为 ubiquitous 的目录；未登录或未启用 iCloud
+Drive 时，界面保持「iCloud Drive 不可用/未设置」，本机 CRUD 不受影响。
 
 ## 独立窗口
 
 - `⌘⇧C` 全局打开或关闭 Capsule；也可以从输入法菜单或「设置 → Capsule」进入。
-- 窗口按 `Prompt`、`Memory`、`Password`、`Skill` 分类搜索，并提供新增、查看、修改和删除。它是可输入的普通 AppKit 管理窗口，不是 Buffer，也不是上屏目标。
-- Prompt 与 Memory 编辑 Markdown 正文；Skill 保存本机文件或文件夹的绝对路径；Password 编辑网址、App、用户名、当前密码与曾用密码。
+- 窗口按八类内容搜索，并提供新增、查看、修改和删除。它是可输入的普通 AppKit 管理窗口，不是 Buffer，也不是上屏目标。
+- Prompt、Memory 与 Note 编辑 Markdown 正文；URL 保存完整 HTTP(S) 地址；Skill 保存本机文件或文件夹的绝对路径；Image/PDF 保存普通、非符号链接文件的绝对路径并提供内嵌预览；Password 编辑网址、App、用户名、当前密码与曾用密码。
 - Password 列表只显示标题与固定长度掩码；网址、App、用户名始终使用安全文本控件。当前密码与曾用密码可通过「查看明文」短时查看，15 秒后自动恢复掩码；窗口失焦、应用失活、锁屏/睡眠/会话退出，以及切换条目或类型、新建、保存、删除、重载和关闭都会立即隐藏。明文视图不可选择、不可复制，也不会写入日志、tooltip、辅助功能标签或 UserDefaults。
 - 未保存草稿在切换条目、类型、页面或关闭窗口前会要求确认；保存与删除携带已加载文件的 SHA-256 revision，并在 Store 文件锁内比较，另一窗口或 CLI 已更新时拒绝覆盖。直接在 Obsidian 修改普通 Markdown 后，旧窗口也必须重新载入才能保存。
 - 当前独立管理窗口只负责内容管理，不直接向外部输入框上屏。原先依附 Buffer workspace 的 Capsule 搜索、保护投递和并击拦截已经移除，因此 Capsule 不参与普通输入按键路径。后续若增加独立上屏，应采用 Capsule 自己的非激活快速面板和外部焦点授权协议，不能重新依附 Buffer，也不能退化为剪贴板或 Accessibility 注入。
@@ -63,8 +123,17 @@ printf '%s' '{
 }' | RimeBuffer capsule password put
 
 RimeBuffer capsule password list
+RimeBuffer capsule password audit
 RimeBuffer capsule password path
 RimeBuffer capsule password remove <uuid>
+```
+
+批量导入从标准输入读取 JSON 数组，并按完整记录在内存去重。读取已有记录、去重和写入处于 Store 的同一次跨进程文件锁内，因此两个导入进程同时运行也不会写出相同记录。输出只包含 aggregate 计数，不包含标题、正文或密码；中断后可安全重跑：
+
+```bash
+trusted-content-emitter | RimeBuffer capsule entry import
+trusted-password-emitter | RimeBuffer capsule password import
+RimeBuffer capsule entry audit-media
 ```
 
 更新条目时，在对应 `put` JSON 中加入已有 `id`。
@@ -74,6 +143,7 @@ RimeBuffer capsule password remove <uuid>
 ```bash
 .build/debug/RimeBuffer capsule-smoke
 .build/debug/RimeBuffer capsule-window-smoke
+.build/debug/RimeBuffer capsule-sync-smoke
 ```
 
-Smoke 使用临时目录和测试凭据，覆盖默认词条的一次性预设、普通 Markdown 往返、四类筛选、独立窗口 CRUD 与并发 revision 规则、目录/文件权限、密码明文边界、加解密、标题篡改拒绝和固定脱敏。测试不会读写用户真实 Capsule 目录。
+Smoke 使用临时目录和测试凭据，覆盖默认词条的一次性预设、八类 Markdown/密文往返、独立窗口 CRUD、真实 PNG/PDF 解码、缺失/符号链接媒体拒绝、URL 列表脱敏、并发 revision 规则、目录/文件权限、密码明文边界、加解密、标题篡改拒绝和固定脱敏。同步 smoke 以两个隔离的本机目录和一个 fake cloud root 模拟跨设备，验证媒体资产、离线媒体 deferred/recovery、共享与最终引用删除后的保守 asset/cache 留存、冲突、tombstone、幂等同步，以及 `master-key`/Password 永不进入镜像。测试不会读写用户真实 Capsule 或 iCloud 目录。

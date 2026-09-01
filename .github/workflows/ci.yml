@@ -274,6 +274,7 @@ jobs:
             mailbox-store-smoke
             mailbox-window-smoke
             capsule-window-smoke
+            capsule-sync-smoke
             plugin-smoke
             plugin-stream-smoke
             plugin-platform-smoke

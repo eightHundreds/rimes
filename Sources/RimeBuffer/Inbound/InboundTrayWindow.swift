@@ -57,6 +57,10 @@ final class MailboxWindowController: NSObject, NSWindowDelegate {
     }
 
     func show(selecting threadID: UUID? = nil) {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write("Mailbox open ignored; RIMES is not selected")
+            return
+        }
         if window == nil { build() }
         if let threadID, MailboxStore.shared.snapshot.thread(id: threadID) != nil {
             _ = MailboxStore.shared.selectThread(id: threadID)
@@ -65,6 +69,9 @@ final class MailboxWindowController: NSObject, NSWindowDelegate {
         }
         applyAppearance()
         contentController?.paneController.reloadFromStore()
+        if let window {
+            StandaloneWindowFocusCoordinator.shared.windowWillPresent(window)
+        }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async { [weak self] in
@@ -80,6 +87,9 @@ final class MailboxWindowController: NSObject, NSWindowDelegate {
         // Closing Mailbox is intentionally terminal for this window only. It
         // must not restore Buffer or reuse a stale host-focus token.
         InboundToast.shared.hide()
+        guard let closingWindow = notification.object as? NSWindow,
+              closingWindow === window else { return }
+        StandaloneWindowFocusCoordinator.shared.windowWillClose(closingWindow)
     }
 
     private func build() {
@@ -126,9 +136,94 @@ final class MailboxWindowController: NSObject, NSWindowDelegate {
 }
 
 func runMailboxWindowSmokeTest() -> Bool {
+    let own = StandaloneWindowFocusIdentity(
+        bundleID: "com.isaac.inputmethod.RimeBuffer",
+        processIdentifier: 900
+    )
+    let external = StandaloneWindowFocusIdentity(
+        bundleID: "com.example.Editor",
+        processIdentifier: 101
+    )
+    let sameBundleOtherProcess = StandaloneWindowFocusIdentity(
+        bundleID: own.bundleID,
+        processIdentifier: 901
+    )
+    let canRestore = StandaloneWindowFocusReturnRules.shouldRestore(
+        closeCompleted: true,
+        remainingTrackedWindowCount: 0,
+        frontmost: own,
+        own: own,
+        returnTarget: external,
+        returnTargetIsRunning: true,
+        returnTargetIdentityMatches: true,
+        hasOtherVisibleKeyCapableOwnWindow: false
+    )
     guard MailboxWindowVisibilityRules.action(isVisible: false) == .show,
-          MailboxWindowVisibilityRules.action(isVisible: true) == .close else {
-        fputs("mailbox-window-smoke: visibility toggle mismatch\n", stderr)
+          MailboxWindowVisibilityRules.action(isVisible: true) == .close,
+          StandaloneWindowFocusReturnRules.isExternalReturnTarget(
+            external,
+            own: own
+          ),
+          !StandaloneWindowFocusReturnRules.isExternalReturnTarget(
+            own,
+            own: own
+          ),
+          !StandaloneWindowFocusReturnRules.isExternalReturnTarget(
+            sameBundleOtherProcess,
+            own: own
+          ),
+          canRestore,
+          !StandaloneWindowFocusReturnRules.shouldRestore(
+            closeCompleted: false,
+            remainingTrackedWindowCount: 0,
+            frontmost: own,
+            own: own,
+            returnTarget: external,
+            returnTargetIsRunning: true,
+            returnTargetIdentityMatches: true,
+            hasOtherVisibleKeyCapableOwnWindow: false
+          ),
+          !StandaloneWindowFocusReturnRules.shouldRestore(
+            closeCompleted: true,
+            remainingTrackedWindowCount: 1,
+            frontmost: own,
+            own: own,
+            returnTarget: external,
+            returnTargetIsRunning: true,
+            returnTargetIdentityMatches: true,
+            hasOtherVisibleKeyCapableOwnWindow: false
+          ),
+          !StandaloneWindowFocusReturnRules.shouldRestore(
+            closeCompleted: true,
+            remainingTrackedWindowCount: 0,
+            frontmost: external,
+            own: own,
+            returnTarget: external,
+            returnTargetIsRunning: true,
+            returnTargetIdentityMatches: true,
+            hasOtherVisibleKeyCapableOwnWindow: false
+          ),
+          !StandaloneWindowFocusReturnRules.shouldRestore(
+            closeCompleted: true,
+            remainingTrackedWindowCount: 0,
+            frontmost: own,
+            own: own,
+            returnTarget: external,
+            returnTargetIsRunning: true,
+            returnTargetIdentityMatches: true,
+            hasOtherVisibleKeyCapableOwnWindow: true
+          ),
+          !StandaloneWindowFocusReturnRules.shouldRestore(
+            closeCompleted: true,
+            remainingTrackedWindowCount: 0,
+            frontmost: own,
+            own: own,
+            returnTarget: external,
+            returnTargetIsRunning: false,
+            returnTargetIdentityMatches: true,
+            hasOtherVisibleKeyCapableOwnWindow: false
+          ) else {
+        fputs("mailbox-window-smoke: lifecycle/focus-return mismatch\n", stderr)
         return false
     }
     print("mailbox-window-smoke: ok")

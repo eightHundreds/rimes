@@ -7,11 +7,41 @@ enum CapsulePasswordCLI {
         let updatedAt: String
     }
 
+    private struct PasswordImportSummary: Encodable {
+        let received: Int
+        let uniqueInput: Int
+        let inserted: Int
+        let skippedExisting: Int
+        let skippedInputDuplicates: Int
+    }
+
+    private struct PasswordAuditSummary: Encodable {
+        let records: Int
+        let decryptable: Int
+        let ok: Bool
+    }
+
     private struct ContentPublicSummary: Encodable {
         let id: String
         let type: String
         let title: String
         let updatedAt: String
+    }
+
+    private struct ContentImportSummary: Encodable {
+        let received: Int
+        let uniqueInput: Int
+        let inserted: Int
+        let skippedExisting: Int
+        let skippedInputDuplicates: Int
+    }
+
+    private struct MediaAuditSummary: Encodable {
+        let imageRecords: Int
+        let imagePreviews: Int
+        let pdfRecords: Int
+        let pdfPreviews: Int
+        let ok: Bool
     }
 
     static func handleIfRequested(arguments: [String]) -> Int32? {
@@ -67,6 +97,40 @@ enum CapsulePasswordCLI {
                     updatedAt: iso8601.string(from: saved.updatedAt)
                 ))
                 return 0
+            case "import":
+                guard tail.count == 1 else {
+                    writeError(
+                        "password import reads a JSON array from stdin; no password argv is accepted"
+                    )
+                    return 64
+                }
+                let data = try readBoundedStandardInput(
+                    maximum: CapsulePasswordStore.maximumImportBytes
+                )
+                guard !data.isEmpty,
+                      data.count <= CapsulePasswordStore.maximumImportBytes else {
+                    writeError("password import JSON is empty or too large")
+                    return 65
+                }
+                let requests = try JSONDecoder().decode(
+                    [CapsulePasswordWriteRequest].self,
+                    from: data
+                )
+                guard requests.count <= CapsulePasswordStore.maximumRecordCount,
+                      requests.allSatisfy({ $0.id == nil }) else {
+                    writeError("password import count is too large or contains record IDs")
+                    return 65
+                }
+
+                let result = try store.importUnique(requests)
+                writeJSON(PasswordImportSummary(
+                    received: result.received,
+                    uniqueInput: result.uniqueInput,
+                    inserted: result.inserted,
+                    skippedExisting: result.skippedExisting,
+                    skippedInputDuplicates: result.skippedInputDuplicates
+                ))
+                return 0
             case "list":
                 guard tail.count == 1 else { return 64 }
                 let summaries = try store.listSummaries().map {
@@ -78,6 +142,20 @@ enum CapsulePasswordCLI {
                 }
                 writeJSON(summaries)
                 return 0
+            case "audit":
+                guard tail.count == 1 else { return 64 }
+                let summaries = try store.listSummaries()
+                var decryptable = 0
+                for summary in summaries {
+                    _ = try store.record(id: summary.id)
+                    decryptable += 1
+                }
+                writeJSON(PasswordAuditSummary(
+                    records: summaries.count,
+                    decryptable: decryptable,
+                    ok: decryptable == summaries.count
+                ))
+                return decryptable == summaries.count ? 0 : 1
             case "remove":
                 guard tail.count == 2,
                       let id = UUID(uuidString: tail[1]) else {
@@ -121,12 +199,73 @@ enum CapsulePasswordCLI {
             let saved = try store.put(request)
             writeJSON(contentSummary(saved))
             return 0
+        case "import":
+            guard tail.count == 1 else {
+                writeError("entry import reads a JSON array from stdin")
+                return 64
+            }
+            let data = try readBoundedStandardInput(
+                maximum: CapsulePasswordStore.maximumImportBytes
+            )
+            guard !data.isEmpty,
+                  data.count <= CapsulePasswordStore.maximumImportBytes else {
+                writeError("entry import JSON is empty or too large")
+                return 65
+            }
+            let requests = try JSONDecoder().decode(
+                [CapsuleContentWriteRequest].self,
+                from: data
+            )
+            guard requests.count <= CapsuleContentStore.maximumRecordCount,
+                  requests.allSatisfy({ $0.id == nil }) else {
+                writeError("entry import count is too large or contains record IDs")
+                return 65
+            }
+            let result = try store.importUnique(requests)
+            writeJSON(ContentImportSummary(
+                received: result.received,
+                uniqueInput: result.uniqueInput,
+                inserted: result.inserted,
+                skippedExisting: result.skippedExisting,
+                skippedInputDuplicates: result.skippedInputDuplicates
+            ))
+            return 0
         case "list":
             guard tail.count == 1 else { return 64 }
             writeJSON(try store.listRecords().map {
                 contentSummary($0.summary)
             })
             return 0
+        case "audit-media":
+            guard tail.count == 1 else { return 64 }
+            let records = try store.listRecords()
+            let images = records.filter { $0.summary.type == .image }
+            let pdfs = records.filter { $0.summary.type == .pdf }
+            let imagePreviews = images.reduce(into: 0) { count, record in
+                if case .image = CapsuleMediaPreviewLoader.loadSynchronously(
+                    kind: .image,
+                    path: record.content
+                ) {
+                    count += 1
+                }
+            }
+            let pdfPreviews = pdfs.reduce(into: 0) { count, record in
+                if case .pdf = CapsuleMediaPreviewLoader.loadSynchronously(
+                    kind: .pdf,
+                    path: record.content
+                ) {
+                    count += 1
+                }
+            }
+            let ok = imagePreviews == images.count && pdfPreviews == pdfs.count
+            writeJSON(MediaAuditSummary(
+                imageRecords: images.count,
+                imagePreviews: imagePreviews,
+                pdfRecords: pdfs.count,
+                pdfPreviews: pdfPreviews,
+                ok: ok
+            ))
+            return ok ? 0 : 1
         case "remove":
             guard tail.count == 2,
                   let id = UUID(uuidString: tail[1]) else {
@@ -196,7 +335,7 @@ enum CapsulePasswordCLI {
 
     private static func writeUsage() {
         writeError(
-            "usage: RimeBuffer capsule password|entry put|list|remove|path|seed"
+            "usage: RimeBuffer capsule password put|import|list|audit|remove|path; entry put|import|list|audit-media|remove|path|seed"
         )
     }
 

@@ -629,6 +629,9 @@ if CommandLine.arguments.contains("mailbox-window-smoke") {
 if CommandLine.arguments.contains("capsule-window-smoke") {
     exit(runCapsuleWindowSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("capsule-sync-smoke") {
+    exit(runCapsuleCloudSyncSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("mailbox-toast-smoke") {
     exit(runMailboxToastSmokeTest() ? 0 : 1)
 }
@@ -921,6 +924,7 @@ let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] a
     ?? "RimeBuffer_1_Connection"
 
 NSApplication.shared.setActivationPolicy(.accessory)   // background app; panels can float above others
+CapsuleCloudSyncController.shared.start()
 
 // Held for the process lifetime so the IMK connection stays up.
 let imkServer = IMKServer(name: connectionName, bundleIdentifier: Bundle.main.bundleIdentifier)
@@ -933,7 +937,9 @@ if imkServer == nil {
 // A Carbon hot key is process-global and remains independent from IMK's normal
 // Command-key passthrough. Retain the controller for the entire server lifetime.
 let globalHotKeyController = GlobalHotKeyController.shared
-_ = globalHotKeyController.install()
+_ = globalHotKeyController.setRuntimeEnabledForInputSource(
+    RimeInputSourceAuthority.currentSourceIsOwn()
+)
 // Warm the engine so the first keystroke isn't slow / so failures surface early.
 _ = rimeEngine.start()
 
@@ -1016,23 +1022,41 @@ private enum InputSourceChangeDiagnosticRules {
         modifierFlags.contains(.control)
     }
 
-    static func isOwnInputSource(_ inputSourceID: String,
-                                 ownBundleID: String) -> Bool {
-        inputSourceID == ownBundleID
-            || inputSourceID.hasPrefix(ownBundleID + ".")
-    }
-
-    static func shouldCloseWorkbench(previousID: String?,
-                                     currentID: String,
-                                     ownBundleID: String) -> Bool {
-        previousID != currentID
-            && !isOwnInputSource(currentID, ownBundleID: ownBundleID)
-    }
 }
 
 // macOS 26 can omit deactivateServer when another process switches input
 // sources through TISSelectInputSource. The distributed TIS notification still
 // arrives, so finish the live controller before its client becomes stranded.
+private func retireRimeInputSourceAuthority(observedSourceID: String?) {
+    _ = globalHotKeyController.setRuntimeEnabledForInputSource(false)
+    ClipboardHistoryWindowController.shared
+        .inputSourceDidChangeAwayFromRIMES()
+    let sourceDescription = observedSourceID ?? "unavailable"
+    IMELog.write(
+        "non-RIMES input source observed -> \(sourceDescription); "
+            + "retiring IME authority and preserving utility windows"
+    )
+    if let lease = InputFocusCoordinator.shared.invalidateAll(
+        reason: "input source changed"
+    ) {
+        // The newly selected input method already owns the client. Clean only
+        // process-local Rime state and never call that retired IMK proxy.
+        lease.controller?.finalizeProtectedSession(
+            lease,
+            reason: "input source changed"
+        )
+        candidateWindow.hide(owner: lease.token)
+    } else {
+        candidateWindow.hideAll()
+    }
+    if let captureToken = BufferModel.shared.captureFocusToken,
+       !InputFocusCoordinator.shared.isCurrent(captureToken) {
+        BufferModel.shared.routeDirectPreservingContent(
+            reason: "input source changed"
+        )
+    }
+}
+
 var lastObservedInputSourceID: String? = {
     guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
         else { return nil }
@@ -1045,8 +1069,6 @@ let inputSourceChangedObserver = DistributedNotificationCenter.default().addObse
     object: nil,
     queue: .main
 ) { _ in
-    ClipboardHistoryWindowController.shared
-        .cancelPendingHostPasteForInputSourceChange()
     let now = ProcessInfo.processInfo.systemUptime
     let modifierFlags = NSEvent.modifierFlags
         .intersection(.deviceIndependentFlagsMask)
@@ -1064,32 +1086,25 @@ let inputSourceChangedObserver = DistributedNotificationCenter.default().addObse
         IMELog.write("TIS source changed: previous=\(previousID) current=unavailable deltaMs=\(elapsed) controlDown=\(controlDown) modifiers=\(modifierFlags.rawValue)")
         lastObservedInputSourceID = nil
         lastObservedInputSourceUptime = now
+        // TIS can briefly return no current source during a handoff. Fail
+        // closed immediately: keeping the old exclusive Carbon registrations
+        // would let ETInput observe shortcuts after another IME took over.
+        retireRimeInputSourceAuthority(observedSourceID: nil)
         return
     }
     let frontmostID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
     IMELog.write("TIS source changed: previous=\(previousID) current=\(currentID) deltaMs=\(elapsed) controlDown=\(controlDown) modifiers=\(modifierFlags.rawValue) frontmost=\(frontmostID)")
     let ownID = Bundle.main.bundleIdentifier ?? "com.isaac.inputmethod.RimeBuffer"
-    let currentIsOwn = InputSourceChangeDiagnosticRules.isOwnInputSource(
+    let currentIsOwn = RimeInputSourceAuthority.isOwnInputSourceID(
         currentID,
-        ownBundleID: ownID
-    )
-    let shouldCloseWorkbench = InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-        previousID: previousInputSourceID,
-        currentID: currentID,
         ownBundleID: ownID
     )
     lastObservedInputSourceID = currentID
     lastObservedInputSourceUptime = now
-    guard !currentIsOwn else { return }
-    IMELog.write("non-RIMES input source observed -> \(currentID); finalizing active controller closeWorkbench=\(shouldCloseWorkbench)")
-    if let lease = InputFocusCoordinator.shared.invalidateAll(reason: "input source changed") {
-        lease.controller?.finalizeDisplacedFocus(lease)
-        candidateWindow.hide(owner: lease.token)
+    if currentIsOwn {
+        _ = globalHotKeyController.setRuntimeEnabledForInputSource(true)
     } else {
-        candidateWindow.hideAll()
-    }
-    if shouldCloseWorkbench {
-        BufferWindowController.shared.closeAndPause()
+        retireRimeInputSourceAuthority(observedSourceID: currentID)
     }
 }
 
@@ -1112,6 +1127,11 @@ NSWorkspace.shared.notificationCenter.addObserver(
         to: activatedApplication
     ) {
         lease.controller?.finalizeDisplacedFocus(lease)
+        if BufferModel.shared.captureFocusToken == lease.token {
+            BufferModel.shared.routeDirectPreservingContent(
+                reason: "frontmost application changed"
+            )
+        }
         candidateWindow.hide(owner: lease.token)
     } else if InputFocusCoordinator.shared.owner == nil {
         candidateWindow.hideAll()
@@ -6177,39 +6197,20 @@ func runBufferWindowSmokeTest() -> Bool {
           ) == nil,
           InputSourceChangeDiagnosticRules.controlIsDown([.control, .shift]),
           !InputSourceChangeDiagnosticRules.controlIsDown([.option]),
-          !InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "com.isaac.inputmethod.RimeBuffer",
-            currentID: "com.isaac.inputmethod.RimeBuffer",
+          RimeInputSourceAuthority.isOwnInputSourceID(
+            "com.isaac.inputmethod.RimeBuffer",
             ownBundleID: "com.isaac.inputmethod.RimeBuffer"
           ),
-          !InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "com.isaac.inputmethod.RimeBuffer.Hans",
-            currentID: "com.isaac.inputmethod.RimeBuffer.Hans",
+          RimeInputSourceAuthority.isOwnInputSourceID(
+            "com.isaac.inputmethod.RimeBuffer.Hans",
             ownBundleID: "com.isaac.inputmethod.RimeBuffer"
           ),
-          InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "com.isaac.inputmethod.RimeBuffer.Hans",
-            currentID: "im.rime.inputmethod.Squirrel.Rime",
+          !RimeInputSourceAuthority.isOwnInputSourceID(
+            "im.rime.inputmethod.Squirrel.Hans",
             ownBundleID: "com.isaac.inputmethod.RimeBuffer"
           ),
-          !InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "im.rime.inputmethod.Squirrel.Rime",
-            currentID: "im.rime.inputmethod.Squirrel.Rime",
-            ownBundleID: "com.isaac.inputmethod.RimeBuffer"
-          ),
-          InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: nil,
-            currentID: "com.apple.keylayout.ABC",
-            ownBundleID: "com.isaac.inputmethod.RimeBuffer"
-          ),
-          InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "im.rime.inputmethod.Squirrel.Rime",
-            currentID: "com.apple.keylayout.ABC",
-            ownBundleID: "com.isaac.inputmethod.RimeBuffer"
-          ),
-          !InputSourceChangeDiagnosticRules.shouldCloseWorkbench(
-            previousID: "com.apple.keylayout.ABC",
-            currentID: "com.isaac.inputmethod.RimeBuffer.Hans",
+          !RimeInputSourceAuthority.isOwnInputSourceID(
+            "com.apple.keylayout.ABC",
             ownBundleID: "com.isaac.inputmethod.RimeBuffer"
           ) else {
         print("FAILED: input-source transition diagnostics")
@@ -7158,6 +7159,303 @@ func runBufferWindowSmokeTest() -> Bool {
         eventTimestamp: 20.04,
         shortcutUsesShift: true
     )
+    var primaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    let armedPrimaryKeyTombstone = primaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 40.05
+    )
+    let exactPrimaryKeyDown = primaryKeyTombstone.observeRegisteredKeyDown(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 40.05
+    )
+    let duplicatePrimaryKeyDown = primaryKeyTombstone.observeRegisteredKeyDown(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 40.05
+    )
+    let recordedPrimaryKeyRelease = primaryKeyTombstone.recordRelease(
+        action: .toggleClipboardHistory,
+        eventTimestamp: 40.10
+    )
+    let intervalPrimaryKeyUp = primaryKeyTombstone.evaluate(
+        eventType: .keyUp,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 40.10
+    )
+    let otherPrimaryKey = primaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_A),
+        eventTimestamp: 40.08
+    )
+    let nextPhysicalPrimaryKeyDown = primaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 40.11
+    )
+    var earlierPrimaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    _ = earlierPrimaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 50.0
+    )
+    let earlierPrimaryKeyEvent = earlierPrimaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 49.99
+    )
+    var provisionalPrimaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    _ = provisionalPrimaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 60.0
+    )
+    _ = provisionalPrimaryKeyTombstone.observeRegisteredKeyDown(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 60.0
+    )
+    let provisionalPrimaryKeyUp = provisionalPrimaryKeyTombstone.evaluate(
+        eventType: .keyUp,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 60.05
+    )
+    let duplicateWithinProvisionalInterval = provisionalPrimaryKeyTombstone
+        .evaluate(
+            eventType: .keyDown,
+            keyCode: UInt16(kVK_ANSI_V),
+            eventTimestamp: 60.01
+        )
+    let registeredClipboardDefinition = GlobalHotKeyDefinition(
+        action: .toggleClipboardHistory,
+        keyCode: UInt32(kVK_ANSI_V),
+        modifiers: UInt32(cmdKey | shiftKey)
+    )
+    let registeredClipboardMatch = GlobalHotKeyRouting.primaryKeyMatch(
+        definitions: [registeredClipboardDefinition],
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        modifierFlags: [.command, .shift]
+    )
+    let ordinaryVMatch = GlobalHotKeyRouting.primaryKeyMatch(
+        definitions: [registeredClipboardDefinition],
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        modifierFlags: []
+    )
+    let extraModifierVMatch = GlobalHotKeyRouting.primaryKeyMatch(
+        definitions: [registeredClipboardDefinition],
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        modifierFlags: [.command, .shift, .option]
+    )
+    let registeredClipboardKeyUpMatch = GlobalHotKeyRouting.primaryKeyMatch(
+        definitions: [registeredClipboardDefinition],
+        eventType: .keyUp,
+        keyCode: UInt16(kVK_ANSI_V),
+        modifierFlags: [.command, .shift]
+    )
+    guard let imkFirstDownIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyDown,
+            cgTimestamp: 70_000
+          ),
+          let imkFirstUpIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyUp,
+            cgTimestamp: 70_050
+          ),
+          let ordinaryVAfterIMKFirstIdentity =
+            GlobalHotKeyPrimaryKeyEventIdentity(
+                keyCode: UInt16(kVK_ANSI_V),
+                phase: .keyDown,
+                cgTimestamp: 70_060
+            ),
+          let carbonFirstDownIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyDown,
+            cgTimestamp: 80_000
+          ),
+          let carbonFirstUpIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyUp,
+            cgTimestamp: 80_050
+          ),
+          let ordinaryVAfterCarbonFirstIdentity =
+            GlobalHotKeyPrimaryKeyEventIdentity(
+                keyCode: UInt16(kVK_ANSI_V),
+                phase: .keyDown,
+                cgTimestamp: 80_060
+            ),
+          let strippedCarbonFirstIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyDown,
+            cgTimestamp: 85_000
+          ),
+          let ordinaryVAfterStrippedCarbonIdentity =
+            GlobalHotKeyPrimaryKeyEventIdentity(
+                keyCode: UInt16(kVK_ANSI_V),
+                phase: .keyDown,
+                cgTimestamp: 85_100
+            ),
+          let missingReleaseDownIdentity = GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: UInt16(kVK_ANSI_V),
+            phase: .keyDown,
+            cgTimestamp: 90_000
+          ),
+          let ordinaryVAfterMissingReleaseIdentity =
+            GlobalHotKeyPrimaryKeyEventIdentity(
+                keyCode: UInt16(kVK_ANSI_V),
+                phase: .keyDown,
+                cgTimestamp: 90_100
+            ) else {
+        print("FAILED: global hotkey primary-key event identities")
+        return false
+    }
+
+    // IMK-first: the exact live registration owns the key before Carbon has
+    // armed a tombstone. Carbon subsequently attaches its press/release, and
+    // the first ordinary V after release must pass and retire the record.
+    var imkFirstPrimaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    let imkFirstPrimaryKeyDown = imkFirstPrimaryKeyTombstone
+        .observeRegisteredKeyDown(
+            action: .toggleClipboardHistory,
+            route: .toggleClipboardHistory,
+            keyCode: UInt16(kVK_ANSI_V),
+            eventTimestamp: 7_000.0,
+            eventIdentity: imkFirstDownIdentity
+        )
+    let imkFirstCarbonPress = imkFirstPrimaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 70.0,
+        eventIdentity: imkFirstDownIdentity
+    )
+    let imkFirstCarbonRelease = imkFirstPrimaryKeyTombstone.recordRelease(
+        action: .toggleClipboardHistory,
+        eventTimestamp: 70.05,
+        eventIdentity: imkFirstUpIdentity
+    )
+    let imkFirstPrimaryKeyUp = imkFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyUp,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 7_000.05,
+        eventIdentity: imkFirstUpIdentity
+    )
+    let ordinaryVAfterIMKFirst = imkFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 70.0,
+        eventIdentity: ordinaryVAfterIMKFirstIdentity
+    )
+    let delayedIMKFirstDuplicate = imkFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 12_000.0,
+        eventIdentity: imkFirstDownIdentity
+    )
+
+    // Carbon-first: the framework-local floating clocks deliberately disagree,
+    // while the shared CG identity proves ownership. Missing release debt also
+    // retires on the next different physical keyDown.
+    var carbonFirstPrimaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    let carbonFirstPress = carbonFirstPrimaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 80.0,
+        eventIdentity: carbonFirstDownIdentity
+    )
+    let carbonFirstPrimaryKeyDown = carbonFirstPrimaryKeyTombstone
+        .observeRegisteredKeyDown(
+            action: .toggleClipboardHistory,
+            route: .toggleClipboardHistory,
+            keyCode: UInt16(kVK_ANSI_V),
+            eventTimestamp: 8_000.0,
+            eventIdentity: carbonFirstDownIdentity
+        )
+    let carbonFirstRelease = carbonFirstPrimaryKeyTombstone.recordRelease(
+        action: .toggleClipboardHistory,
+        eventTimestamp: 80.05,
+        eventIdentity: carbonFirstUpIdentity
+    )
+    let carbonFirstPrimaryKeyUp = carbonFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyUp,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 8_000.05,
+        eventIdentity: carbonFirstUpIdentity
+    )
+    let ordinaryVAfterCarbonFirst = carbonFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 80.0,
+        eventIdentity: ordinaryVAfterCarbonFirstIdentity
+    )
+    let delayedCarbonFirstDuplicate = carbonFirstPrimaryKeyTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 16_000.0,
+        eventIdentity: carbonFirstDownIdentity
+    )
+    // A Carbon-first callback whose modifiers were stripped bypasses the exact
+    // registration preflight, but the common CG identity still consumes it.
+    // Equal floating timestamps with a different CG identity must pass.
+    var strippedCarbonFirstTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    _ = strippedCarbonFirstTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 85.0,
+        eventIdentity: strippedCarbonFirstIdentity
+    )
+    let strippedCarbonFirstKeyDown = strippedCarbonFirstTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 8_500.0,
+        eventIdentity: strippedCarbonFirstIdentity
+    )
+    let ordinaryVAfterStrippedCarbon = strippedCarbonFirstTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 85.0,
+        eventIdentity: ordinaryVAfterStrippedCarbonIdentity
+    )
+    let delayedStrippedCarbonDuplicate = strippedCarbonFirstTombstone.evaluate(
+        eventType: .keyDown,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 17_000.0,
+        eventIdentity: strippedCarbonFirstIdentity
+    )
+    var missingReleasePrimaryKeyTombstone = GlobalHotKeyPrimaryKeyTombstone()
+    _ = missingReleasePrimaryKeyTombstone.record(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 90.0,
+        eventIdentity: missingReleaseDownIdentity
+    )
+    _ = missingReleasePrimaryKeyTombstone.observeRegisteredKeyDown(
+        action: .toggleClipboardHistory,
+        route: .toggleClipboardHistory,
+        keyCode: UInt16(kVK_ANSI_V),
+        eventTimestamp: 9_000.0,
+        eventIdentity: missingReleaseDownIdentity
+    )
+    let ordinaryVAfterMissingRelease = missingReleasePrimaryKeyTombstone
+        .evaluate(
+            eventType: .keyDown,
+            keyCode: UInt16(kVK_ANSI_V),
+            eventTimestamp: 90.0,
+            eventIdentity: ordinaryVAfterMissingReleaseIdentity
+        )
     guard ShiftModifierGesture.standaloneTapLimit == 0.5,
           shortShiftTap.releaseDecision(
             at: 10.499,
@@ -7207,6 +7505,52 @@ func runBufferWindowSmokeTest() -> Bool {
           !rejectedOlderTombstone,
           monotonicTombstone.hotKeyAt == 20.05,
           monotonicTombstone.route == .toggleWorkbench,
+          armedPrimaryKeyTombstone,
+          exactPrimaryKeyDown.disposition == .consume,
+          exactPrimaryKeyDown.deltaMicroseconds == 0,
+          duplicatePrimaryKeyDown.disposition == .consume,
+          recordedPrimaryKeyRelease,
+          intervalPrimaryKeyUp.disposition == .consume,
+          otherPrimaryKey.disposition == .passThrough,
+          nextPhysicalPrimaryKeyDown.disposition == .passThrough,
+          primaryKeyTombstone.keyCode == nil,
+          earlierPrimaryKeyEvent.disposition == .passThrough,
+          earlierPrimaryKeyEvent.deltaMicroseconds == nil,
+          earlierPrimaryKeyTombstone.keyCode == nil,
+          provisionalPrimaryKeyUp.disposition == .consume,
+          duplicateWithinProvisionalInterval.disposition == .consume,
+          provisionalPrimaryKeyTombstone.imkReleasedAtMicroseconds
+            == 60_050_000,
+          registeredClipboardMatch == GlobalHotKeyPrimaryKeyMatch(
+            action: .toggleClipboardHistory,
+            route: .toggleClipboardHistory,
+            keyCode: UInt16(kVK_ANSI_V)
+          ),
+          ordinaryVMatch == nil,
+          extraModifierVMatch == nil,
+          registeredClipboardKeyUpMatch == nil,
+          imkFirstPrimaryKeyDown.disposition == .consume,
+          imkFirstPrimaryKeyDown.deltaMicroseconds == 0,
+          imkFirstCarbonPress,
+          imkFirstCarbonRelease,
+          imkFirstPrimaryKeyUp.disposition == .consume,
+          ordinaryVAfterIMKFirst.disposition == .passThrough,
+          imkFirstPrimaryKeyTombstone.keyCode == nil,
+          delayedIMKFirstDuplicate.disposition == .consume,
+          carbonFirstPress,
+          carbonFirstPrimaryKeyDown.disposition == .consume,
+          carbonFirstPrimaryKeyDown.deltaMicroseconds == 0,
+          carbonFirstRelease,
+          carbonFirstPrimaryKeyUp.disposition == .consume,
+          ordinaryVAfterCarbonFirst.disposition == .passThrough,
+          carbonFirstPrimaryKeyTombstone.keyCode == nil,
+          delayedCarbonFirstDuplicate.disposition == .consume,
+          strippedCarbonFirstKeyDown.disposition == .consume,
+          ordinaryVAfterStrippedCarbon.disposition == .passThrough,
+          strippedCarbonFirstTombstone.keyCode == nil,
+          delayedStrippedCarbonDuplicate.disposition == .consume,
+          ordinaryVAfterMissingRelease.disposition == .passThrough,
+          missingReleasePrimaryKeyTombstone.keyCode == nil,
           usedShift.releaseDecision(
             at: 10.1,
             currentSession: 8,

@@ -19,7 +19,10 @@ func runCapsuleWindowSmokeTest() -> Bool {
 
     do {
         _ = NSApplication.shared
-        let pane = CapsulePaneViewController(repository: repository)
+        let pane = CapsulePaneViewController(
+            repository: repository,
+            cloudSyncController: nil
+        )
         guard pane.validatesEntryRowPointerForSmoke() else {
             return capsuleWindowSmokeFail("entry-row pointing-hand policy")
         }
@@ -83,6 +86,12 @@ func runCapsuleWindowSmokeTest() -> Bool {
               ),
               CapsuleWindowSelectionRules.allowsAutomaticFirstSelection(
                 kind: .prompt
+              ),
+              !StandaloneWindowFocusReturnRules.closeHasCompleted(
+                windowIsVisible: true
+              ),
+              StandaloneWindowFocusReturnRules.closeHasCompleted(
+                windowIsVisible: false
               ) else {
             return capsuleWindowSmokeFail("visibility toggle contract")
         }
@@ -110,6 +119,49 @@ func runCapsuleWindowSmokeTest() -> Bool {
         skill.content = skillDirectory.path
         let skillRow = try repository.save(skill)
 
+        var note = CapsuleWindowDraft.empty(kind: .note)
+        note.title = "Smoke Note"
+        note.content = "# Local note\n\nOne Markdown file is one Capsule item."
+        let noteRow = try repository.save(note)
+
+        var webURL = CapsuleWindowDraft.empty(kind: .url)
+        webURL.title = "Smoke URL"
+        webURL.content = "https://example.invalid/private/path?token=never-list#anchor"
+        let urlRow = try repository.save(webURL)
+
+        let imageURL = root.appendingPathComponent("fixture-image.png")
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 16,
+            pixelsHigh: 16,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ),
+        let imageData = bitmap.representation(using: .png, properties: [:]) else {
+            return capsuleWindowSmokeFail("image fixture creation")
+        }
+        try imageData.write(to: imageURL, options: .atomic)
+
+        let pdfURL = root.appendingPathComponent("fixture-document.pdf")
+        let pdfFixture = NSView(frame: NSRect(x: 0, y: 0, width: 72, height: 72))
+        let pdfData = pdfFixture.dataWithPDF(inside: pdfFixture.bounds)
+        try pdfData.write(to: pdfURL, options: .atomic)
+
+        var image = CapsuleWindowDraft.empty(kind: .image)
+        image.title = "Smoke Image"
+        image.content = imageURL.path
+        let imageRow = try repository.save(image)
+
+        var pdf = CapsuleWindowDraft.empty(kind: .pdf)
+        pdf.title = "Smoke PDF"
+        pdf.content = pdfURL.path
+        let pdfRow = try repository.save(pdf)
+
         var password = CapsuleWindowDraft.empty(kind: .password)
         password.title = "Smoke Password"
         password.url = "https://credential.invalid/login"
@@ -122,11 +174,80 @@ func runCapsuleWindowSmokeTest() -> Bool {
         guard promptRow.kind == .prompt,
               memoryRow.kind == .memory,
               skillRow.kind == .skill,
+              noteRow.kind == .note,
+              urlRow.kind == .url,
+              imageRow.kind == .image,
+              pdfRow.kind == .pdf,
               passwordRow.kind == .password,
               try repository.list(kind: .prompt).map(\.id) == [promptRow.id],
               try repository.list(kind: .skill).map(\.id) == [skillRow.id],
+              try repository.list(kind: .note).map(\.id) == [noteRow.id],
+              try repository.list(kind: .url).map(\.id) == [urlRow.id],
+              try repository.list(kind: .image).map(\.id) == [imageRow.id],
+              try repository.list(kind: .pdf).map(\.id) == [pdfRow.id],
               try repository.list(kind: .password).map(\.id) == [passwordRow.id] else {
             return capsuleWindowSmokeFail("create/list routing")
+        }
+
+        guard urlRow.preview == "example.invalid/private/path",
+              !urlRow.accessibilitySummary.contains("token="),
+              imageRow.preview == "Image · fixture-image.png",
+              pdfRow.preview == "PDF · fixture-document.pdf" else {
+            return capsuleWindowSmokeFail("safe URL/media list projection")
+        }
+        guard case .image = CapsuleMediaPreviewLoader.loadSynchronously(
+            kind: .image,
+            path: imageURL.path
+        ), case .pdf = CapsuleMediaPreviewLoader.loadSynchronously(
+            kind: .pdf,
+            path: pdfURL.path
+        ) else {
+            return capsuleWindowSmokeFail("real image/PDF preview decode")
+        }
+        let previewQueue = OperationQueue()
+        previewQueue.isSuspended = true
+        let previewLoader = CapsuleMediaPreviewLoader(queue: previewQueue)
+        var asyncPreviewKinds: [CapsuleEntryKind] = []
+        let imageOperation = previewLoader.load(
+            kind: .image,
+            path: imageURL.path
+        ) { result in
+            if case .image = result { asyncPreviewKinds.append(.image) }
+        }
+        let pdfOperation = previewLoader.load(
+            kind: .pdf,
+            path: pdfURL.path
+        ) { result in
+            if case .pdf = result { asyncPreviewKinds.append(.pdf) }
+        }
+        previewQueue.isSuspended = false
+        let previewDeadline = Date().addingTimeInterval(5)
+        while asyncPreviewKinds.count < 2, Date() < previewDeadline {
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: Date().addingTimeInterval(0.01)
+            )
+        }
+        guard !imageOperation.isCancelled,
+              !pdfOperation.isCancelled,
+              Set(asyncPreviewKinds) == Set([.image, .pdf]) else {
+            return capsuleWindowSmokeFail(
+                "independent panes must not cancel each other's media preview"
+            )
+        }
+        let linkedImageURL = root.appendingPathComponent("linked-image.png")
+        try FileManager.default.createSymbolicLink(
+            at: linkedImageURL,
+            withDestinationURL: imageURL
+        )
+        guard case .unavailable = CapsuleMediaPreviewLoader.loadSynchronously(
+            kind: .image,
+            path: linkedImageURL.path
+        ), case .unavailable = CapsuleMediaPreviewLoader.loadSynchronously(
+            kind: .pdf,
+            path: root.appendingPathComponent("missing.pdf").path
+        ) else {
+            return capsuleWindowSmokeFail("unsafe/missing media preview rejection")
         }
 
         guard passwordRow.preview == "••••••••",
@@ -322,6 +443,36 @@ func runCapsuleWindowSmokeTest() -> Bool {
             // Expected: the manager validates before calling the store.
         }
 
+        var invalidURL = CapsuleWindowDraft.empty(kind: .url)
+        invalidURL.title = "Invalid URL"
+        invalidURL.content = "javascript:alert(1)"
+        do {
+            _ = try repository.save(invalidURL)
+            return capsuleWindowSmokeFail("unsafe URL accepted")
+        } catch CapsuleWindowDraftError.invalidURL {
+            // Expected.
+        }
+
+        var missingImage = CapsuleWindowDraft.empty(kind: .image)
+        missingImage.title = "Missing Image"
+        missingImage.content = root.appendingPathComponent("missing.png").path
+        do {
+            _ = try repository.save(missingImage)
+            return capsuleWindowSmokeFail("missing image accepted")
+        } catch CapsuleWindowDraftError.unavailableAsset {
+            // Expected.
+        }
+
+        var wrongPDF = CapsuleWindowDraft.empty(kind: .pdf)
+        wrongPDF.title = "Wrong PDF"
+        wrongPDF.content = imageURL.path
+        do {
+            _ = try repository.save(wrongPDF)
+            return capsuleWindowSmokeFail("wrong PDF extension accepted")
+        } catch CapsuleWindowDraftError.unsupportedAssetType {
+            // Expected.
+        }
+
         var emptyPassword = CapsuleWindowDraft.empty(kind: .password)
         emptyPassword.title = "Invalid Password"
         do {
@@ -343,12 +494,20 @@ func runCapsuleWindowSmokeTest() -> Bool {
             updatedSkill,
             expectedRevision: updatedSkill.revision
         )
+        try repository.remove(noteRow, expectedRevision: noteRow.revision)
+        try repository.remove(urlRow, expectedRevision: urlRow.revision)
+        try repository.remove(imageRow, expectedRevision: imageRow.revision)
+        try repository.remove(pdfRow, expectedRevision: pdfRow.revision)
         try repository.remove(
             updatedPassword,
             expectedRevision: updatedPassword.revision
         )
         guard try repository.list(kind: .prompt).isEmpty,
               try repository.list(kind: .skill).isEmpty,
+              try repository.list(kind: .note).isEmpty,
+              try repository.list(kind: .url).isEmpty,
+              try repository.list(kind: .image).isEmpty,
+              try repository.list(kind: .pdf).isEmpty,
               try repository.list(kind: .password).isEmpty,
               try repository.list(kind: .memory, query: "Smoke Memory").isEmpty else {
             return capsuleWindowSmokeFail("delete routing")
@@ -368,7 +527,12 @@ private func capsuleWindowSmokeFail(_ message: String) -> Bool {
 
 private func capsulePointingHandControlsAreValid(in root: NSView) -> Bool {
     let controls = capsuleDescendants(in: root)
-    let buttons = controls.compactMap { $0 as? NSButton }
+    // AppKit owns the private search/clear buttons nested inside
+    // NSSearchField. Their concrete classes vary by macOS release and should
+    // keep the system cursor policy; this assertion covers only our controls.
+    let buttons = controls.compactMap { $0 as? NSButton }.filter {
+        !capsuleIsInsideSearchField($0)
+    }
     let segmentedControls = controls.compactMap { $0 as? NSSegmentedControl }
     let popUpButtons = controls.compactMap { $0 as? NSPopUpButton }
     return !buttons.isEmpty
@@ -383,6 +547,15 @@ private func capsulePointingHandControlsAreValid(in root: NSView) -> Bool {
         && popUpButtons.allSatisfy {
             $0 is RimeFixedAccentPopUpButton
         }
+}
+
+private func capsuleIsInsideSearchField(_ view: NSView) -> Bool {
+    var ancestor = view.superview
+    while let current = ancestor {
+        if current is NSSearchField { return true }
+        ancestor = current.superview
+    }
+    return false
 }
 
 private func capsuleDescendants(in root: NSView) -> [NSView] {

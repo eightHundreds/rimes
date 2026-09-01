@@ -61,6 +61,8 @@ reset_rime_user_dir_preserving_product_state() {
         ! -name stats \
         ! -name learning \
         ! -name my-prompt \
+        ! -name capsule \
+        ! -name capsule-sync \
         ! -name gateway-token \
         ! -name marine-chrome-token \
         ! -name marine-chrome-origin \
@@ -119,6 +121,8 @@ import_rime_user_dir_preserving_product_state() {
         --exclude stats
         --exclude learning
         --exclude my-prompt
+        --exclude capsule
+        --exclude capsule-sync
         --exclude gateway-token
         --exclude marine-chrome-token
         --exclude marine-chrome-origin

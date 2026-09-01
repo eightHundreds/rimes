@@ -19,6 +19,12 @@ EXPECTED_PLUGIN_CONFIG="$TEST_STATE_ROOT/expected-remarkable-credentials.json"
 EXPECTED_PROMPT="$TEST_STATE_ROOT/expected-prompt.md"
 EXPECTED_PROMPT_INDEX="$TEST_STATE_ROOT/expected-prompt-index.sqlite"
 EXPECTED_MARINE_DIR="$TEST_STATE_ROOT/expected-marine-chrome"
+EXPECTED_CAPSULE_DIR="$TEST_STATE_ROOT/expected-capsule"
+EXPECTED_CAPSULE_SYNC_DIR="$TEST_STATE_ROOT/expected-capsule-sync"
+CAPSULE_ENTRY_ID='11111111-1111-4111-8111-111111111111'
+CAPSULE_PASSWORD_ID='22222222-2222-4222-8222-222222222222'
+CAPSULE_LIBRARY_ID='33333333-3333-4333-8333-333333333333'
+CAPSULE_SYNC_CONFIG='config-v1.json'
 MARINE_STATE_FILES=(
     marine-chrome-token
     marine-chrome-origin
@@ -31,6 +37,8 @@ mkdir -p "$PROFILE_DIR/ai" "$PROFILE_DIR/plugins" "$PROFILE_DIR/preset-plugins" 
          "$PROFILE_DIR/plugin-config/builtin.remarkable" "$IMPORT_DIR/ai" \
          "$IMPORT_DIR/plugins" "$IMPORT_DIR/preset-plugins" "$IMPORT_DIR/stats" "$IMPORT_DIR/learning" \
          "$IMPORT_DIR/my-prompt" "$IMPORT_DIR/plugin-config/builtin.remarkable" \
+         "$PROFILE_DIR/capsule/entries" "$PROFILE_DIR/capsule/passwords" \
+         "$PROFILE_DIR/capsule/assets" "$PROFILE_DIR/capsule-sync" \
          "$EXPECTED_MARINE_DIR"
 
 # This is an inert fixture, never a credential read from the developer's
@@ -66,6 +74,63 @@ for state_file in "${MARINE_STATE_FILES[@]}"; do
     cp "$EXPECTED_MARINE_DIR/$state_file" "$PROFILE_DIR/$state_file"
     chmod 0600 "$PROFILE_DIR/$state_file"
 done
+
+# Capsule and its sync controller live beside Rime schema data in the same
+# profile, but they are product state. Keep an independent expected tree
+# so both import and reset must preserve every byte and reject a same-named tree
+# from the Squirrel import source.
+cat > "$PROFILE_DIR/capsule/entries/$CAPSULE_ENTRY_ID.md" <<EOF
+---
+capsule: note
+version: 1
+id: "$CAPSULE_ENTRY_ID"
+title: "Fixture note"
+updated_at: "2026-09-01T00:00:00.000Z"
+---
+
+Capsule entry bytes must survive reseeding.
+EOF
+cat > "$PROFILE_DIR/capsule/passwords/$CAPSULE_PASSWORD_ID.md" <<EOF
+---
+capsule: password
+version: 1
+id: "$CAPSULE_PASSWORD_ID"
+title: "Fixture password"
+updated_at: "2026-09-01T00:00:00.000Z"
+---
+
+\`\`\`capsule-password
+dGVzdC1vbmx5LWNpcGhlcnRleHQ=
+\`\`\`
+EOF
+printf '0123456789abcdef0123456789abcdef' \
+    > "$PROFILE_DIR/capsule/master-key"
+printf '%s\n' 'seeded' > "$PROFILE_DIR/capsule/content-seed-v1"
+printf '%s\n' \
+    "{\"version\":1,\"libraryID\":\"$CAPSULE_LIBRARY_ID\"}" \
+    > "$PROFILE_DIR/capsule/content-library-v1.json"
+printf '%s' 'fixture-image-bytes' \
+    > "$PROFILE_DIR/capsule/assets/fixture.png"
+printf '%s\n' \
+    "{\"version\":1,\"enabled\":true,\"libraryID\":\"$CAPSULE_LIBRARY_ID\",\"folderPath\":\"/fixture/iCloud\",\"bookmark\":\"dGVzdA==\"}" \
+    > "$PROFILE_DIR/capsule-sync/$CAPSULE_SYNC_CONFIG"
+printf '%s\n' \
+    "{\"version\":1,\"libraryID\":\"$CAPSULE_LIBRARY_ID\",\"entries\":{}}" \
+    > "$PROFILE_DIR/capsule-sync/state-$CAPSULE_LIBRARY_ID.json"
+chmod 0700 "$PROFILE_DIR/capsule" "$PROFILE_DIR/capsule/entries" \
+    "$PROFILE_DIR/capsule/passwords" "$PROFILE_DIR/capsule/assets" \
+    "$PROFILE_DIR/capsule-sync"
+chmod 0600 "$PROFILE_DIR/capsule/entries/$CAPSULE_ENTRY_ID.md" \
+    "$PROFILE_DIR/capsule/passwords/$CAPSULE_PASSWORD_ID.md" \
+    "$PROFILE_DIR/capsule/master-key" \
+    "$PROFILE_DIR/capsule/content-seed-v1" \
+    "$PROFILE_DIR/capsule/content-library-v1.json" \
+    "$PROFILE_DIR/capsule/assets/fixture.png" \
+    "$PROFILE_DIR/capsule-sync/$CAPSULE_SYNC_CONFIG" \
+    "$PROFILE_DIR/capsule-sync/state-$CAPSULE_LIBRARY_ID.json"
+cp -R "$PROFILE_DIR/capsule" "$EXPECTED_CAPSULE_DIR"
+cp -R "$PROFILE_DIR/capsule-sync" "$EXPECTED_CAPSULE_SYNC_DIR"
+
 printf '%s\n' 'discard-me' > "$PROFILE_DIR/build/cache"
 printf '%s\n' 'discard-me' > "$PROFILE_DIR/installation.yaml"
 printf '%s\n' 'discard-me' > "$PROFILE_DIR/old.schema.yaml"
@@ -91,6 +156,24 @@ printf '%s\n' 'must-not-replace-identity' > "$IMPORT_DIR/remote_identity.key"
 for state_file in "${MARINE_STATE_FILES[@]}"; do
     printf 'must-not-replace-%s\n' "$state_file" > "$IMPORT_DIR/$state_file"
 done
+mkdir -p "$IMPORT_DIR/capsule/entries" "$IMPORT_DIR/capsule/passwords" \
+    "$IMPORT_DIR/capsule-sync"
+printf '%s\n' 'must-not-replace-capsule-entry' \
+    > "$IMPORT_DIR/capsule/entries/$CAPSULE_ENTRY_ID.md"
+printf '%s\n' 'must-not-replace-password-document' \
+    > "$IMPORT_DIR/capsule/passwords/$CAPSULE_PASSWORD_ID.md"
+printf '%s\n' 'must-not-replace-master-key' \
+    > "$IMPORT_DIR/capsule/master-key"
+printf '%s\n' 'must-not-replace-content-library-marker' \
+    > "$IMPORT_DIR/capsule/content-library-v1.json"
+printf '%s\n' 'must-not-add-capsule-file' \
+    > "$IMPORT_DIR/capsule/import-only.md"
+printf '%s\n' 'must-not-replace-sync-config' \
+    > "$IMPORT_DIR/capsule-sync/$CAPSULE_SYNC_CONFIG"
+printf '%s\n' 'must-not-replace-sync-state' \
+    > "$IMPORT_DIR/capsule-sync/state-$CAPSULE_LIBRARY_ID.json"
+printf '%s\n' 'must-not-add-sync-file' \
+    > "$IMPORT_DIR/capsule-sync/import-only.json"
 printf '%s\n' 'new-schema' > "$IMPORT_DIR/default.yaml"
 
 mode_of() {
@@ -106,6 +189,22 @@ assert_marine_chrome_state_preserved() {
         cmp -s "$EXPECTED_MARINE_DIR/$state_file" "$PROFILE_DIR/$state_file"
         test "$(mode_of "$PROFILE_DIR/$state_file")" = '600'
     done
+}
+
+assert_capsule_state_preserved() {
+    diff -r "$EXPECTED_CAPSULE_DIR" "$PROFILE_DIR/capsule"
+    diff -r "$EXPECTED_CAPSULE_SYNC_DIR" "$PROFILE_DIR/capsule-sync"
+    test "$(mode_of "$PROFILE_DIR/capsule")" = '700'
+    test "$(mode_of "$PROFILE_DIR/capsule/entries/$CAPSULE_ENTRY_ID.md")" = '600'
+    test "$(mode_of "$PROFILE_DIR/capsule/passwords/$CAPSULE_PASSWORD_ID.md")" = '600'
+    test "$(mode_of "$PROFILE_DIR/capsule/master-key")" = '600'
+    test "$(mode_of "$PROFILE_DIR/capsule/content-library-v1.json")" = '600'
+    test "$(mode_of "$PROFILE_DIR/capsule-sync")" = '700'
+    test "$(mode_of "$PROFILE_DIR/capsule-sync/$CAPSULE_SYNC_CONFIG")" = '600'
+    test "$(mode_of "$PROFILE_DIR/capsule-sync/state-$CAPSULE_LIBRARY_ID.json")" = '600'
+    test "$(wc -c < "$PROFILE_DIR/capsule/master-key" | tr -d ' ')" = '32'
+    test ! -e "$PROFILE_DIR/capsule/import-only.md"
+    test ! -e "$PROFILE_DIR/capsule-sync/import-only.json"
 }
 
 CONFIG_MODE_BEFORE="$(mode_of "$PROFILE_DIR/ai/openai-compatible.json")"
@@ -138,6 +237,7 @@ cmp -s "$EXPECTED_PROMPT_INDEX" "$PROFILE_DIR/my-prompt/prompts.sqlite"
 test "$(cat "$PROFILE_DIR/gateway-token")" = 'gateway-state'
 test "$(cat "$PROFILE_DIR/remote_identity.key")" = 'identity-state'
 assert_marine_chrome_state_preserved
+assert_capsule_state_preserved
 test "$(cat "$PROFILE_DIR/default.yaml")" = 'new-schema'
 test ! -e "$PROFILE_DIR/build"
 test ! -e "$PROFILE_DIR/installation.yaml"
@@ -164,6 +264,7 @@ test "$(mode_of "$PROFILE_DIR/plugin-config/builtin.remarkable")" = \
 test "$(cat "$PROFILE_DIR/plugins/marker")" = 'installed-plugin'
 test "$(cat "$PROFILE_DIR/preset-plugins/marker")" = 'installed-preset-plugin'
 assert_marine_chrome_state_preserved
+assert_capsule_state_preserved
 test ! -e "$PROFILE_DIR/build"
 test ! -e "$PROFILE_DIR/default.yaml"
 
@@ -180,4 +281,4 @@ grep -Fq 'source scripts/lib/rime-user-state.sh' build_install.sh
 grep -Fq 'import_rime_user_dir_preserving_product_state "$HOME/Library/Rime" "$RB_USER"' build_install.sh
 grep -Fq 'reset_rime_user_dir_preserving_product_state "$RB_USER"' build_install.sh
 
-echo 'rime-user-state: durable config preserved across import and reset'
+echo 'rime-user-state: durable config and Capsule state preserved across import and reset'

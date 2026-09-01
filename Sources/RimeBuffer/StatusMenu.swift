@@ -237,8 +237,10 @@ final class StatusMenu {
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")
         alert.window.appearance = RimeUI.appKitAppearance
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert) == .alertFirstButtonReturn else {
+            return
+        }
 
         RimeBufferController.active?.forceCommit()
         InputMetricsPersistence.saveNow()
@@ -284,7 +286,7 @@ final class StatusMenu {
         let alert = NSAlert()
         alert.messageText = message
         alert.window.appearance = RimeUI.appKitAppearance
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        _ = StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert)
     }
 }

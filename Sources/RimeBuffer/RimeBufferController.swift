@@ -528,6 +528,450 @@ struct GlobalHotKeyShiftTombstone: Equatable {
     }
 }
 
+/// Identity shared by the Carbon and NSEvent wrappers of one physical key
+/// event. `CGEvent.timestamp` is an integer token from the underlying event;
+/// unlike `GetEventTime` and `NSEvent.timestamp`, it does not require comparing
+/// floating-point values obtained through two framework adapters.
+struct GlobalHotKeyPrimaryKeyEventIdentity: Equatable, Hashable {
+    enum Phase: Equatable, Hashable {
+        case keyDown
+        case keyUp
+    }
+
+    let keyCode: UInt16
+    let phase: Phase
+    let cgTimestamp: UInt64
+
+    init?(keyCode: UInt16, phase: Phase, cgTimestamp: UInt64) {
+        guard cgTimestamp > 0 else { return nil }
+        self.keyCode = keyCode
+        self.phase = phase
+        self.cgTimestamp = cgTimestamp
+    }
+
+    static func from(_ event: NSEvent) -> Self? {
+        let phase: Phase
+        switch event.type {
+        case .keyDown: phase = .keyDown
+        case .keyUp: phase = .keyUp
+        default: return nil
+        }
+        guard let cgEvent = event.cgEvent else { return nil }
+        return Self(
+            keyCode: event.keyCode,
+            phase: phase,
+            cgTimestamp: cgEvent.timestamp
+        )
+    }
+}
+
+/// Carbon can claim a registered shortcut before or after InputMethodKit sees
+/// a duplicate callback for the shortcut's primary key. Keep a process-wide
+/// ledger of exact underlying event identities. The fallback floating clocks
+/// are consulted only when neither side exposes a CGEvent identity, avoiding a
+/// broad suppression window that could swallow the next ordinary same-key tap.
+struct GlobalHotKeyPrimaryKeyTombstone: Equatable {
+    enum Disposition: Equatable {
+        case passThrough
+        case consume
+    }
+
+    struct Evaluation: Equatable {
+        let disposition: Disposition
+        let deltaMicroseconds: Int64?
+        let route: GlobalHotKeyRoute
+    }
+
+    private struct RecentEvent: Equatable {
+        let identity: GlobalHotKeyPrimaryKeyEventIdentity
+        let route: GlobalHotKeyRoute
+    }
+
+    private static let recentEventCapacity = 8
+
+    private(set) var keyCode: UInt16?
+    /// Carbon EventTime values. They are never compared with NSEvent time.
+    private(set) var pressedAtMicroseconds: Int64?
+    private(set) var releasedAtMicroseconds: Int64?
+    /// NSEvent timestamp values used only for identity-less IMK fallback.
+    private(set) var imkPressedAtMicroseconds: Int64?
+    private(set) var imkReleasedAtMicroseconds: Int64?
+    private(set) var pressedEventIdentity: GlobalHotKeyPrimaryKeyEventIdentity?
+    private(set) var releasedEventIdentity: GlobalHotKeyPrimaryKeyEventIdentity?
+    private(set) var route: GlobalHotKeyRoute = .ignore
+    private(set) var action: GlobalHotKeyAction?
+    private(set) var matchedKeyDown = false
+    private var recentEvents: [RecentEvent] = []
+
+    static func timestampMicroseconds(_ timestamp: TimeInterval) -> Int64? {
+        guard timestamp.isFinite, timestamp >= 0,
+              timestamp <= Double(Int64.max) / 1_000_000 else { return nil }
+        return Int64((timestamp * 1_000_000).rounded())
+    }
+
+    @discardableResult
+    mutating func record(
+        action: GlobalHotKeyAction,
+        route: GlobalHotKeyRoute,
+        keyCode: UInt16,
+        eventTimestamp: TimeInterval,
+        eventIdentity: GlobalHotKeyPrimaryKeyEventIdentity? = nil
+    ) -> Bool {
+        guard route != .ignore else { return false }
+        let timestamp = Self.timestampMicroseconds(eventTimestamp)
+        let identity = validatedIdentity(
+            eventIdentity,
+            keyCode: keyCode,
+            phase: .keyDown
+        )
+        if let identity {
+            remember(identity, route: route)
+        }
+        guard timestamp != nil || identity != nil else { return false }
+        let attachesToIMKFirstRecord = self.action == action
+            && self.keyCode == keyCode
+            && pressedAtMicroseconds == nil
+            && imkPressedAtMicroseconds != nil
+            && releasedAtMicroseconds == nil
+        if !attachesToIMKFirstRecord,
+           let pressedAtMicroseconds,
+           let timestamp,
+           timestamp < pressedAtMicroseconds {
+            return false
+        }
+        if attachesToIMKFirstRecord {
+            pressedAtMicroseconds = timestamp
+            if pressedEventIdentity == nil {
+                pressedEventIdentity = identity
+            }
+            self.route = route
+            return true
+        }
+        self.keyCode = keyCode
+        self.pressedAtMicroseconds = timestamp
+        releasedAtMicroseconds = nil
+        imkPressedAtMicroseconds = nil
+        imkReleasedAtMicroseconds = nil
+        pressedEventIdentity = identity
+        releasedEventIdentity = nil
+        self.route = route
+        self.action = action
+        matchedKeyDown = false
+        return true
+    }
+
+    @discardableResult
+    mutating func recordRelease(
+        action: GlobalHotKeyAction,
+        eventTimestamp: TimeInterval,
+        eventIdentity: GlobalHotKeyPrimaryKeyEventIdentity? = nil
+    ) -> Bool {
+        guard self.action == action, let keyCode else { return false }
+        let timestamp = Self.timestampMicroseconds(eventTimestamp)
+        let identity = validatedIdentity(
+            eventIdentity,
+            keyCode: keyCode,
+            phase: .keyUp
+        )
+        if let identity {
+            remember(identity, route: route)
+        }
+        guard timestamp != nil || identity != nil else { return false }
+        if let pressedAtMicroseconds,
+           let timestamp,
+           timestamp < pressedAtMicroseconds {
+            return false
+        }
+        if let timestamp {
+            releasedAtMicroseconds = max(
+                releasedAtMicroseconds ?? pressedAtMicroseconds ?? timestamp,
+                timestamp
+            )
+        }
+        releasedEventIdentity = identity
+        return true
+    }
+
+    /// Consume an exact keyDown already proven to belong to a live Carbon
+    /// registration. This is the order-independent half of the tombstone: IMK
+    /// can establish the record before Carbon, or attach itself to a record
+    /// Carbon established first. The caller performs the exact modifier match,
+    /// so this path never claims an ordinary unmodified press of the same key.
+    mutating func observeRegisteredKeyDown(
+        action: GlobalHotKeyAction,
+        route: GlobalHotKeyRoute,
+        keyCode incomingKeyCode: UInt16,
+        eventTimestamp: TimeInterval,
+        eventIdentity: GlobalHotKeyPrimaryKeyEventIdentity? = nil
+    ) -> Evaluation {
+        guard route != .ignore else {
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: nil,
+                route: .ignore
+            )
+        }
+        let incomingTimestamp = Self.timestampMicroseconds(eventTimestamp)
+        let identity = validatedIdentity(
+            eventIdentity,
+            keyCode: incomingKeyCode,
+            phase: .keyDown
+        )
+        if let identity {
+            remember(identity, route: route)
+        }
+
+        let priorTimestamp = imkPressedAtMicroseconds
+        let delta = priorTimestamp.flatMap { prior in
+            incomingTimestamp.map { $0 - prior }
+        }
+        let identityMatchesCurrent = identity != nil
+            && identity == pressedEventIdentity
+        let belongsToCurrentRecord = self.action == action
+            && keyCode == incomingKeyCode
+            && (identityMatchesCurrent
+                || priorTimestamp == nil
+                || priorTimestamp.flatMap { prior in
+                    incomingTimestamp.map { incoming in
+                        incoming >= prior
+                            && imkReleasedAtMicroseconds.map {
+                                incoming <= $0
+                            } != false
+                    }
+                } == true)
+
+        if belongsToCurrentRecord {
+            matchedKeyDown = true
+            imkPressedAtMicroseconds = incomingTimestamp
+            imkReleasedAtMicroseconds = nil
+            if pressedEventIdentity == nil {
+                pressedEventIdentity = identity
+            }
+        } else if priorTimestamp == nil
+                    || incomingTimestamp == nil
+                    || incomingTimestamp.flatMap({ incoming in
+                        priorTimestamp.map { incoming >= $0 }
+                    }) == true {
+            self.keyCode = incomingKeyCode
+            pressedAtMicroseconds = nil
+            releasedAtMicroseconds = nil
+            imkPressedAtMicroseconds = incomingTimestamp
+            imkReleasedAtMicroseconds = nil
+            pressedEventIdentity = identity
+            releasedEventIdentity = nil
+            self.route = route
+            self.action = action
+            matchedKeyDown = true
+        }
+
+        let reportedDelta: Int64? = delta ?? (priorTimestamp == nil ? 0 : nil)
+        return Evaluation(
+            disposition: .consume,
+            deltaMicroseconds: reportedDelta,
+            route: route
+        )
+    }
+
+    mutating func evaluate(
+        eventType: NSEvent.EventType,
+        keyCode incomingKeyCode: UInt16,
+        eventTimestamp: TimeInterval,
+        eventIdentity: GlobalHotKeyPrimaryKeyEventIdentity? = nil
+    ) -> Evaluation {
+        let evaluatedRoute = route
+        guard eventType == .keyDown || eventType == .keyUp else {
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: nil,
+                route: evaluatedRoute
+            )
+        }
+        let phase: GlobalHotKeyPrimaryKeyEventIdentity.Phase =
+            eventType == .keyDown ? .keyDown : .keyUp
+        let identity = validatedIdentity(
+            eventIdentity,
+            keyCode: incomingKeyCode,
+            phase: phase
+        )
+        if let identity,
+           let recent = recentEvents.last(where: { $0.identity == identity }) {
+            if eventType == .keyDown,
+               identity == pressedEventIdentity {
+                matchedKeyDown = true
+            }
+            let delta = imkPressedAtMicroseconds.flatMap { pressed in
+                Self.timestampMicroseconds(eventTimestamp).map { $0 - pressed }
+            }
+            return Evaluation(
+                disposition: .consume,
+                deltaMicroseconds: delta,
+                route: recent.route
+            )
+        }
+
+        guard let keyCode,
+              incomingKeyCode == keyCode else {
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: nil,
+                route: evaluatedRoute
+            )
+        }
+        let incomingTimestamp = Self.timestampMicroseconds(eventTimestamp)
+        let delta = imkPressedAtMicroseconds.flatMap { pressed in
+            incomingTimestamp.map { $0 - pressed }
+        }
+
+        // If either wrapper exposed an underlying identity and it did not match
+        // above, this is a different physical event. A keyDown must pass and
+        // retire only the active record; exact completed identities stay in the
+        // small recent ledger for a duplicate that arrives even later.
+        if pressedEventIdentity != nil || identity != nil {
+            if eventType == .keyUp,
+               releasedEventIdentity == nil {
+                releasedEventIdentity = identity
+                if let identity {
+                    remember(identity, route: evaluatedRoute)
+                }
+                if let incomingTimestamp {
+                    imkReleasedAtMicroseconds = incomingTimestamp
+                }
+                return Evaluation(
+                    disposition: .consume,
+                    deltaMicroseconds: delta,
+                    route: evaluatedRoute
+                )
+            }
+            if eventType == .keyDown {
+                resetActive()
+            }
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: delta,
+                route: evaluatedRoute
+            )
+        }
+
+        guard let imkPressedAtMicroseconds else {
+            // Carbon supplied no common identity and IMK did not observe the
+            // registered chord first. A same-key keyDown is ambiguous with the
+            // user's next ordinary press, so fail open and retire active debt.
+            if eventType == .keyDown {
+                resetActive()
+            }
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: nil,
+                route: evaluatedRoute
+            )
+        }
+
+        guard let incomingTimestamp else {
+            if eventType == .keyDown {
+                resetActive()
+            }
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: nil,
+                route: evaluatedRoute
+            )
+        }
+        let fallbackDelta = incomingTimestamp - imkPressedAtMicroseconds
+        if let imkReleasedAtMicroseconds {
+            if incomingTimestamp >= imkPressedAtMicroseconds,
+               incomingTimestamp <= imkReleasedAtMicroseconds {
+                if eventType == .keyDown { matchedKeyDown = true }
+                return Evaluation(
+                    disposition: .consume,
+                    deltaMicroseconds: fallbackDelta,
+                    route: evaluatedRoute
+                )
+            }
+            if eventType == .keyDown,
+               incomingTimestamp > imkReleasedAtMicroseconds {
+                resetActive()
+            }
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: fallbackDelta,
+                route: evaluatedRoute
+            )
+        }
+        if eventType == .keyDown {
+            if fallbackDelta == 0 {
+                matchedKeyDown = true
+                return Evaluation(
+                    disposition: .consume,
+                    deltaMicroseconds: fallbackDelta,
+                    route: evaluatedRoute
+                )
+            }
+            if fallbackDelta > 0 {
+                resetActive()
+            }
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: fallbackDelta,
+                route: evaluatedRoute
+            )
+        }
+        guard fallbackDelta >= 0 else {
+            return Evaluation(
+                disposition: .passThrough,
+                deltaMicroseconds: fallbackDelta,
+                route: evaluatedRoute
+            )
+        }
+        imkReleasedAtMicroseconds = incomingTimestamp
+        return Evaluation(
+            disposition: .consume,
+            deltaMicroseconds: fallbackDelta,
+            route: evaluatedRoute
+        )
+    }
+
+    mutating func reset() {
+        resetActive()
+        recentEvents.removeAll()
+    }
+
+    private mutating func resetActive() {
+        keyCode = nil
+        pressedAtMicroseconds = nil
+        releasedAtMicroseconds = nil
+        imkPressedAtMicroseconds = nil
+        imkReleasedAtMicroseconds = nil
+        pressedEventIdentity = nil
+        releasedEventIdentity = nil
+        route = .ignore
+        action = nil
+        matchedKeyDown = false
+    }
+
+    private func validatedIdentity(
+        _ identity: GlobalHotKeyPrimaryKeyEventIdentity?,
+        keyCode: UInt16,
+        phase: GlobalHotKeyPrimaryKeyEventIdentity.Phase
+    ) -> GlobalHotKeyPrimaryKeyEventIdentity? {
+        guard identity?.keyCode == keyCode,
+              identity?.phase == phase else { return nil }
+        return identity
+    }
+
+    private mutating func remember(
+        _ identity: GlobalHotKeyPrimaryKeyEventIdentity,
+        route: GlobalHotKeyRoute
+    ) {
+        recentEvents.removeAll { $0.identity == identity }
+        recentEvents.append(RecentEvent(identity: identity, route: route))
+        if recentEvents.count > Self.recentEventCapacity {
+            recentEvents.removeFirst(
+                recentEvents.count - Self.recentEventCapacity
+            )
+        }
+    }
+}
+
 enum InputCaretGeometryRules {
     /// `attributes(forCharacterIndex:)` is relative to the inline session.
     /// Zero also asks for the current selection when no inline session exists.
@@ -555,11 +999,28 @@ final class RimeBufferController: IMKInputController {
     /// Shift that physically ended before the hot key but whose flags callback
     /// is still queued. Release-time timestamps provide the exact ordering.
     static func globalHotKeyWillPerform(
+        _ action: GlobalHotKeyAction,
         _ route: GlobalHotKeyRoute,
         eventTimestamp: TimeInterval,
+        primaryKeyEventTimestamp: TimeInterval,
+        primaryKeyCode: UInt16,
+        primaryKeyEventIdentity: GlobalHotKeyPrimaryKeyEventIdentity?,
         shortcutUsesShift: Bool
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        if globalHotKeyPrimaryKeyTombstone.record(
+            action: action,
+            route: route,
+            keyCode: primaryKeyCode,
+            eventTimestamp: primaryKeyEventTimestamp,
+            eventIdentity: primaryKeyEventIdentity
+        ) {
+            IMELog.write(
+                "global hotkey primary-key tombstone armed route=\(route) "
+                    + "keyCode=\(primaryKeyCode) "
+                    + "cg_identity=\(primaryKeyEventIdentity != nil)"
+            )
+        }
         guard globalHotKeyShiftTombstone.record(
                 route: route,
                 eventTimestamp: eventTimestamp,
@@ -568,6 +1029,25 @@ final class RimeBufferController: IMKInputController {
         IMELog.write(
             "global hotkey Shift tombstone armed route=\(route)"
         )
+    }
+
+    @discardableResult
+    static func globalHotKeyDidRelease(
+        _ action: GlobalHotKeyAction,
+        eventTimestamp: TimeInterval,
+        primaryKeyEventIdentity: GlobalHotKeyPrimaryKeyEventIdentity?
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard globalHotKeyPrimaryKeyTombstone.recordRelease(
+            action: action,
+            eventTimestamp: eventTimestamp,
+            eventIdentity: primaryKeyEventIdentity
+        ) else { return false }
+        IMELog.write(
+            "global hotkey primary-key release recorded action=\(action) "
+                + "cg_identity=\(primaryKeyEventIdentity != nil)"
+        )
+        return true
     }
 
     private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
@@ -582,6 +1062,8 @@ final class RimeBufferController: IMKInputController {
     private static let expandedPageBatch = 3
     private static var globalHotKeyShiftTombstone =
         GlobalHotKeyShiftTombstone()
+    private static var globalHotKeyPrimaryKeyTombstone =
+        GlobalHotKeyPrimaryKeyTombstone()
 
     private var session: UInt64 = 0
     private var currentSchemaId = ""
@@ -590,6 +1072,8 @@ final class RimeBufferController: IMKInputController {
     private var shiftGesture: ShiftModifierGesture?
     private var focusToken: FocusToken?
     private var clipboardSearchOwnerToken: FocusToken?
+    private var clipboardSearchPresentationRestoreGeneration: UInt64 = 0
+    private var loggedInactiveInputSourceCallback = false
     private var lastBufferBackspaceKeyHandledAt: CFAbsoluteTime = 0
     private var lastBufferBackspaceCommandHandledAt: CFAbsoluteTime = 0
     private var lastBufferEnterKeyHandledAt: CFAbsoluteTime = 0
@@ -1146,7 +1630,90 @@ final class RimeBufferController: IMKInputController {
 
     // MARK: Server lifecycle (focus in/out per client)
 
+    /// ETInput remains resident for process-global utility shortcuts after the
+    /// user selects another input source. Reject callbacks from the retired IMK
+    /// connection before they can adopt focus, set marked text, or consume a
+    /// key intended for the newly selected input method.
+    private func callbackHasCurrentInputSourceAuthority(
+        operation: String
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let currentID = RimeInputSourceAuthority.currentInputSourceID()
+        guard let currentID,
+              RimeInputSourceAuthority.isOwnInputSourceID(currentID) else {
+            retireForInactiveInputSource(
+                reason: "inactive input source callback: \(operation)",
+                currentInputSourceID: currentID
+            )
+            return false
+        }
+        // A transient nil TIS read makes main fail closed and unregister every
+        // process-global shortcut. A later exact IMK callback is fresh authority
+        // from the selected RIMES source, so synchronously reconcile the Carbon
+        // registrations even if macOS never emits a second TIS notification.
+        _ = GlobalHotKeyController.shared.setRuntimeEnabledForInputSource(true)
+        loggedInactiveInputSourceCallback = false
+        return true
+    }
+
+    /// No old IMK client is called from this path. The selected input source
+    /// already owns that field, so only process-local Rime state and frozen
+    /// delivery authority may be retired safely.
+    private func retireForInactiveInputSource(
+        reason: String,
+        currentInputSourceID: String?
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let rejectedToken = focusToken
+
+        // The stale IMK callback can arrive before the distributed TIS change
+        // notification. Detach Clip first so focus invalidation observes a
+        // passive window with no presentation owner and therefore cannot close
+        // an already visible clipboard history surface.
+        ClipboardHistoryWindowController.shared
+            .inputSourceDidChangeAwayFromRIMES()
+        clipboardSearchPresentationRestoreGeneration &+= 1
+        if let lease = InputFocusCoordinator.shared.invalidateAll(reason: reason) {
+            lease.controller?.finalizeProtectedSession(lease, reason: reason)
+            candidateWindow.hide(owner: lease.token)
+        }
+
+        if let rejectedToken, focusToken == rejectedToken {
+            cancelFocusBoundGestures()
+            clipboardSearchOwnerToken = nil
+            pendingFlyChordBase = nil
+            mutualPairingState.reset()
+            if session != 0 {
+                rimeEngine.clearComposition(session: session)
+            }
+            composition.markCleared()
+            BufferWindowController.shared.clearInlineComposition(
+                owner: rejectedToken
+            )
+            candidateWindow.hide(owner: rejectedToken)
+            if BufferModel.shared.captureFocusToken == rejectedToken {
+                BufferModel.shared.routeDirectPreservingContent(reason: reason)
+            }
+            focusToken = nil
+        } else if let captureToken = BufferModel.shared.captureFocusToken,
+                  !InputFocusCoordinator.shared.isCurrent(captureToken) {
+            BufferModel.shared.routeDirectPreservingContent(reason: reason)
+        }
+
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
+        BufferWindowController.shared.refresh()
+        guard !loggedInactiveInputSourceCallback else { return }
+        loggedInactiveInputSourceCallback = true
+        IMELog.write(
+            "\(reason) rejected current="
+                + (currentInputSourceID ?? "unavailable")
+        )
+    }
+
     override func activateServer(_ sender: Any!) {
+        guard callbackHasCurrentInputSourceAuthority(
+            operation: "activate"
+        ) else { return }
         // Seed from real hardware state — clearing to [] would desync the
         // flagsChanged delta stream whenever a modifier (esp. Caps Lock) is
         // held or locked across a focus change.
@@ -1504,6 +2071,9 @@ final class RimeBufferController: IMKInputController {
     }
 
     override func deactivateServer(_ sender: Any!) {
+        guard callbackHasCurrentInputSourceAuthority(
+            operation: "deactivate"
+        ) else { return }
         guard let lease = lifecycleLease(for: sender, operation: "deactivate"),
               let client = lease.client else {
             return
@@ -1527,6 +2097,9 @@ final class RimeBufferController: IMKInputController {
     }
 
     override func commitComposition(_ sender: Any!) {
+        guard callbackHasCurrentInputSourceAuthority(
+            operation: "commitComposition"
+        ) else { return }
         guard let lease = lifecycleLease(for: sender, operation: "commitComposition"),
               let client = lease.client else {
             return
@@ -1764,9 +2337,107 @@ final class RimeBufferController: IMKInputController {
         return context.active || !context.input.isEmpty || !context.preedit.isEmpty
     }
 
+    /// A newly opened Clip search must start from an empty Rime context. Some
+    /// prediction schemas retain candidates after ordinary host composition is
+    /// inactive; borrowing that context would make the hotkey's late primary
+    /// key or an old prediction appear as a search query.
+    @discardableResult
+    func beginClipboardSearch(expected target: FocusLease) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard RimeInputSourceAuthority.currentSourceIsOwn(),
+              target.controller === self,
+              target.isExternalTarget,
+              focusToken == target.token,
+              let client = target.client,
+              ObjectIdentifier(client as AnyObject) == target.clientIdentity,
+              InputFocusCoordinator.shared.interactionTarget(
+                expected: target.token
+              ) === target else { return false }
+        clipboardSearchPresentationRestoreGeneration &+= 1
+        clipboardSearchOwnerToken = target.token
+        chord.invalidate()
+        pendingFlyChordBase = nil
+        mutualPairingState.reset()
+        if session != 0 {
+            rimeEngine.clearComposition(session: session)
+        }
+        composition.markCleared()
+        InputFocusCoordinator.shared.setCompositionActive(
+            false,
+            token: target.token
+        )
+        candidateWindow.hide(owner: target.token)
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
+        return RimeInputSourceAuthority.currentSourceIsOwn()
+            && focusToken == target.token
+            && InputFocusCoordinator.shared.interactionTarget(
+                expected: target.token
+            ) === target
+    }
+
+    /// Return activates the selected history item, so an unfinished borrowed
+    /// search preedit must be discarded before archive loading begins. Keep the
+    /// search owner alive until `hide()` performs its normal exact-client
+    /// marked-text cleanup; clearing ownership here would strand the host guard.
+    @discardableResult
+    func discardClipboardSearchCompositionForActivation(
+        expected token: FocusToken,
+        client: IMKTextInput
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard RimeInputSourceAuthority.currentSourceIsOwn(),
+              focusToken == token,
+              shouldCaptureClipboardSearchCommit(from: client),
+              clipboardSearchOwnerToken == token,
+              let lease = InputFocusCoordinator.shared.interactionTarget(
+                expected: token
+              ),
+              lease.controller === self,
+              lease.clientIdentity == ObjectIdentifier(client as AnyObject)
+        else { return false }
+        clipboardSearchPresentationRestoreGeneration &+= 1
+        let generation = clipboardSearchPresentationRestoreGeneration
+        chord.invalidate()
+        pendingFlyChordBase = nil
+        mutualPairingState.reset()
+        if session != 0 {
+            rimeEngine.clearComposition(session: session)
+        }
+        composition.markCleared()
+        InputFocusCoordinator.shared.setCompositionActive(false, token: token)
+        candidateWindow.hide(owner: token)
+        ClipboardHistoryWindowController.shared.clearSearchComposition()
+
+        let clientIdentity = lease.clientIdentity
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  RimeInputSourceAuthority.currentSourceIsOwn(),
+                  self.clipboardSearchPresentationRestoreGeneration
+                    == generation,
+                  self.clipboardSearchOwnerToken == token,
+                  self.focusToken == token,
+                  let current = InputFocusCoordinator.shared.interactionTarget(
+                    expected: token
+                  ),
+                  current === lease,
+                  current.clientIdentity == clientIdentity,
+                  let currentClient = current.client,
+                  ObjectIdentifier(currentClient as AnyObject)
+                    == clientIdentity else { return }
+            self.clearCompositionPresentation(client: currentClient)
+        }
+        return true
+    }
+
     /// Closing/protecting the standalone search surface discards its unfinished
     /// query composition. It never commits that text into the external field.
-    func cancelClipboardSearchComposition(expected token: FocusToken) {
+    func cancelClipboardSearchComposition(
+        expected token: FocusToken,
+        restoreHostPresentation: Bool = true
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        clipboardSearchPresentationRestoreGeneration &+= 1
+        let restoreGeneration = clipboardSearchPresentationRestoreGeneration
         guard clipboardSearchOwnerToken == token else { return }
         clipboardSearchOwnerToken = nil
         chord.invalidate()
@@ -1775,20 +2446,73 @@ final class RimeBufferController: IMKInputController {
         if session != 0 {
             rimeEngine.clearComposition(session: session)
         }
-        if !IsSecureEventInputEnabled(),
-           let lease = InputFocusCoordinator.shared.interactionTarget(
-                expected: token
-           ),
-           lease.controller === self,
-           let client = lease.client,
-           ObjectIdentifier(client as AnyObject) == lease.clientIdentity {
-            clearCompositionPresentation(client: client)
-        } else {
-            composition.markCleared()
-        }
+        // Cancelling Clip can run inside IMK's handle stack. Keep the synchronous
+        // half process-local so it cannot re-enter the host through marked-text
+        // calls while the original key callback is still unwinding.
+        composition.markCleared()
         InputFocusCoordinator.shared.setCompositionActive(false, token: token)
         candidateWindow.hide(owner: token)
         ClipboardHistoryWindowController.shared.clearSearchComposition()
+
+        // Freeze only local lease identity here. The foreign-input-source path
+        // returns before resolving either weak client or IMKInputController's
+        // current client, so it performs zero host client calls.
+        guard restoreHostPresentation,
+              RimeInputSourceAuthority.currentSourceIsOwn(),
+              !IsSecureEventInputEnabled(),
+              clipboardSearchOwnerToken == nil,
+              focusToken == token,
+              let frozenLease = InputFocusCoordinator.shared.lease(for: token),
+              frozenLease.controller === self else { return }
+        let frozenClientIdentity = frozenLease.clientIdentity
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let client = self.clipboardSearchPresentationRestoreClient(
+                    expected: token,
+                    generation: restoreGeneration,
+                    clientIdentity: frozenClientIdentity
+                  ) else { return }
+
+            self.clearCompositionPresentation(client: client)
+
+            // clearMarkedText can synchronously move focus. Restore normal Rime
+            // presentation or Buffer's idle guard only if the exact same lease
+            // and controller client survived that call.
+            guard self.clipboardSearchPresentationRestoreClient(
+                expected: token,
+                generation: restoreGeneration,
+                clientIdentity: frozenClientIdentity
+            ) === client else { return }
+            self.updateUI(client: client)
+        }
+    }
+
+    /// Resolves the host client only after source, generation, token and lease
+    /// preflight have succeeded. Keep the source check first: when another input
+    /// method owns the field this helper must not touch either client proxy.
+    private func clipboardSearchPresentationRestoreClient(
+        expected token: FocusToken,
+        generation: UInt64,
+        clientIdentity: ObjectIdentifier
+    ) -> IMKTextInput? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard RimeInputSourceAuthority.currentSourceIsOwn(),
+              clipboardSearchPresentationRestoreGeneration == generation,
+              clipboardSearchOwnerToken == nil,
+              !IsSecureEventInputEnabled(),
+              focusToken == token,
+              let lease = InputFocusCoordinator.shared.interactionTarget(
+                expected: token
+              ),
+              lease.controller === self,
+              lease.clientIdentity == clientIdentity,
+              let leaseClient = lease.client,
+              ObjectIdentifier(leaseClient as AnyObject) == clientIdentity,
+              let controllerClient = self.client(),
+              ObjectIdentifier(controllerClient as AnyObject)
+                == clientIdentity else { return nil }
+        return leaseClient
     }
 
     // MARK: Key routing
@@ -1799,19 +2523,60 @@ final class RimeBufferController: IMKInputController {
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, let client = sender as? IMKTextInput else { return false }
-        if ClipboardHistoryHostPasteRules.isTaggedPasteEvent(event) {
-            let focusAdopted = adoptEventFocus(
-                client: client,
-                eventTimestamp: event.timestamp,
-                eventType: event.type
+        guard callbackHasCurrentInputSourceAuthority(
+            operation: "handle"
+        ) else { return false }
+        let primaryKeyEventIdentity = GlobalHotKeyPrimaryKeyEventIdentity.from(
+            event
+        )
+        if let registeredHotKey = GlobalHotKeyController.shared
+            .registeredPrimaryKeyMatch(
+                eventType: event.type,
+                keyCode: event.keyCode,
+                modifierFlags: event.modifierFlags
+            ) {
+            let evaluation = Self.globalHotKeyPrimaryKeyTombstone
+                .observeRegisteredKeyDown(
+                    action: registeredHotKey.action,
+                    route: registeredHotKey.route,
+                    keyCode: registeredHotKey.keyCode,
+                    eventTimestamp: event.timestamp,
+                    eventIdentity: primaryKeyEventIdentity
+                )
+            let modifiers = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask).rawValue
+            IMELog.write(
+                "global hotkey registered primary-key callback "
+                    + "delta_us=\(evaluation.deltaMicroseconds ?? 0) "
+                    + "cg_identity=\(primaryKeyEventIdentity != nil) "
+                    + "modifiers=\(modifiers) route=\(evaluation.route) "
+                    + "disposition=\(evaluation.disposition)"
             )
-            return ClipboardHistoryWindowController.shared
-                .routeSyntheticHostPaste(
-                    event,
-                    client: client,
-                    controller: self,
-                    focusAdopted: focusAdopted
-                ) ?? true
+            return evaluation.disposition == .consume
+        }
+        let hotKeyPrimaryEvaluation = Self.globalHotKeyPrimaryKeyTombstone
+            .evaluate(
+                eventType: event.type,
+                keyCode: event.keyCode,
+                eventTimestamp: event.timestamp,
+                eventIdentity: primaryKeyEventIdentity
+            )
+        if hotKeyPrimaryEvaluation.deltaMicroseconds != nil
+            || hotKeyPrimaryEvaluation.route != .ignore {
+            let modifiers = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask).rawValue
+            let deltaMicrosecondsText = hotKeyPrimaryEvaluation.deltaMicroseconds
+                .map(String.init) ?? "unavailable"
+            IMELog.write(
+                "global hotkey primary-key callback type=\(event.type.rawValue) "
+                    + "delta_us=\(deltaMicrosecondsText) modifiers=\(modifiers) "
+                    + "cg_identity=\(primaryKeyEventIdentity != nil) "
+                    + "route=\(hotKeyPrimaryEvaluation.route) "
+                    + "disposition=\(hotKeyPrimaryEvaluation.disposition)"
+            )
+        }
+        if hotKeyPrimaryEvaluation.disposition == .consume {
+            return true
         }
         if event.type == .keyDown,
            !event.isARepeat {
@@ -3071,14 +3836,9 @@ final class RimeBufferController: IMKInputController {
 
     override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
         guard let selector else { return false }
-        if let handled = ClipboardHistoryWindowController.shared
-            .routeSyntheticHostPasteCommand(
-                selector,
-                client: sender as? IMKTextInput,
-                controller: self
-            ) {
-            return handled
-        }
+        guard callbackHasCurrentInputSourceAuthority(
+            operation: "didCommand"
+        ) else { return false }
         if ClipboardHistoryWindowController.shared.consumeCommandIfRecentlyHandled(
             selector,
             client: sender as? IMKTextInput
@@ -3088,6 +3848,14 @@ final class RimeBufferController: IMKInputController {
         let newlineCommand = isInsertNewlineSelector(selector)
         let callbackClient = currentCallbackClient(sender)
         let explicitClientMismatch = sender is IMKTextInput && callbackClient == nil
+        if newlineCommand,
+           ClipboardHistoryWindowController.shared
+            .consumeActivationCommandIfVisible(
+                client: callbackClient,
+                controller: self
+            ) {
+            return true
+        }
         if isCancelOperationSelector(selector) {
             let escapeClient = currentEscapeCommandClient(sender)
             if recentlyHandledWorkbenchEscape(

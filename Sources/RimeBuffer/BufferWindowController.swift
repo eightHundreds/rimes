@@ -1526,6 +1526,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func show(repositionOnOpen: Bool) {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write("buffer window open ignored; RIMES is not selected")
+            return
+        }
         let wasVisibleOnActiveSpace = isVisible
         if !wasVisibleOnActiveSpace { workbenchSessionEpoch &+= 1 }
         UserDefaults.standard.set(true, forKey: Key.visible)
@@ -1564,6 +1568,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     /// itself no longer implies capture; this method requests an exact-focus
     /// capture grant and still shows the workbench when no trusted field exists.
     func openAndResume() {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write("buffer capture open ignored; RIMES is not selected")
+            return
+        }
         if !activateCaptureForCurrentFocus(showWorkbench: true) {
             show()
         }
@@ -1721,7 +1729,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     func toggleVisibility() {
-        isVisible ? closeAndPause() : openAndResume()
+        if isVisible {
+            closeAndPause()
+        } else {
+            openAndResume()
+        }
     }
 
     /// Selection changes invalidate any delayed plugin-delivery completion

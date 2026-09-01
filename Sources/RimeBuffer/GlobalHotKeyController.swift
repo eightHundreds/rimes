@@ -1,3 +1,4 @@
+import AppKit
 import Carbon.HIToolbox
 import Foundation
 
@@ -55,6 +56,12 @@ struct GlobalHotKeyDefinition {
     }
 }
 
+struct GlobalHotKeyPrimaryKeyMatch: Equatable {
+    let action: GlobalHotKeyAction
+    let route: GlobalHotKeyRoute
+    let keyCode: UInt16
+}
+
 /// Pure definitions and matching for the process-wide shortcuts. Keeping this
 /// separate from registration lets smoke tests validate the contract without
 /// temporarily claiming real global shortcuts from the user's Mac.
@@ -104,6 +111,10 @@ enum GlobalHotKeyRouting {
               let action = GlobalHotKeyAction(rawValue: identifier.id) else {
             return .ignore
         }
+        return route(for: action)
+    }
+
+    static func route(for action: GlobalHotKeyAction) -> GlobalHotKeyRoute {
         switch action {
         case .toggleWorkbench: return .toggleWorkbench
         case .toggleClipboardHistory: return .toggleClipboardHistory
@@ -111,6 +122,34 @@ enum GlobalHotKeyRouting {
         case .openCapsule: return .openCapsule
         case .openSettings: return .openSettings
         }
+    }
+
+    /// IMK and Carbon may report the same physical press in either order. Match
+    /// only definitions whose Carbon registration actually succeeded, and only
+    /// the exact supported modifier set, so an ordinary later press of the same
+    /// primary key can never be mistaken for the global shortcut.
+    static func primaryKeyMatch(
+        definitions: [GlobalHotKeyDefinition],
+        eventType: NSEvent.EventType,
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> GlobalHotKeyPrimaryKeyMatch? {
+        guard eventType == .keyDown else { return nil }
+        let carbonModifiers = RimeKeyboardShortcut(
+            keyCode: keyCode,
+            modifiers: modifierFlags
+        ).carbonModifiers
+        guard let definition = definitions.first(where: {
+            $0.keyCode == UInt32(keyCode)
+                && $0.modifiers == carbonModifiers
+        }) else { return nil }
+        let route = route(for: definition.action)
+        guard route != .ignore else { return nil }
+        return GlobalHotKeyPrimaryKeyMatch(
+            action: definition.action,
+            route: route,
+            keyCode: keyCode
+        )
     }
 }
 
@@ -126,6 +165,7 @@ final class GlobalHotKeyController {
     private var hotKeyRefs: [GlobalHotKeyAction: EventHotKeyRef] = [:]
     private var registeredDefinitions: [GlobalHotKeyAction: GlobalHotKeyDefinition] = [:]
     private var shortcutPreferencesObserver: NSObjectProtocol?
+    private var runtimeEnabled = false
 
     private init() {
         shortcutPreferencesObserver = NotificationCenter.default.addObserver(
@@ -155,19 +195,27 @@ final class GlobalHotKeyController {
         dispatchPrecondition(condition: .onQueue(.main))
 
         if eventHandlerRef == nil {
-            var eventType = EventTypeSpec(
-                eventClass: OSType(kEventClassKeyboard),
-                eventKind: UInt32(kEventHotKeyPressed)
-            )
+            let eventTypes = [
+                EventTypeSpec(
+                    eventClass: OSType(kEventClassKeyboard),
+                    eventKind: UInt32(kEventHotKeyPressed)
+                ),
+                EventTypeSpec(
+                    eventClass: OSType(kEventClassKeyboard),
+                    eventKind: UInt32(kEventHotKeyReleased)
+                ),
+            ]
             var installedHandler: EventHandlerRef?
-            let handlerStatus = InstallEventHandler(
-                GetApplicationEventTarget(),
-                Self.eventHandler,
-                1,
-                &eventType,
-                Unmanaged.passUnretained(self).toOpaque(),
-                &installedHandler
-            )
+            let handlerStatus = eventTypes.withUnsafeBufferPointer { buffer in
+                InstallEventHandler(
+                    GetApplicationEventTarget(),
+                    Self.eventHandler,
+                    buffer.count,
+                    buffer.baseAddress,
+                    Unmanaged.passUnretained(self).toOpaque(),
+                    &installedHandler
+                )
+            }
             guard handlerStatus == noErr, let installedHandler else {
                 IMELog.write("global hotkey handler install failed status=\(handlerStatus)")
                 return false
@@ -212,12 +260,66 @@ final class GlobalHotKeyController {
     @discardableResult
     func reloadFromPreferences() -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
+        unregisterAllHotKeys()
+        guard runtimeEnabled else { return true }
+        return install()
+    }
+
+    /// Utility shortcuts are registered only while RIMES is the selected input
+    /// source. Unregistering them lets other input methods and host applications
+    /// keep the same chords without ETInput observing or consuming them.
+    @discardableResult
+    func setRuntimeEnabledForInputSource(_ enabled: Bool) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard runtimeEnabled != enabled else {
+            guard enabled else { return true }
+            let registrationIsComplete = hotKeyRefs.count
+                == GlobalHotKeyAction.allCases.count
+            guard !registrationIsComplete else { return true }
+            let installed = install()
+            IMELog.write(
+                "global hotkey incomplete registration retried complete=\(installed)"
+            )
+            return installed
+        }
+        runtimeEnabled = enabled
+        unregisterAllHotKeys()
+        if enabled {
+            let installed = install()
+            IMELog.write(
+                "global hotkeys enabled for RIMES source complete=\(installed)"
+            )
+            return installed
+        }
+        IMELog.write("global hotkeys disabled for non-RIMES source")
+        return true
+    }
+
+    private func unregisterAllHotKeys() {
         for hotKeyRef in hotKeyRefs.values {
             _ = UnregisterEventHotKey(hotKeyRef)
         }
         hotKeyRefs.removeAll()
         registeredDefinitions.removeAll()
-        return install()
+    }
+
+    /// Called from the IMK key path before its event can reach Rime. Using the
+    /// live registration table avoids claiming a preference whose Carbon
+    /// registration failed, while letting an IMK-first callback be consumed
+    /// before Carbon opens the corresponding utility surface.
+    func registeredPrimaryKeyMatch(
+        eventType: NSEvent.EventType,
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> GlobalHotKeyPrimaryKeyMatch? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard runtimeEnabled else { return nil }
+        return GlobalHotKeyRouting.primaryKeyMatch(
+            definitions: Array(registeredDefinitions.values),
+            eventType: eventType,
+            keyCode: keyCode,
+            modifierFlags: modifierFlags
+        )
     }
 
     deinit {
@@ -254,38 +356,80 @@ final class GlobalHotKeyController {
         guard parameterStatus == noErr else {
             return OSStatus(eventNotHandledErr)
         }
-        let route = GlobalHotKeyRouting.route(
-            eventClass: GetEventClass(event),
-            eventKind: GetEventKind(event),
-            identifier: identifier
-        )
-        guard route != .ignore else {
+        let eventClass = GetEventClass(event)
+        let eventKind = GetEventKind(event)
+        guard eventClass == OSType(kEventClassKeyboard),
+              identifier.signature == GlobalHotKeyRouting.signature,
+              let action = GlobalHotKeyAction(rawValue: identifier.id),
+              eventKind == UInt32(kEventHotKeyPressed)
+                || eventKind == UInt32(kEventHotKeyReleased) else {
             return OSStatus(eventNotHandledErr)
         }
+        let hadAuthorityBeforeMainHop = RimeInputSourceAuthority
+            .currentSourceIsOwn()
 
         // The application event target normally invokes us on the main loop;
         // retain the same behavior defensively if Carbon ever calls elsewhere.
-        let performRoute = {
-            // Carbon owns the shortcut's Command/key events, so the active IMK
-            // controller may only see Shift down/up. Record a process-wide
-            // tombstone before changing the workbench: the eventual release
-            // can be delivered after host re-entry or to another controller,
-            // so mutating only the current controller's gesture is not enough.
+        let performEvent = { () -> Bool in
             let carbonTimestamp = TimeInterval(GetEventTime(event))
-            let eventTimestamp = carbonTimestamp.isFinite && carbonTimestamp > 0
+            let routingTimestamp = carbonTimestamp.isFinite && carbonTimestamp > 0
                 ? carbonTimestamp
                 : TimeInterval(GetCurrentEventTime())
+            guard let registeredDefinition = self.registeredDefinitions[action],
+                  let primaryKeyCode = UInt16(
+                    exactly: registeredDefinition.keyCode
+                  ) else {
+                IMELog.write("global hotkey ignored without registered definition")
+                return false
+            }
+            let primaryKeyEventIdentity = Self.primaryKeyEventIdentity(
+                event,
+                eventKind: eventKind,
+                keyCode: primaryKeyCode
+            )
+            if eventKind == UInt32(kEventHotKeyReleased) {
+                guard hadAuthorityBeforeMainHop,
+                      RimeInputSourceAuthority.currentSourceIsOwn() else {
+                    return false
+                }
+                _ = RimeBufferController.globalHotKeyDidRelease(
+                    action,
+                    eventTimestamp: carbonTimestamp,
+                    primaryKeyEventIdentity: primaryKeyEventIdentity
+                )
+                return true
+            }
+
+            let route = GlobalHotKeyRouting.route(
+                eventClass: eventClass,
+                eventKind: eventKind,
+                identifier: identifier
+            )
+            guard route != .ignore else { return false }
+            let hasAuthorityAtMainBoundary = RimeInputSourceAuthority
+                .currentSourceIsOwn()
+            guard hadAuthorityBeforeMainHop, hasAuthorityAtMainBoundary else {
+                if !hasAuthorityAtMainBoundary {
+                    _ = self.setRuntimeEnabledForInputSource(false)
+                }
+                IMELog.write(
+                    "global hotkey ignored because RIMES is not selected"
+                )
+                return false
+            }
             // Consult the definition that actually owns this Carbon
             // registration. Preferences can change immediately before a
             // reload; re-reading them here could describe a different chord
             // from the event currently being dispatched.
-            let shortcutUsesShift = GlobalHotKeyAction(rawValue: identifier.id)
-                .flatMap { self.registeredDefinitions[$0] }
-                .map { $0.modifiers & UInt32(shiftKey) != 0 }
-                ?? false
+            let shortcutUsesShift = registeredDefinition.modifiers
+                & UInt32(shiftKey) != 0
             RimeBufferController.globalHotKeyWillPerform(
+                action,
                 route,
-                eventTimestamp: eventTimestamp,
+                eventTimestamp: routingTimestamp,
+                primaryKeyEventTimestamp: carbonTimestamp,
+                primaryKeyCode: primaryKeyCode,
+                primaryKeyEventIdentity: primaryKeyEventIdentity,
                 shortcutUsesShift: shortcutUsesShift
             )
             switch route {
@@ -307,18 +451,40 @@ final class GlobalHotKeyController {
             case .ignore:
                 break
             }
+            return true
         }
+        let handled: Bool
         if Thread.isMainThread {
-            performRoute()
+            handled = performEvent()
         } else {
             // Suppression must be ordered before the physical Shift-up
             // callback. Carbon normally invokes us on the main loop; this
             // synchronous fallback keeps the exceptional path deterministic.
-            DispatchQueue.main.sync(execute: performRoute)
+            handled = DispatchQueue.main.sync(execute: performEvent)
         }
 
         // This exact registered hot key is ours. Mark it handled so its key
         // cannot continue into the focused host application.
-        return noErr
+        return handled ? noErr : OSStatus(eventNotHandledErr)
+    }
+
+    private static func primaryKeyEventIdentity(
+        _ event: EventRef,
+        eventKind: UInt32,
+        keyCode: UInt16
+    ) -> GlobalHotKeyPrimaryKeyEventIdentity? {
+        let phase: GlobalHotKeyPrimaryKeyEventIdentity.Phase
+        switch eventKind {
+        case UInt32(kEventHotKeyPressed): phase = .keyDown
+        case UInt32(kEventHotKeyReleased): phase = .keyUp
+        default: return nil
+        }
+        guard let copiedCGEvent = CopyEventCGEvent(event) else { return nil }
+        let cgEvent = copiedCGEvent.takeRetainedValue()
+        return GlobalHotKeyPrimaryKeyEventIdentity(
+            keyCode: keyCode,
+            phase: phase,
+            cgTimestamp: cgEvent.timestamp
+        )
     }
 }

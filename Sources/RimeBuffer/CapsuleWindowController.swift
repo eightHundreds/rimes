@@ -1,6 +1,10 @@
 import AppKit
+import CoreGraphics
 import CryptoKit
+import Darwin
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let capsuleStoreDidChange = Notification.Name(
@@ -54,6 +58,163 @@ struct CapsulePaneLayoutSnapshot {
     let kindControlFrame: NSRect
     let editorFrame: NSRect
     let hasAmbiguousLayout: Bool
+}
+
+enum CapsuleMediaPreviewResult {
+    case image(CGImage)
+    case pdf(image: CGImage, pageCount: Int)
+    case unavailable
+}
+
+/// Media files are user-managed and can be large. Validate and decode them off
+/// the main thread, then let the selected editor install only the latest result.
+/// This prevents a 100+ MB PDF or a stale image selection from freezing or
+/// repainting the next Capsule row.
+final class CapsuleMediaPreviewLoader {
+    static let shared = CapsuleMediaPreviewLoader()
+
+    static let maximumImageBytes = 128 * 1_024 * 1_024
+    static let maximumPDFBytes = 256 * 1_024 * 1_024
+    static let maximumThumbnailPixels = 1_600
+
+    private let queue: OperationQueue
+
+    init(queue: OperationQueue = OperationQueue()) {
+        queue.name = "RIMES.CapsuleMediaPreview"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 1
+        self.queue = queue
+    }
+
+    @discardableResult
+    func load(
+        kind: CapsuleEntryKind,
+        path: String,
+        completion: @escaping (CapsuleMediaPreviewResult) -> Void
+    ) -> Operation {
+        // The queue is process-global and serial. Cancellation belongs to the
+        // requesting pane, so a Settings preview cannot starve the standalone
+        // Capsule window (or vice versa).
+        let operation = BlockOperation()
+        operation.addExecutionBlock { [weak operation] in
+            guard operation?.isCancelled == false else { return }
+            let result = Self.loadSynchronously(kind: kind, path: path)
+            guard operation?.isCancelled == false else { return }
+            OperationQueue.main.addOperation { [weak operation] in
+                guard operation?.isCancelled == false else { return }
+                completion(result)
+            }
+        }
+        queue.addOperation(operation)
+        return operation
+    }
+
+    static func loadSynchronously(
+        kind: CapsuleEntryKind,
+        path: String
+    ) -> CapsuleMediaPreviewResult {
+        guard kind == .image || kind == .pdf,
+              NSString(string: path).isAbsolutePath else {
+            return .unavailable
+        }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if kind == .pdf, url.pathExtension.lowercased() != "pdf" {
+            return .unavailable
+        }
+        let descriptor = open(
+            url.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else { return .unavailable }
+        defer { close(descriptor) }
+        var fileStatus = stat()
+        guard fstat(descriptor, &fileStatus) == 0,
+              (fileStatus.st_mode & S_IFMT) == S_IFREG,
+              fileStatus.st_size > 0 else {
+            return .unavailable
+        }
+        let size = UInt64(fileStatus.st_size)
+        // ImageIO/Core Graphics read through the already-validated descriptor,
+        // so replacing the original path cannot swap in a symlink or a larger
+        // file between the safety check and the decoder open.
+        let descriptorURL = URL(fileURLWithPath: "/dev/fd/\(descriptor)")
+
+        switch kind {
+        case .image:
+            guard size <= UInt64(maximumImageBytes),
+                  let source = CGImageSourceCreateWithURL(
+                    descriptorURL as CFURL,
+                    nil
+                  ) else {
+                return .unavailable
+            }
+            let options = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: maximumThumbnailPixels,
+            ] as CFDictionary
+            guard let image = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                options
+            ) else {
+                return .unavailable
+            }
+            return .image(image)
+        case .pdf:
+            guard size <= UInt64(maximumPDFBytes),
+                  let provider = CGDataProvider(url: descriptorURL as CFURL),
+                  let document = CGPDFDocument(provider),
+                  document.numberOfPages > 0,
+                  let page = document.page(at: 1) else {
+                return .unavailable
+            }
+            var previewBox: CGPDFBox = .cropBox
+            var pageBox = page.getBoxRect(previewBox)
+            if pageBox.isEmpty {
+                previewBox = .mediaBox
+                pageBox = page.getBoxRect(previewBox)
+            }
+            guard pageBox.width > 0, pageBox.height > 0 else {
+                return .unavailable
+            }
+            let scale = min(
+                CGFloat(maximumThumbnailPixels) / pageBox.width,
+                CGFloat(maximumThumbnailPixels) / pageBox.height,
+                1
+            )
+            let width = max(1, Int(ceil(pageBox.width * scale)))
+            let height = max(1, Int(ceil(pageBox.height * scale)))
+            guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return .unavailable
+            }
+            let target = CGRect(x: 0, y: 0, width: width, height: height)
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(target)
+            context.concatenate(page.getDrawingTransform(
+                previewBox,
+                rect: target,
+                rotate: 0,
+                preserveAspectRatio: true
+            ))
+            context.drawPDFPage(page)
+            guard let image = context.makeImage() else {
+                return .unavailable
+            }
+            return .pdf(image: image, pageCount: document.numberOfPages)
+        case .prompt, .memory, .password, .skill, .note, .url:
+            return .unavailable
+        }
+    }
 }
 
 struct CapsulePasswordEditorSnapshot: Equatable {
@@ -151,6 +312,10 @@ enum CapsuleWindowDraftError: LocalizedError, Equatable {
     case missingContent
     case missingPassword
     case relativeSkillPath
+    case invalidURL
+    case relativeAssetPath(String)
+    case unsupportedAssetType(String)
+    case unavailableAsset(String)
 
     var errorDescription: String? {
         switch self {
@@ -162,6 +327,14 @@ enum CapsuleWindowDraftError: LocalizedError, Equatable {
             return "请填写密码"
         case .relativeSkillPath:
             return "Skill 必须使用电脑中的绝对路径"
+        case .invalidURL:
+            return "URL 必须是包含协议的完整网址"
+        case let .relativeAssetPath(kind):
+            return "\(kind) 必须使用电脑中的绝对路径"
+        case let .unsupportedAssetType(kind):
+            return "所选文件不是受支持的 \(kind)"
+        case let .unavailableAsset(kind):
+            return "\(kind) 文件不存在、不是普通文件或使用了符号链接"
         }
     }
 }
@@ -235,9 +408,20 @@ struct CapsuleWindowDraft: Equatable {
             throw CapsuleWindowDraftError.missingTitle
         }
         switch kind {
-        case .prompt, .memory:
+        case .prompt, .memory, .note:
             guard !content.isEmpty else {
                 throw CapsuleWindowDraftError.missingContent
+            }
+        case .url:
+            guard !content.isEmpty,
+                  let components = URLComponents(string: content),
+                  let scheme = components.scheme,
+                  ["http", "https"].contains(scheme.lowercased()),
+                  components.host?.isEmpty == false,
+                  content == content.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                  ) else {
+                throw CapsuleWindowDraftError.invalidURL
             }
         case .skill:
             guard !content.isEmpty else {
@@ -245,6 +429,38 @@ struct CapsuleWindowDraft: Equatable {
             }
             guard NSString(string: content).isAbsolutePath else {
                 throw CapsuleWindowDraftError.relativeSkillPath
+            }
+        case .image, .pdf:
+            guard !content.isEmpty else {
+                throw CapsuleWindowDraftError.missingContent
+            }
+            guard NSString(string: content).isAbsolutePath else {
+                throw CapsuleWindowDraftError.relativeAssetPath(
+                    kind.displayName
+                )
+            }
+            let ext = URL(fileURLWithPath: content).pathExtension.lowercased()
+            let accepted: Set<String> = kind == .pdf
+                ? ["pdf"]
+                : [
+                    "png", "jpg", "jpeg", "heic", "webp", "tif",
+                    "tiff", "gif", "bmp",
+                ]
+            guard accepted.contains(ext) else {
+                throw CapsuleWindowDraftError.unsupportedAssetType(
+                    kind.displayName
+                )
+            }
+            let assetURL = URL(fileURLWithPath: content).standardizedFileURL
+            let values = try? assetURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ])
+            guard values?.isRegularFile == true,
+                  values?.isSymbolicLink != true else {
+                throw CapsuleWindowDraftError.unavailableAsset(
+                    kind.displayName
+                )
             }
         case .password:
             guard !password.isEmpty else {
@@ -288,7 +504,7 @@ final class CapsuleWindowRepository {
                     fileURL: summary.fileURL
                 )
             }
-        case .prompt, .memory, .skill:
+        case .prompt, .memory, .skill, .note, .url, .image, .pdf:
             return try contentStore.listRecords().filter { record in
                 record.summary.type == kind
                     && Self.matches(
@@ -330,7 +546,7 @@ final class CapsuleWindowRepository {
                 previousPasswords: record.secret.previousPasswords,
                 loadedRevision: after
             )
-        case .prompt, .memory, .skill:
+        case .prompt, .memory, .skill, .note, .url, .image, .pdf:
             let before = try Self.fileRevision(row.fileURL)
             let record = try contentStore.record(id: row.id)
             let after = try Self.fileRevision(record.summary.fileURL)
@@ -390,7 +606,7 @@ final class CapsuleWindowRepository {
                 revision: try Self.fileRevision(summary.fileURL),
                 fileURL: summary.fileURL
             )
-        case .prompt, .memory, .skill:
+        case .prompt, .memory, .skill, .note, .url, .image, .pdf:
             let summary: CapsuleContentSummary
             do {
                 summary = try contentStore.put(
@@ -432,7 +648,7 @@ final class CapsuleWindowRepository {
                     id: row.id,
                     expectedRevision: expectedRevision
                 )
-            case .prompt, .memory, .skill:
+            case .prompt, .memory, .skill, .note, .url, .image, .pdf:
                 try contentStore.remove(
                     id: row.id,
                     expectedRevision: expectedRevision
@@ -525,9 +741,16 @@ final class CapsuleWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write("Capsule open ignored; RIMES is not selected")
+            return
+        }
         if window == nil { build() }
         applyAppearance()
         contentController?.reloadFromStore()
+        if let window {
+            StandaloneWindowFocusCoordinator.shared.windowWillPresent(window)
+        }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async { [weak self] in
@@ -545,6 +768,9 @@ final class CapsuleWindowController: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         contentController?.discardEditorForClose()
+        guard let closingWindow = notification.object as? NSWindow,
+              closingWindow === window else { return }
+        StandaloneWindowFocusCoordinator.shared.windowWillClose(closingWindow)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -601,6 +827,8 @@ final class CapsulePaneViewController: NSViewController,
     private static let searchDebounce: TimeInterval = 0.150
 
     private let repository: CapsuleWindowRepository
+    private let cloudSyncController: CapsuleCloudSyncController?
+    private let mediaPreviewLoader = CapsuleMediaPreviewLoader.shared
     private let reloadQueue = DispatchQueue(
         label: "RIMES.CapsuleWindow.reload",
         qos: .userInitiated
@@ -608,10 +836,21 @@ final class CapsulePaneViewController: NSViewController,
 
     private let titleLabel = NSTextField(labelWithString: "$ rimes capsule")
     private let subtitleLabel = NSTextField(
-        labelWithString: "local knowledge manager · Markdown + encrypted secrets"
+        labelWithString: "local knowledge manager · Markdown + media + encrypted secrets"
+    )
+    private let syncStatusLabel = NSTextField(labelWithString: "iCloud 未设置")
+    private let syncNowButton = RimePointingHandButton(
+        title: "立即同步",
+        target: nil,
+        action: nil
+    )
+    private let syncManageButton = RimePointingHandButton(
+        title: "iCloud…",
+        target: nil,
+        action: nil
     )
     private lazy var kindControl = RimePointingHandSegmentedControl(
-        labels: CapsuleEntryKind.allCases.map(\.displayName),
+        labels: CapsuleEntryKind.allCases.map(\.tabLabel),
         trackingMode: .selectOne,
         target: self,
         action: #selector(kindChanged)
@@ -646,6 +885,10 @@ final class CapsulePaneViewController: NSViewController,
     private var titleField: NSTextField?
     private var contentTextView: NSTextView?
     private var skillPathField: NSTextField?
+    private var urlContentField: NSTextField?
+    private var assetPathField: NSTextField?
+    private weak var assetPreviewContainer: NSView?
+    private var imagePreviewView: NSImageView?
     private var passwordURLField: NSSecureTextField?
     private var passwordAppField: NSSecureTextField?
     private var passwordUsernameField: NSSecureTextField?
@@ -656,15 +899,22 @@ final class CapsulePaneViewController: NSViewController,
     private var passwordRevealTimer: Timer?
     private var searchReloadTimer: Timer?
     private var reloadGeneration: UInt64 = 0
+    private var mediaPreviewGeneration: UInt64 = 0
+    private var mediaPreviewOperation: Operation?
     private var applyingSelection = false
     private var editorDirty = false
     private var storeObserver: NSObjectProtocol?
+    private var cloudSyncObserver: NSObjectProtocol?
     private var applicationPrivacyObservers: [NSObjectProtocol] = []
     private var workspacePrivacyObservers: [NSObjectProtocol] = []
     private var distributedPrivacyObservers: [NSObjectProtocol] = []
 
-    init(repository: CapsuleWindowRepository = CapsuleWindowRepository()) {
+    init(
+        repository: CapsuleWindowRepository = CapsuleWindowRepository(),
+        cloudSyncController: CapsuleCloudSyncController? = .shared
+    ) {
         self.repository = repository
+        self.cloudSyncController = cloudSyncController
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -678,6 +928,9 @@ final class CapsulePaneViewController: NSViewController,
         passwordRevealTimer?.invalidate()
         if let storeObserver {
             NotificationCenter.default.removeObserver(storeObserver)
+        }
+        if let cloudSyncObserver {
+            NotificationCenter.default.removeObserver(cloudSyncObserver)
         }
         let center = NotificationCenter.default
         applicationPrivacyObservers.forEach(center.removeObserver)
@@ -700,6 +953,40 @@ final class CapsulePaneViewController: NSViewController,
         heading.orientation = .vertical
         heading.alignment = .leading
         heading.spacing = 2
+
+        syncStatusLabel.font = MailboxTerminalTypography.font(ofSize: 9)
+        syncStatusLabel.lineBreakMode = .byTruncatingTail
+        syncStatusLabel.maximumNumberOfLines = 1
+        syncStatusLabel.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        syncStatusLabel.setAccessibilityLabel("Capsule iCloud 同步状态")
+
+        for button in [syncNowButton, syncManageButton] {
+            button.bezelStyle = .inline
+            button.font = MailboxTerminalTypography.font(
+                ofSize: 9,
+                weight: .semibold
+            )
+            button.setContentHuggingPriority(.required, for: .horizontal)
+        }
+        syncNowButton.target = self
+        syncNowButton.action = #selector(syncNow)
+        syncNowButton.setAccessibilityLabel("立即同步 Capsule")
+        syncManageButton.target = self
+        syncManageButton.action = #selector(manageCloudSync)
+        syncManageButton.setAccessibilityLabel("管理 Capsule iCloud 同步")
+        let header = NSStackView(views: [
+            heading,
+            NSView(),
+            syncStatusLabel,
+            syncNowButton,
+            syncManageButton,
+        ])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
 
         kindControl.selectedSegment = CapsuleEntryKind.allCases.firstIndex(
             of: selectedKind
@@ -776,25 +1063,26 @@ final class CapsulePaneViewController: NSViewController,
         divider.translatesAutoresizingMaskIntoConstraints = false
         divider.identifier = NSUserInterfaceItemIdentifier("capsule-divider")
 
-        heading.translatesAutoresizingMaskIntoConstraints = false
+        header.translatesAutoresizingMaskIntoConstraints = false
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         editorContainer.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(heading)
+        root.addSubview(header)
         root.addSubview(toolbar)
         root.addSubview(listContainer)
         root.addSubview(divider)
         root.addSubview(editorContainer)
         NSLayoutConstraint.activate([
-            heading.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            heading.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -16),
-            heading.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            header.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            header.bottomAnchor.constraint(equalTo: heading.bottomAnchor),
             // NSStackView has no intrinsic height of its own. Pin its bottom to
             // the last arranged label so short Skill/Password forms cannot
             // absorb the window's free height and push the whole pane down.
             heading.bottomAnchor.constraint(equalTo: subtitleLabel.bottomAnchor),
 
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            toolbar.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 14),
+            toolbar.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
             toolbar.widthAnchor.constraint(equalToConstant: 286),
             kindControl.widthAnchor.constraint(equalTo: toolbar.widthAnchor),
             searchRow.widthAnchor.constraint(equalTo: toolbar.widthAnchor),
@@ -816,6 +1104,7 @@ final class CapsulePaneViewController: NSViewController,
         ])
 
         view = root
+        renderCloudSyncStatus()
         renderEditor()
         applyAppearance()
     }
@@ -833,6 +1122,16 @@ final class CapsulePaneViewController: NSViewController,
             }
             self.reloadFromStore()
         }
+        if let cloudSyncController {
+            cloudSyncObserver = NotificationCenter.default.addObserver(
+                forName: .capsuleCloudSyncStatusDidChange,
+                object: cloudSyncController,
+                queue: .main
+            ) { [weak self] _ in
+                self?.renderCloudSyncStatus()
+            }
+            cloudSyncController.start()
+        }
         installPrivacyObservers()
         reloadFromStore()
     }
@@ -840,6 +1139,7 @@ final class CapsulePaneViewController: NSViewController,
     override func viewDidAppear() {
         super.viewDidAppear()
         reloadFromStore()
+        cloudSyncController?.requestSync(after: 0)
     }
 
     override func viewWillDisappear() {
@@ -920,6 +1220,7 @@ final class CapsulePaneViewController: NSViewController,
         view.layer?.backgroundColor = RimeUI.surface.cgColor
         titleLabel.textColor = RimeUI.textPrimary
         subtitleLabel.textColor = RimeUI.textSecondary
+        syncStatusLabel.textColor = RimeUI.textSecondary
         statusLabel.textColor = RimeUI.textSecondary
         listContainer.layer?.backgroundColor = RimeUI.surface2.cgColor
         listContainer.layer?.borderColor = RimeUI.border.cgColor
@@ -929,6 +1230,146 @@ final class CapsulePaneViewController: NSViewController,
             $0.identifier?.rawValue == "capsule-divider"
         })?.layer?.backgroundColor = RimeUI.border.cgColor
         tableView.reloadData()
+    }
+
+    private func renderCloudSyncStatus() {
+        guard isViewLoaded else { return }
+        guard let cloudSyncController else {
+            syncStatusLabel.isHidden = true
+            syncNowButton.isHidden = true
+            syncManageButton.isHidden = true
+            return
+        }
+        let status = cloudSyncController.status
+        syncStatusLabel.isHidden = false
+        syncNowButton.isHidden = false
+        syncManageButton.isHidden = false
+        switch status.phase {
+        case .unconfigured:
+            syncStatusLabel.stringValue = "iCloud 未设置"
+        case .unavailable:
+            syncStatusLabel.stringValue = "iCloud Drive 不可用"
+        case .idle:
+            syncStatusLabel.stringValue = "iCloud 等待同步"
+        case .syncing:
+            syncStatusLabel.stringValue = "iCloud 正在同步"
+        case .synced:
+            if status.deferredCount > 0 {
+                syncStatusLabel.stringValue =
+                    "iCloud · \(status.deferredCount) 个媒体待本机文件"
+            } else if status.conflictCount > 0 {
+                syncStatusLabel.stringValue = "iCloud · \(status.conflictCount) 个冲突"
+            } else if let date = status.lastSyncedAt {
+                let time = DateFormatter.localizedString(
+                    from: date,
+                    dateStyle: .none,
+                    timeStyle: .short
+                )
+                syncStatusLabel.stringValue = "iCloud 已同步 \(time)"
+            } else {
+                syncStatusLabel.stringValue = "iCloud 已同步"
+            }
+        case .failed:
+            syncStatusLabel.stringValue = "iCloud 同步失败"
+        }
+        syncStatusLabel.toolTip = [status.folderName, status.message]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+        syncNowButton.isEnabled = status.isConfigured
+            && status.phase != .unavailable
+            && !status.isBusy
+        syncManageButton.isEnabled = !status.isBusy
+    }
+
+    @objc private func syncNow() {
+        cloudSyncController?.requestSync(after: 0)
+    }
+
+    @objc private func manageCloudSync() {
+        guard let cloudSyncController else { return }
+        guard cloudSyncController.status.isConfigured else {
+            chooseCloudSyncFolder()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "管理 Capsule iCloud 同步"
+        alert.informativeText = "关闭只会停止自动同步，不会删除本机或 iCloud Drive 中的内容。Password、Skill 路径与主密钥始终保留在本机。"
+        alert.addButton(withTitle: "更换文件夹…")
+        alert.addButton(withTitle: "关闭同步")
+        alert.addButton(withTitle: "取消")
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn:
+                self.chooseCloudSyncFolder()
+            case .alertSecondButtonReturn:
+                cloudSyncController.disable { [weak self] result in
+                    if case let .failure(error) = result {
+                        self?.presentCloudSyncError(error)
+                    }
+                }
+            default:
+                break
+            }
+        }
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            handle(alert.runModal())
+        }
+    }
+
+    private func chooseCloudSyncFolder() {
+        guard let cloudSyncController else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择 Capsule iCloud Drive 文件夹"
+        panel.message = "请在 iCloud Drive 中新建或选择一个空文件夹。Prompt、Memory、Note、URL、Image 与 PDF 会同步；Password、Skill 路径与主密钥不会上传。"
+        panel.prompt = "使用此文件夹"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.resolvesAliases = false
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(
+                "Library/Mobile Documents/com~apple~CloudDocs",
+                isDirectory: true
+            ),
+            home.appendingPathComponent(
+                "Library/CloudStorage",
+                isDirectory: true
+            ),
+        ]
+        panel.directoryURL = candidates.first {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            cloudSyncController.configure(folderURL: url) { [weak self] result in
+                if case let .failure(error) = result {
+                    self?.presentCloudSyncError(error)
+                }
+            }
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            handle(panel.runModal())
+        }
+    }
+
+    private func presentCloudSyncError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "无法启用 iCloud 同步"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "好")
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     /// Native smoke hook: render the real AppKit pane at a deterministic size
@@ -1072,6 +1513,15 @@ final class CapsulePaneViewController: NSViewController,
 
     func controlTextDidChange(_ notification: Notification) {
         editorDirty = true
+        guard let field = notification.object as? NSTextField,
+              field === assetPathField,
+              draft.kind == .image || draft.kind == .pdf,
+              let preview = assetPreviewContainer else { return }
+        // Keep the preview guard in sync with the visible field immediately.
+        // Otherwise a late decode for the old path can repaint this editor.
+        draft.content = field.stringValue
+        imagePreviewView = nil
+        loadAssetPreview(kind: draft.kind, path: draft.content, in: preview)
     }
 
     func textDidChange(_ notification: Notification) {
@@ -1272,6 +1722,9 @@ final class CapsulePaneViewController: NSViewController,
 
     private func renderEditor() {
         guard isViewLoaded else { return }
+        mediaPreviewOperation?.cancel()
+        mediaPreviewOperation = nil
+        mediaPreviewGeneration &+= 1
         for view in formStack.arrangedSubviews {
             formStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -1279,6 +1732,10 @@ final class CapsulePaneViewController: NSViewController,
         titleField = nil
         contentTextView = nil
         skillPathField = nil
+        urlContentField = nil
+        assetPathField = nil
+        assetPreviewContainer = nil
+        imagePreviewView = nil
         passwordURLField = nil
         passwordAppField = nil
         passwordUsernameField = nil
@@ -1338,10 +1795,21 @@ final class CapsulePaneViewController: NSViewController,
         addField(label: "TITLE", field: title)
 
         switch draft.kind {
-        case .prompt, .memory:
+        case .prompt, .memory, .note:
             let textView = makeContentTextView(text: draft.content)
             contentTextView = textView
-            addTextArea(label: "CONTENT", textView: textView)
+            addTextArea(
+                label: draft.kind == .note ? "NOTE · MARKDOWN" : "CONTENT",
+                textView: textView
+            )
+        case .url:
+            let field = NSTextField(string: draft.content)
+            field.placeholderString = "https://example.com/path"
+            field.font = MailboxTerminalTypography.font(ofSize: 11)
+            field.setAccessibilityLabel("完整 URL")
+            field.delegate = self
+            urlContentField = field
+            addField(label: "URL", field: field)
         case .skill:
             let pathField = NSTextField(string: draft.content)
             pathField.placeholderString = "/Users/name/path/to/skill"
@@ -1361,6 +1829,8 @@ final class CapsulePaneViewController: NSViewController,
             row.alignment = .centerY
             row.spacing = 8
             addField(label: "ABSOLUTE PATH", field: row)
+        case .image, .pdf:
+            addAssetFields(kind: draft.kind)
         case .password:
             addPasswordFields()
         }
@@ -1469,6 +1939,183 @@ final class CapsulePaneViewController: NSViewController,
         addField(label: label, field: scroll)
     }
 
+    private func addAssetFields(kind: CapsuleEntryKind) {
+        precondition(kind == .image || kind == .pdf)
+        let pathField = NSTextField(string: draft.content)
+        pathField.placeholderString = kind == .image
+            ? "/Users/name/Pictures/example.png"
+            : "/Users/name/Documents/example.pdf"
+        pathField.font = MailboxTerminalTypography.font(ofSize: 11)
+        pathField.setAccessibilityLabel("\(kind.displayName) 绝对路径")
+        pathField.delegate = self
+        assetPathField = pathField
+
+        let chooseButton = RimePointingHandButton(
+            title: kind == .image ? "选择图片…" : "选择 PDF…",
+            target: self,
+            action: #selector(chooseAssetFile)
+        )
+        chooseButton.bezelStyle = .rounded
+        chooseButton.font = MailboxTerminalTypography.font(ofSize: 10)
+        let pathRow = NSStackView(views: [pathField, chooseButton])
+        pathRow.orientation = .horizontal
+        pathRow.alignment = .centerY
+        pathRow.spacing = 8
+        addField(label: "ABSOLUTE PATH", field: pathRow)
+
+        let preview = NSView()
+        preview.wantsLayer = true
+        preview.layer?.backgroundColor = RimeUI.surface3.cgColor
+        preview.layer?.borderColor = RimeUI.border.cgColor
+        preview.layer?.borderWidth = 1
+        preview.layer?.cornerRadius = 5
+        preview.heightAnchor.constraint(equalToConstant: 360).isActive = true
+        assetPreviewContainer = preview
+
+        loadAssetPreview(kind: kind, path: draft.content, in: preview)
+        addField(label: "PREVIEW", field: preview)
+    }
+
+    private func loadAssetPreview(
+        kind: CapsuleEntryKind,
+        path: String,
+        in container: NSView
+    ) {
+        mediaPreviewOperation?.cancel()
+        mediaPreviewOperation = nil
+        mediaPreviewGeneration &+= 1
+        let generation = mediaPreviewGeneration
+        guard !path.isEmpty else {
+            installAssetPreviewMessage(
+                kind == .image
+                    ? "选择图片后在这里预览"
+                    : "选择 PDF 后在这里预览",
+                in: container
+            )
+            return
+        }
+        installAssetPreviewMessage("正在读取本机文件…", in: container)
+        mediaPreviewOperation = mediaPreviewLoader.load(
+            kind: kind,
+            path: path
+        ) { [weak self, weak container] result in
+            guard let self,
+                  let container,
+                  generation == self.mediaPreviewGeneration,
+                  self.draft.kind == kind,
+                  self.draft.content == path,
+                  container.superview != nil else { return }
+            container.subviews.forEach { $0.removeFromSuperview() }
+            switch result {
+            case let .image(image):
+                let imageView = NSImageView()
+                imageView.image = NSImage(
+                    cgImage: image,
+                    size: NSSize(width: image.width, height: image.height)
+                )
+                imageView.imageScaling = .scaleProportionallyUpOrDown
+                imageView.imageAlignment = .alignCenter
+                imageView.setAccessibilityLabel("图片预览")
+                imageView.translatesAutoresizingMaskIntoConstraints = false
+                container.addSubview(imageView)
+                NSLayoutConstraint.activate([
+                    imageView.leadingAnchor.constraint(
+                        equalTo: container.leadingAnchor,
+                        constant: 8
+                    ),
+                    imageView.trailingAnchor.constraint(
+                        equalTo: container.trailingAnchor,
+                        constant: -8
+                    ),
+                    imageView.topAnchor.constraint(
+                        equalTo: container.topAnchor,
+                        constant: 8
+                    ),
+                    imageView.bottomAnchor.constraint(
+                        equalTo: container.bottomAnchor,
+                        constant: -8
+                    ),
+                ])
+                self.imagePreviewView = imageView
+            case let .pdf(image, pageCount):
+                let imageView = NSImageView()
+                imageView.image = NSImage(
+                    cgImage: image,
+                    size: NSSize(width: image.width, height: image.height)
+                )
+                imageView.imageScaling = .scaleProportionallyUpOrDown
+                imageView.imageAlignment = .alignCenter
+                imageView.setAccessibilityLabel("PDF 第 1 页预览，共 \(pageCount) 页")
+                imageView.translatesAutoresizingMaskIntoConstraints = false
+                let pageLabel = NSTextField(
+                    labelWithString: "第 1 页预览 · 共 \(pageCount) 页"
+                )
+                pageLabel.font = MailboxTerminalTypography.font(ofSize: 9)
+                pageLabel.textColor = RimeUI.textSecondary
+                pageLabel.alignment = .center
+                pageLabel.translatesAutoresizingMaskIntoConstraints = false
+                container.addSubview(imageView)
+                container.addSubview(pageLabel)
+                NSLayoutConstraint.activate([
+                    imageView.leadingAnchor.constraint(
+                        equalTo: container.leadingAnchor
+                    ),
+                    imageView.trailingAnchor.constraint(
+                        equalTo: container.trailingAnchor
+                    ),
+                    imageView.topAnchor.constraint(equalTo: container.topAnchor),
+                    imageView.bottomAnchor.constraint(
+                        equalTo: pageLabel.topAnchor,
+                        constant: -4
+                    ),
+                    pageLabel.leadingAnchor.constraint(
+                        equalTo: container.leadingAnchor,
+                        constant: 8
+                    ),
+                    pageLabel.trailingAnchor.constraint(
+                        equalTo: container.trailingAnchor,
+                        constant: -8
+                    ),
+                    pageLabel.bottomAnchor.constraint(
+                        equalTo: container.bottomAnchor,
+                        constant: -8
+                    ),
+                ])
+                self.imagePreviewView = imageView
+            case .unavailable:
+                self.installAssetPreviewMessage(
+                    "无法读取文件；请检查路径、格式或文件大小",
+                    in: container
+                )
+            }
+        }
+    }
+
+    private func installAssetPreviewMessage(
+        _ message: String,
+        in container: NSView
+    ) {
+        container.subviews.forEach { $0.removeFromSuperview() }
+        let label = NSTextField(labelWithString: message)
+        label.font = MailboxTerminalTypography.font(ofSize: 10)
+        label.textColor = RimeUI.textSecondary
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            label.leadingAnchor.constraint(
+                greaterThanOrEqualTo: container.leadingAnchor,
+                constant: 16
+            ),
+            label.trailingAnchor.constraint(
+                lessThanOrEqualTo: container.trailingAnchor,
+                constant: -16
+            ),
+        ])
+    }
+
     private func fieldLabel(_ value: String) -> NSTextField {
         let label = NSTextField(labelWithString: value)
         label.font = MailboxTerminalTypography.font(
@@ -1546,10 +2193,14 @@ final class CapsulePaneViewController: NSViewController,
     private func captureDraftFromFields() {
         draft.title = titleField?.stringValue ?? draft.title
         switch draft.kind {
-        case .prompt, .memory:
+        case .prompt, .memory, .note:
             draft.content = contentTextView?.string ?? draft.content
+        case .url:
+            draft.content = urlContentField?.stringValue ?? draft.content
         case .skill:
             draft.content = skillPathField?.stringValue ?? draft.content
+        case .image, .pdf:
+            draft.content = assetPathField?.stringValue ?? draft.content
         case .password:
             draft.url = passwordURLField?.stringValue ?? draft.url
             draft.app = passwordAppField?.stringValue ?? draft.app
@@ -1723,6 +2374,35 @@ final class CapsulePaneViewController: NSViewController,
             self?.skillPathField?.stringValue = path
             self?.editorDirty = true
             self?.setStatus("Skill 路径尚未保存")
+        }
+    }
+
+    @objc private func chooseAssetFile() {
+        guard draft.kind == .image || draft.kind == .pdf,
+              let window = view.window else { return }
+        captureDraftFromFields()
+        let kind = draft.kind
+        let panel = NSOpenPanel()
+        panel.title = kind == .image ? "选择 Capsule 图片" : "选择 Capsule PDF"
+        panel.message = "Capsule 只保存该文件在当前电脑中的绝对路径。"
+        panel.prompt = "选择"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = false
+        panel.allowedContentTypes = kind == .image ? [.image] : [.pdf]
+        if !draft.content.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: draft.content)
+                .deletingLastPathComponent()
+        }
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self,
+                  response == .OK,
+                  let selectedURL = panel.url else { return }
+            self.draft.content = selectedURL.standardizedFileURL.path
+            self.editorDirty = true
+            self.renderEditor()
+            self.setStatus("\(kind.displayName) 路径尚未保存")
         }
     }
 

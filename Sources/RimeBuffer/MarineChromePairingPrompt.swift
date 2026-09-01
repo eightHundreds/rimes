@@ -42,6 +42,14 @@ final class MarineChromePairingPromptController: NSObject, NSWindowDelegate {
         dispatchPrecondition(condition: .onQueue(.main))
         finish(approved: false)
 
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write(
+                "marine pairing prompt rejected; RIMES is not selected"
+            )
+            respond(false)
+            return
+        }
+
         let panel = MarineChromePairingPanel(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 250),
             styleMask: [.titled, .closable, .utilityWindow],
@@ -116,6 +124,7 @@ final class MarineChromePairingPromptController: NSObject, NSWindowDelegate {
             self?.finish(approved: false)
         }
         panel.center()
+        StandaloneWindowFocusCoordinator.shared.windowWillPresent(panel)
         NSApp.activate(ignoringOtherApps: true)
         NSApp.requestUserAttention(.criticalRequest)
         panel.makeKeyAndOrderFront(nil)
@@ -135,10 +144,24 @@ final class MarineChromePairingPromptController: NSObject, NSWindowDelegate {
         finish(approved: false)
     }
 
-    @objc private func approve() { finish(approved: true) }
+    @objc private func approve() {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write(
+                "marine pairing approval rejected; RIMES is not selected"
+            )
+            finish(approved: false)
+            return
+        }
+        finish(approved: true)
+    }
     @objc private func reject() { finish(approved: false) }
 
     func windowWillClose(_ notification: Notification) {
+        if let closingWindow = notification.object as? NSWindow {
+            StandaloneWindowFocusCoordinator.shared.windowWillClose(
+                closingWindow
+            )
+        }
         finish(approved: false, closeWindow: false)
     }
 
@@ -153,7 +176,12 @@ final class MarineChromePairingPromptController: NSObject, NSWindowDelegate {
         codeLabel = nil
         currentPanel?.delegate = nil
         currentPanel?.onCancel = nil
-        if closeWindow { currentPanel?.close() }
+        if closeWindow, let currentPanel {
+            currentPanel.close()
+            StandaloneWindowFocusCoordinator.shared.windowWillClose(
+                currentPanel
+            )
+        }
         callback?(approved)
     }
 }

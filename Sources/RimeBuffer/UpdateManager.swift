@@ -585,8 +585,10 @@ final class UpdateManager {
         alert.addButton(withTitle: "打开系统安装器")
         alert.addButton(withTitle: "稍后")
         alert.window.appearance = RimeUI.appKitAppearance
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert) == .alertFirstButtonReturn else {
+            return
+        }
         installStagedUpdate(version: version, package: package)
     }
 
@@ -1025,8 +1027,8 @@ final class UpdateManager {
         alert.alertStyle = warning ? .warning : .informational
         alert.addButton(withTitle: "好的")
         alert.window.appearance = RimeUI.appKitAppearance
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        _ = StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert)
     }
 
     private func showUpdateFailure(title: String, message: String) {
@@ -1037,8 +1039,8 @@ final class UpdateManager {
         alert.addButton(withTitle: "打开官方 Releases")
         alert.addButton(withTitle: "关闭")
         alert.window.appearance = RimeUI.appKitAppearance
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+        if StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert) == .alertFirstButtonReturn {
             openReleasesPage()
         }
     }

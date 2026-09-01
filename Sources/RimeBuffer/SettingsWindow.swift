@@ -506,6 +506,24 @@ private final class SettingsCardActionSmokeProbe: NSObject {
     }
 }
 
+enum SettingsWindowPresentationRules {
+    private static let standaloneShowCommands: Set<String> = [
+        "settings-preview",
+        "theme-appkit-smoke",
+    ]
+
+    static func isStandaloneShowCommand(arguments: [String]) -> Bool {
+        !standaloneShowCommands.isDisjoint(with: arguments)
+    }
+
+    static func allowsShow(
+        currentInputSourceIsOwn: Bool,
+        isStandaloneShowCommand: Bool
+    ) -> Bool {
+        currentInputSourceIsOwn || isStandaloneShowCommand
+    }
+}
+
 /// Central settings surface for input schemas, candidate UI, buffer mode,
 /// AI/local connectors, and diagnostics.
 final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDelegate {
@@ -646,7 +664,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         RimeUI.accentTextColor
     }
 
-    func show() {
+    @discardableResult
+    func show() -> Bool {
+        let isStandaloneShowCommand = SettingsWindowPresentationRules
+            .isStandaloneShowCommand(arguments: CommandLine.arguments)
+        guard SettingsWindowPresentationRules.allowsShow(
+            currentInputSourceIsOwn: RimeInputSourceAuthority.currentSourceIsOwn(),
+            isStandaloneShowCommand: isStandaloneShowCommand
+        ) else {
+            IMELog.write("Settings open ignored; RIMES is not selected")
+            return false
+        }
         // `settings-preview` reaches this method before `app.run()`; the live
         // IMK process is already running, so this branch is a preview-only
         // launch prerequisite and a no-op in production.
@@ -655,22 +683,29 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
         if window == nil { build() }
         if window?.isVisible == true {
+            if let window {
+                StandaloneWindowFocusCoordinator.shared.windowWillPresent(window)
+            }
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
-            return
+            return true
         }
         rebuildRouteCatalog()
         reload()
         showCurrentRoute()
+        if let window {
+            StandaloneWindowFocusCoordinator.shared.windowWillPresent(window)
+        }
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
         window?.contentView?.layoutSubtreeIfNeeded()
         window?.contentView?.display()
+        return true
     }
 
     func showBufferSettings() {
-        show()
+        guard show() else { return }
         _ = navigation.selectRoute(SettingsCoreRoute.buffer.id,
                                    catalog: routeCatalog)
         _ = navigation.selectSubpage(
@@ -682,7 +717,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     func showPluginConfiguration(pluginKey: PluginKey) {
-        show()
+        guard show() else { return }
         _ = navigation.selectRoute(SettingsCoreRoute.plugins.id,
                                    catalog: routeCatalog)
         _ = navigation.selectSubpage(PluginManagementSubpage.bufferPlugins.id,
@@ -1452,7 +1487,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard notification.object as? NSWindow === window else { return }
+        guard let closingWindow = notification.object as? NSWindow,
+              closingWindow === window else { return }
         if let sheet = pluginConfigurationSheet {
             window?.endSheet(sheet)
             sheet.orderOut(nil)
@@ -1481,6 +1517,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         activeCapsuleController?.discardEditorForClose()
         activeCapsuleController = nil
         candidatePreview = nil
+        StandaloneWindowFocusCoordinator.shared.windowWillClose(closingWindow)
     }
 
     private func configureControls() {
@@ -2045,7 +2082,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             case .mailbox:
                 return "独立管理本地保存的 AI 会话与待审核外部推送。"
             case .capsule:
-                return "独立管理本机 Prompt、Memory、Password 与 Skill。"
+                return "独立管理本机 Prompt、Memory、Password、Skill、Note、URL、Image 与 PDF。"
             case .connectors:
                 return "管理 AI 模型与本地网关。"
             case .plugins:
@@ -4453,6 +4490,10 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     @objc private func deployAndRestart() {
+        guard RimeInputSourceAuthority.currentSourceIsOwn() else {
+            IMELog.write("settings deploy ignored; RIMES is not selected")
+            return
+        }
         do {
             try persistSchemaSelection()
         } catch {
@@ -4460,7 +4501,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             return
         }
         RimeBufferController.active?.forceCommit()
-        info("开始部署…完成后输入法会自动重启。")
+        guard info("开始部署…完成后输入法会自动重启。") else {
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             _ = rimeEngine.start()
             let ok = BBRimeDeploy()
@@ -4491,7 +4534,10 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")
         alert.window.appearance = RimeUI.appKitAppearance
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert) == .alertFirstButtonReturn else {
+            return
+        }
 
         RimeBufferController.active?.forceCommit()
         InputMetricsPersistence.saveNow()
@@ -4689,7 +4735,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.tabSeparatedText, .plainText]
         panel.appearance = RimeUI.appKitAppearance
-        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
+        guard panel.runModal() == .OK,
+              RimeInputSourceAuthority.currentSourceIsOwn(),
+              let sourceURL = panel.url else { return }
 
         let confirmation = NSAlert()
         confirmation.alertStyle = .informational
@@ -4698,7 +4746,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         confirmation.addButton(withTitle: "导入并合并")
         confirmation.addButton(withTitle: "取消")
         confirmation.window.appearance = RimeUI.appKitAppearance
-        guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+        guard StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(confirmation)
+                == .alertFirstButtonReturn else { return }
 
         do {
             let result = try UserLexiconService.shared.importLearningData(kind,
@@ -4720,7 +4770,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         panel.canCreateDirectories = true
         panel.allowedContentTypes = [.tabSeparatedText]
         panel.appearance = RimeUI.appKitAppearance
-        guard panel.runModal() == .OK, let destinationURL = panel.url else { return }
+        guard panel.runModal() == .OK,
+              RimeInputSourceAuthority.currentSourceIsOwn(),
+              let destinationURL = panel.url else { return }
 
         do {
             let result = try UserLexiconService.shared.exportLearningData(kind,
@@ -4739,7 +4791,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         alert.informativeText = (error as? LocalizedError)?.errorDescription
             ?? error.localizedDescription
         alert.window.appearance = RimeUI.appKitAppearance
-        alert.runModal()
+        _ = StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert)
     }
 
     @objc private func openDir() {
@@ -4766,10 +4819,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         NSWorkspace.shared.open(installLogURL)
     }
 
-    private func info(_ message: String) {
+    @discardableResult
+    private func info(_ message: String) -> Bool {
         let alert = NSAlert()
         alert.messageText = message
         alert.window.appearance = RimeUI.appKitAppearance
-        alert.runModal()
+        return StandaloneWindowFocusCoordinator.shared
+            .runModalAlertIfRIMESActive(alert) != nil
     }
 }
