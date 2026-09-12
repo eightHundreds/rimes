@@ -68,6 +68,57 @@ cd platforms/android
 首次在设备上启动会编译全部词典（雾凇词库较大），仪器测试与 E2E 脚本都为此预留了
 足够超时；后续启动直接复用 `files/rime/user/build`。
 
+## 发布（CI/CD）
+
+`.github/workflows/android-release.yml` 负责把 `:app:assembleRelease` 的产物发到
+GitHub Releases，步骤与本文档上面的“构建”一致（`fetch-prebuilt.sh` +
+`build-opencc-data.sh` + `preview.py verify`），只是切到 release 变体并附加签名与
+发布逻辑。
+
+**触发方式**
+
+- 推送形如 `android-v0.5.0`、`android-v0.5.0-android.1` 的 tag（
+  `^android-v` + 语义化版本，可带 `-suffix` 预发布后缀）会构建并把
+  `RIMES-Android-<version>.apk`（连同 `.sha256` 校验文件）发布为一条新的
+  GitHub Release。已存在同名 Release 时任务直接失败，不会覆盖资产。
+- `workflow_dispatch`（Actions 页手动触发）只构建、跑 JVM 单测并上传 Actions
+  Artifact 供检查，不会创建 Release——用来在不打 tag 的情况下验证这条流水线本身
+  是否能跑通。
+- 产物 ABI 固定为 `arm64-v8a` + `x86_64`（与 `gradle.properties` 里
+  `rimesAbis` 的默认值一致），跟仓库默认调试构建一样。
+
+**签名策略**
+
+`app/build.gradle.kts` 的 release 变体默认签名到 Gradle 自带的 debug
+keystore——这保证在没有配置任何 secret 之前，workflow 也能跑通并产出一个可安装、
+已签名的 APK（只是不能用同一个 key 连续升级安装到已发布正式签名的设备上）。
+
+要切换到正式签名，在仓库（或组织）设置里添加下面四个 Actions secret，workflow 会
+自动检测并改用它们，不需要再改代码：
+
+| Secret | 内容 |
+|---|---|
+| `RIMES_ANDROID_RELEASE_KEYSTORE_BASE64` | 正式发布用 `.jks`/`.keystore` 文件的 base64（如 `base64 -i release.keystore \| tr -d '\n'`） |
+| `RIMES_ANDROID_RELEASE_KEYSTORE_PASSWORD` | keystore 密码 |
+| `RIMES_ANDROID_RELEASE_KEY_ALIAS` | 签名 key 的 alias |
+| `RIMES_ANDROID_RELEASE_KEY_PASSWORD` | 该 key 的密码 |
+
+四个 secret 全部存在时，`app/build.gradle.kts` 会新增一个 `release`
+`signingConfig`（用运行期解出的 keystore 文件 + 上述密码/alias），并让 release
+构建类型改用它；任何一个缺失都会继续回退到 debug keystore，workflow 不会因为缺
+keystore 而失败，只会在 Release 说明和 Actions 日志里标注这是 debug 签名。
+
+本地构建同一个正式签名 APK：
+
+```bash
+cd platforms/android
+export RIMES_ANDROID_RELEASE_KEYSTORE_PATH=/path/to/release.keystore
+export RIMES_ANDROID_RELEASE_KEYSTORE_PASSWORD=...
+export RIMES_ANDROID_RELEASE_KEY_ALIAS=...
+export RIMES_ANDROID_RELEASE_KEY_PASSWORD=...
+./gradlew :app:assembleRelease
+```
+
 ## 未对齐项
 
 以下 macOS 能力在本阶段没有移植，原因见 PR 说明：AI 生成（Codex/Claude CLI、

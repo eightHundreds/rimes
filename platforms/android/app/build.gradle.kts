@@ -15,6 +15,27 @@ val requestedAbis: List<String> = (project.findProperty("rimesAbis") as String? 
     .map { it.trim() }
     .filter { it.isNotEmpty() }
 
+// ---------------------------------------------------------------------------
+// Release signing
+//
+// A formal release keystore is optional. When the four
+// RIMES_ANDROID_RELEASE_* environment variables are all present (wired from
+// GitHub secrets by .github/workflows/android-release.yml — see
+// platforms/android/README.md for the exact secret names and how to rotate
+// them), the release build type is signed with that keystore. Otherwise it
+// falls back to the stock Gradle debug keystore, so `assembleRelease` always
+// produces an installable, signed APK even before a real keystore exists.
+// ---------------------------------------------------------------------------
+val releaseKeystorePath: String? = System.getenv("RIMES_ANDROID_RELEASE_KEYSTORE_PATH")
+val releaseKeystorePassword: String? = System.getenv("RIMES_ANDROID_RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = System.getenv("RIMES_ANDROID_RELEASE_KEY_ALIAS")
+val releaseKeyPassword: String? = System.getenv("RIMES_ANDROID_RELEASE_KEY_PASSWORD")
+val hasFormalReleaseSigning: Boolean =
+    !releaseKeystorePath.isNullOrBlank() &&
+        !releaseKeystorePassword.isNullOrBlank() &&
+        !releaseKeyAlias.isNullOrBlank() &&
+        !releaseKeyPassword.isNullOrBlank()
+
 android {
     namespace = "com.isaac.inputmethod.rimes"
     compileSdk = 35
@@ -44,10 +65,25 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasFormalReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasFormalReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
         debug {
             isMinifyEnabled = false
