@@ -21,6 +21,18 @@ $previewTool = Join-Path $repositoryRoot 'scripts/platform-preview/preview.py'
 if (-not (Test-Path -LiteralPath $previewTool -PathType Leaf)) {
     throw "The reviewed platform-preview staging tool is missing: $previewTool"
 }
+$previewPolicy = Join-Path $repositoryRoot 'scripts/platform-preview/policy.json'
+if (-not (Test-Path -LiteralPath $previewPolicy -PathType Leaf)) {
+    throw "The reviewed platform-preview policy is missing: $previewPolicy"
+}
+# The reviewed closure size is owned by policy.json's include list. Read it
+# from there so the staged-inventory guard cannot drift when the policy is
+# re-reviewed.
+$policy = Get-Content -LiteralPath $previewPolicy -Raw -Encoding UTF8 | ConvertFrom-Json
+$expectedPayloadFiles = @($policy.include).Count
+if ($expectedPayloadFiles -lt 1) {
+    throw "The reviewed platform-preview policy include list is empty: $previewPolicy"
+}
 $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
 if ($null -eq $pythonCommand) {
     $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
@@ -63,8 +75,8 @@ try {
         throw "The reviewed platform-preview staging policy failed with exit code $LASTEXITCODE."
     }
     $stagedInventory = @(Get-SafePayloadInventory -PayloadRoot $stagedPayloadRoot)
-    if ($stagedInventory.Count -ne 52) {
-        throw "The reviewed preview closure must currently contain exactly 52 files; found $($stagedInventory.Count)."
+    if ($stagedInventory.Count -ne $expectedPayloadFiles) {
+        throw "The reviewed preview closure must contain exactly $expectedPayloadFiles files (policy.json include); found $($stagedInventory.Count)."
     }
 
     foreach ($scriptName in @(

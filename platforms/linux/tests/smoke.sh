@@ -72,8 +72,13 @@ package_root=$(find "$tmp_root/extracted" -mindepth 1 -maxdepth 1 -type d -print
 [[ -f "$package_root/THIRD_PARTY_NOTICES.md" ]] || fail "package omitted third-party notices"
 
 payload="$package_root/data/rime-data"
+policy="$PLATFORM_ROOT/../../scripts/platform-preview/policy.json"
+expected_count=$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))["include"]))' "$policy") ||
+    fail "cannot read the reviewed include count from policy.json"
+[[ "$expected_count" =~ ^[1-9][0-9]*$ ]] || fail "policy include count is not a positive integer: $expected_count"
 payload_count=$(find -P "$payload" -type f | wc -l | tr -d '[:space:]')
-[[ "$payload_count" == "52" ]] || fail "expected 52 reviewed payload files, got $payload_count"
+[[ "$payload_count" == "$expected_count" ]] ||
+    fail "expected $expected_count reviewed payload files (policy.json include), got $payload_count"
 [[ -f "$payload/licenses/GPL-3.0.txt" ]] || fail "package omitted GPL-3.0 text"
 [[ -f "$payload/licenses/rime-ice-SOURCE.md" ]] || fail "package omitted Rime Ice source notice"
 [[ -f "$payload/licenses/rime-wubi-LICENSE" ]] || fail "package omitted Rime Wubi license"

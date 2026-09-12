@@ -75,10 +75,30 @@ fi
     rimes_die "repository rime-data directory not found; package.sh must run from a source checkout"
 [[ -f "$repo_root/LICENSE" ]] || rimes_die "project LICENSE not found"
 preview_tool="$repo_root/scripts/platform-preview/preview.py"
+preview_policy="$repo_root/scripts/platform-preview/policy.json"
 rimes_command_exists python3 ||
     rimes_die "python3 is required to stage the reviewed preview payload"
 [[ -f "$preview_tool" ]] ||
     rimes_die "reviewed platform-preview staging tool not found: $preview_tool"
+[[ -f "$preview_policy" ]] ||
+    rimes_die "reviewed platform-preview policy not found: $preview_policy"
+
+# The reviewed closure size is owned by policy.json's include list. Read it
+# from there so the guard below cannot drift when the policy is re-reviewed.
+expected_count=$(python3 - "$preview_policy" <<'EOF'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    policy = json.load(handle)
+include = policy.get("include")
+if not isinstance(include, list) or not include:
+    sys.exit("policy include must be a non-empty array")
+print(len(include))
+EOF
+) || rimes_die "cannot read the reviewed include list from $preview_policy"
+[[ "$expected_count" =~ ^[1-9][0-9]*$ ]] ||
+    rimes_die "policy include count is not a positive integer: $expected_count"
 
 mkdir -p "$output_dir"
 output_dir=$(CDPATH= cd -- "$output_dir" && pwd -P)
@@ -134,8 +154,8 @@ while IFS= read -r -d '' file; do
 done < <(find -P "$package_root/data/rime-data" -type f -print0)
 
 staged_count=$(find -P "$package_root/data/rime-data" -type f | wc -l | tr -d '[:space:]')
-[[ "$staged_count" == "52" ]] ||
-    rimes_die "reviewed payload must contain exactly 52 files, found $staged_count"
+[[ "$staged_count" == "$expected_count" ]] ||
+    rimes_die "reviewed payload must contain exactly $expected_count files (policy.json include), found $staged_count"
 [[ ! -e "$package_root/data/rime-data/rime_ai.example.json" ]] ||
     rimes_die "legacy AI example unexpectedly entered the reviewed payload"
 if find -P "$package_root/data/rime-data/lua" -type f -name 'ai_*.lua' -print -quit | grep -q .; then
