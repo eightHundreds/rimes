@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The RIMES parent input method with a single Simplified Chinese subtype.
+     Schema switching (雾凇全拼 / 双拼 / 五笔 / 英文 / 飞耀) happens inside the
+     IME, mirroring the macOS single input source with in-app schema menu. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.isaac.inputmethod.rimes.settings.SettingsActivity"
+    android:supportsSwitchingToNextInputMethod="true">
+    <subtype
+        android:label="@string/ime_subtype_zh"
+        android:imeSubtypeLocale="zh_CN"
+        android:languageTag="zh-Hans-CN"
+        android:imeSubtypeMode="keyboard"
+        android:isAsciiCapable="true" />
+</input-method>

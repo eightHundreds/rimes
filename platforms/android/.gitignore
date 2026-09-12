@@ -1,0 +1,18 @@
+# Gradle / Android Studio state
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+.cxx/
+
+# Third-party binaries fetched by scripts/fetch-prebuilt.sh and generated OpenCC
+# dictionaries from scripts/build-opencc-data.sh. Never commit them; they are
+# pinned by commit and rebuilt from source like Vendor/ on macOS.
+third_party/
+
+# Emulator / test output
+app/build/
+e2e-out/
