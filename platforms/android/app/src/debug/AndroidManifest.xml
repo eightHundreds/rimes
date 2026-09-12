@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug-only automation hook used by scripts/e2e-emulator.sh. Absent from release builds. -->
+        <receiver
+            android:name=".debug.E2EControlReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.isaac.inputmethod.rimes.E2E_SET_BUFFER" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

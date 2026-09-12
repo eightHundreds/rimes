@@ -130,6 +130,18 @@ package alone. Use the
 `RIMES-Linux-Data-Preview-*`; see [CROSS-PLATFORM-PREVIEW.md](CROSS-PLATFORM-PREVIEW.md)
 for the exact boundary, safety model, and validation commands.
 
+### Native Android input method (in development)
+
+[platforms/android](platforms/android/README.md) is a native Android `InputMethodService`.
+It compiles the same librime C++ bridge and key contract as macOS, statically links a pinned
+librime (with the lua / octagram / predict plugins), ships the same reviewed `rime-data`
+closure plus OpenCC data inside the APK, and ports the five core schemas plus the optional
+Chording extension, per-field Rime sessions, the candidate bar with an expanded matrix, the
+Buffer workbench (tap/hold Return delivery), the schema switcher, the four themes, settings,
+user-lexicon export/import and the statistics extension. AI generation, Apple Translation,
+Clipboard History, Mailbox, Capsule and auto-update are not ported; see its README for the
+source build and emulator tests.
+
 ## Docs
 
 | Doc | Contents |

@@ -25,10 +25,14 @@ RIMES treats material work by coding agents as an open-source contribution:
 - Temporary subagents are credited through their parent agent unless they have their own persistent public identity.
 - Agents are credited only on work they actually participated in; published history is not rewritten solely to add attribution.
 
-Current verified commit identity:
+Current verified commit identities:
 
 ```text
 Co-authored-by: Codex <267193182+codex@users.noreply.github.com>
+Co-authored-by: Cursor <cursoragent@cursor.com>
 ```
+
+The Cursor identity covers Cursor cloud/background agents (including Claude running inside
+Cursor); it is the public attribution account Cursor uses on GitHub.
 
 Human maintainers remain responsible for review, merge decisions, and releases.

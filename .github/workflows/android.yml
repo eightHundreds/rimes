@@ -1,0 +1,61 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-unit-test:
+    name: Debug APK + JVM tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@7a6d8a8234af8eb26422e24e3006232cccaa061b # v4.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Fetch pinned prebuilt librime toolchain
+        run: platforms/android/scripts/fetch-prebuilt.sh
+
+      - name: Build stock OpenCC data
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build
+          platforms/android/scripts/build-opencc-data.sh
+
+      - name: Verify the staged rime-data closure
+        run: python3 scripts/platform-preview/preview.py verify --repo-root .
+
+      - name: Build debug APK and run JVM unit tests
+        working-directory: platforms/android
+        run: ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest -PrimesAbis=x86_64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with:
+          name: rimes-android-debug-x86_64
+          path: platforms/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7

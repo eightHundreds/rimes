@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RIMES</string>
+    <string name="ime_label">RIMES 输入法</string>
+    <string name="ime_subtype_zh">中文（雾凇 / 双拼 / 五笔）</string>
+    <string name="settings_title">RIMES 设置</string>
+</resources>

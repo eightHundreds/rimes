@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Rimes" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#22C55E</item>
+        <item name="colorPrimaryVariant">#15803D</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">#EAB308</item>
+        <item name="android:windowBackground">?attr/colorSurface</item>
+    </style>
+    <style name="Theme.Rimes.Settings" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">#15803D</item>
+        <item name="colorPrimaryVariant">#0F6A3F</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">#EAB308</item>
+    </style>
+</resources>

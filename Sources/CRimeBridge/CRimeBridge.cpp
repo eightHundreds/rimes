@@ -282,6 +282,14 @@ struct RimeApi {
 
 typedef RimeApi* (*RimeGetApiFunc)(void);
 
+#if defined(__ANDROID__)
+// Android links a static librime (with its merged lua/octagram/predict
+// plugins) into the same shared object as this bridge, so the entry point is
+// resolved by the linker instead of dlopen/dlsym. The vtable declared above is
+// still the only view of the API this file uses.
+extern "C" RimeApi* rime_get_api(void);
+#endif
+
 static std::mutex gMutex;
 static RimeApi* gApi = nullptr;
 static bool gStarted = false;
@@ -291,14 +299,15 @@ static std::string gSharedDataDir;
 static std::string gUserDataDir;
 static std::string gLogDir;
 
-// Fallback location when the app isn't self-contained: a system Squirrel install.
-static const char* kSquirrelFrameworks =
-    "/Library/Input Methods/Squirrel.app/Contents/Frameworks";
-
 static bool fileExists(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0;
 }
+
+#if !defined(__ANDROID__)
+// Fallback location when the app isn't self-contained: a system Squirrel install.
+static const char* kSquirrelFrameworks =
+    "/Library/Input Methods/Squirrel.app/Contents/Frameworks";
 
 // Prefer the app's own bundled Frameworks dir; fall back to Squirrel's. `leaf`
 // is relative to a Frameworks dir, e.g. "librime.1.dylib" or
@@ -310,6 +319,7 @@ static std::string resolveDylib(const std::string& frameworksDir, const char* le
     }
     return std::string(kSquirrelFrameworks) + "/" + leaf;
 }
+#endif
 
 #define RIME_STRUCT_INIT(Type, var) \
     ((var).data_size = (int)(sizeof(Type) - sizeof((var).data_size)))
@@ -348,6 +358,7 @@ static RimeLeversApi* leversApi() {
     return reinterpret_cast<RimeLeversApi*>(module->get_api());
 }
 
+#if !defined(__ANDROID__)
 static bool loadDylib(const char* path, bool required) {
     void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (handle) return true;
@@ -360,6 +371,7 @@ static bool loadDylib(const char* path, bool required) {
     }
     return !required;
 }
+#endif
 
 bool BBRimeStart(const char* sharedDataDir,
                  const char* userDataDir,
@@ -373,6 +385,12 @@ bool BBRimeStart(const char* sharedDataDir,
     gLogDir = logDir ? logDir : "";
     std::string fw = frameworksDir ? frameworksDir : "";
 
+#if defined(__ANDROID__)
+    // Static link: no library search, no plugin dylibs. `frameworksDir` is
+    // accepted for API compatibility and ignored.
+    (void)fw;
+    RimeGetApiFunc getApi = &rime_get_api;
+#else
     // librime is dlopen'd (not linked). Load it FIRST with RTLD_GLOBAL so that
     // when the plugins below ask for their `@rpath/librime.1.dylib` dependency,
     // dyld satisfies it from this already-loaded image by install-name match —
@@ -392,6 +410,7 @@ bool BBRimeStart(const char* sharedDataDir,
         }
         return false;
     }
+#endif
 
     gApi = getApi();
     if (!gApi) {
