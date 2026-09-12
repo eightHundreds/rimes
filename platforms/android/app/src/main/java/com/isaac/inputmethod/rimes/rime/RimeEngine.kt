@@ -39,7 +39,7 @@ class RimeEngine(
      * compiles every dictionary, so callers run it off the main thread.
      */
     @Synchronized
-    override fun start(): Boolean {
+    fun start(): Boolean {
         if (started) return true
         if (!RimeBridge.ensureLoaded()) {
             IMELog.write("rime start FAILED: native library unavailable")

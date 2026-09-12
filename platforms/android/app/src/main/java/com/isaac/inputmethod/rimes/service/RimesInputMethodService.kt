@@ -249,6 +249,7 @@ class RimesInputMethodService :
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        if (info != null && (!controller.isBound || currentToken == null)) bindCurrentField(info)
         applyPalette()
         render(controller.lastUiState)
     }

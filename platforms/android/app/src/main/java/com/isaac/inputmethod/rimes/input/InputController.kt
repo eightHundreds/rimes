@@ -146,7 +146,7 @@ class InputController(
     }
 
     private fun ensureSessionReady(): Boolean {
-        if (!engine.start()) return false
+        if (!engine.isHealthy) return false
         if (session != 0L && engine.sessionExists(session)) return true
         session = engine.createSession()
         if (session == 0L) return false

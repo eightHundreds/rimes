@@ -72,10 +72,13 @@ class RimesApplication : Application() {
         startFuture?.let { return it }
         val future = engineExecutor.submit<Boolean> {
             try {
+                val hadBuild = java.io.File(deployer.userDir, "build").isDirectory
                 val seeded = deployer.seedIfNeeded()
                 syncSchemaListWithExtension()
                 val ok = engine.start()
-                if (ok && seeded) engine.deploy()
+                // A fresh user dir was fully built by start(); only an upgrade of
+                // already-deployed data needs the explicit incremental redeploy.
+                if (ok && seeded && hadBuild) engine.deploy()
                 ok
             } catch (error: Exception) {
                 IMELog.write("engine bootstrap failed: ${error.javaClass.simpleName}: ${error.message}")

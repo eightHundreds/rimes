@@ -5,8 +5,8 @@ package com.isaac.inputmethod.rimes.rime
  * interface so key routing can be unit-tested against a scripted engine.
  */
 interface RimeEngineApi {
+    /** Non-blocking; a not-yet-started engine reports false and callers fall back to raw text. */
     val isHealthy: Boolean
-    fun start(): Boolean
     fun createSession(): Long
     fun destroySession(session: Long)
     fun sessionExists(session: Long): Boolean

@@ -92,7 +92,6 @@ class FakeEngine : RimeEngineApi {
     }
 
     override val isHealthy: Boolean get() = healthy
-    override fun start(): Boolean = healthy
     override fun createSession(): Long {
         if (!healthy) return 0L
         val id = nextSession++
