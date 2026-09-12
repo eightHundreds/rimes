@@ -123,8 +123,9 @@ class RimeEngineInstrumentedTest {
         try {
             assertTrue(app.engine.selectSchema("wubi86", session))
             assertEquals("wubi86", app.engine.getStatus(session).schemaId)
-            type(session, "ggg")
-            assertTrue(app.engine.getContext(session).candidateList.any { it.text == "三" })
+            type(session, "gggg")
+            val wubi = app.engine.getContext(session)
+            assertTrue("wubi candidates: ${wubi.candidateList.map { it.text }}", wubi.candidateList.any { it.text == "王" })
             app.engine.clearComposition(session)
 
             assertTrue(app.engine.selectSchema("double_pinyin_flypy", session))
@@ -134,7 +135,8 @@ class RimeEngineInstrumentedTest {
 
             assertTrue(app.engine.selectSchema("english", session))
             type(session, "hel")
-            assertTrue(app.engine.getContext(session).candidateList.any { it.text.startsWith("hel", ignoreCase = true) })
+            val english = app.engine.getContext(session)
+            assertTrue("english candidates: ${english.candidateList.map { it.text }}", english.candidateList.any { it.text.startsWith("hel", ignoreCase = true) })
             app.engine.clearComposition(session)
         } finally {
             app.engine.destroySession(session)

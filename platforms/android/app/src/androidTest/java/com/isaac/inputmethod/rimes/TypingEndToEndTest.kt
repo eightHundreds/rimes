@@ -7,6 +7,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
+import android.widget.EditText
 import com.isaac.inputmethod.rimes.settings.PlaygroundActivity
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -80,7 +83,19 @@ class TypingEndToEndTest {
         }
     }
 
-    private fun fieldText(): String = device.findObject(fieldSelector).text ?: ""
+    /** Reads the host EditText directly (the test runs inside the app process). */
+    private fun editTextValue(id: Int): String {
+        var value = ""
+        instrumentation.runOnMainSync {
+            val activity = ActivityLifecycleMonitorRegistry.getInstance()
+                .getActivitiesInStage(Stage.RESUMED)
+                .firstOrNull { it is PlaygroundActivity }
+            value = activity?.findViewById<EditText>(id)?.text?.toString() ?: ""
+        }
+        return value
+    }
+
+    private fun fieldText(): String = editTextValue(PlaygroundActivity.FIELD_ID)
 
     private fun waitForFieldText(expected: String, timeoutMs: Long = 30_000) {
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -130,12 +145,12 @@ class TypingEndToEndTest {
         val deadline = System.currentTimeMillis() + 30_000
         var text = ""
         while (System.currentTimeMillis() < deadline) {
-            text = device.findObject(passwordSelector).text ?: ""
-            if (text.length == 2) break
+            text = editTextValue(PlaygroundActivity.PASSWORD_ID)
+            if (text == "ni") break
             Thread.sleep(300)
         }
-        // UiAutomator reads password fields as masked dots; only the length is observable.
-        assertEquals(2, text.length)
+        // Raw ASCII passthrough: no Rime candidates, no Chinese, no composing span.
+        assertEquals("ni", text)
         device.findObject(passwordSelector).text = ""
     }
 }

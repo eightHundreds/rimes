@@ -119,6 +119,16 @@ Windows 11 实机验证。它目前仍是 commit-only 开发里程碑，尚无�
 `RIMES-Windows-Data-Preview-*` / `RIMES-Linux-Data-Preview-*` 资产安装；完整边界、
 安全策略和验证方式见 [CROSS-PLATFORM-PREVIEW.md](CROSS-PLATFORM-PREVIEW.md)。
 
+### Android 原生输入法（开发中）
+
+[platforms/android](platforms/android/README.md) 是原生 Android `InputMethodService`：
+与 macOS 共用同一份 librime C++ 桥和按键契约，静态链接固定版本的 librime（含 lua /
+octagram / predict 插件），随 APK 打包同一份审核后的 `rime-data` 闭包与 OpenCC 数据，
+并移植了五套核心方案 + 可选并击扩展、每文本框独立 Rime 会话、候选栏与展开矩阵、
+Buffer 工作台（轻按/长按回车投递）、方案选单、四套主题、设置页、学习词库导出/导入
+以及统计扩展。AI 生成、Apple 翻译、Clipboard History、Mailbox、Capsule 与自动更新
+尚未移植；从源码构建与模拟器测试方法见其 README。
+
 ## 文档
 
 | 文档 | 内容 |
