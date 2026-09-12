@@ -33,9 +33,21 @@ mkdir -p "$OUT"
 [[ "$("$ADB" shell getprop sys.boot_completed | tr -d '\r')" == "1" ]] || die "device has not finished booting"
 
 echo "==> installing $APK"
+"$ADB" logcat -c >/dev/null 2>&1 || true
 "$ADB" install -r -t "$APK" >/dev/null
 echo "==> enabling RIMES as the default input method"
-"$ADB" shell ime enable "$IME_ID" >/dev/null
+# InputMethodManagerService refreshes its list asynchronously after install.
+deadline=$((SECONDS + 300))
+until "$ADB" shell ime list -a -s | tr -d '\r' | grep -qx "$IME_ID"; do
+    (( SECONDS < deadline )) || die "system never listed $IME_ID"
+    sleep 3
+done
+deadline=$((SECONDS + 300))
+until "$ADB" shell ime list -s | tr -d '\r' | grep -qx "$IME_ID"; do
+    (( SECONDS < deadline )) || die "could not enable $IME_ID"
+    "$ADB" shell ime enable "$IME_ID" >/dev/null 2>&1 || true
+    sleep 3
+done
 "$ADB" shell ime set "$IME_ID" >/dev/null
 "$ADB" shell settings put secure show_ime_with_hard_keyboard 1 >/dev/null
 [[ "$("$ADB" shell settings get secure default_input_method | tr -d '\r')" == "$IME_ID" ]] \
@@ -82,8 +94,9 @@ screenshot() {
 }
 
 echo "==> opening 键入测试"
-"$ADB" shell am force-stop "$PACKAGE" >/dev/null 2>&1 || true
-"$ADB" shell am start -W -n "$PACKAGE/.settings.PlaygroundActivity" >/dev/null
+# Never force-stop the package: it also hosts the input method service and the
+# system would fall back to another keyboard.
+"$ADB" shell am start -W --activity-clear-task -n "$PACKAGE/.settings.PlaygroundActivity" >/dev/null
 sleep 3
 
 # Focus the field by tapping its bounds from the dump.
@@ -99,6 +112,22 @@ if m:
 "$ADB" shell input tap $bounds >/dev/null
 sleep 2
 
+echo "==> waiting for the engine to finish deploying (first run compiles dictionaries)"
+# The IME window is not part of a uiautomator dump, so readiness is observed
+# through the behaviour log: the service logs exactly one start line per process.
+deadline=$((SECONDS + 2400))
+while :; do
+    if "$ADB" logcat -d -s RIMES:V 2>/dev/null | grep -q "rime start OK"; then
+        break
+    fi
+    if "$ADB" logcat -d -s RIMES:V 2>/dev/null | grep -q "rime start FAILED"; then
+        die "librime failed to start; see adb logcat -s RIMES RimesJNI"
+    fi
+    (( SECONDS < deadline )) || die "engine did not become ready in time"
+    sleep 10
+done
+sleep 3
+
 record_pid=""
 if [[ "$RECORD" == "1" ]]; then
     echo "==> recording screen"
@@ -106,15 +135,6 @@ if [[ "$RECORD" == "1" ]]; then
     record_pid=$!
     sleep 2
 fi
-
-echo "==> waiting for the engine to finish deploying (first run compiles dictionaries)"
-deadline=$((SECONDS + 2400))
-until "$ADB" shell "run-as $PACKAGE ls files/rime/user/build/rime_ice.schema.yaml" >/dev/null 2>&1; do
-    (( SECONDS < deadline )) || die "deployment did not finish in time"
-    sleep 10
-done
-# Give librime a moment to finish the maintenance thread and the smoke session.
-sleep 5
 
 echo "==> case 1: nihao + Space -> 你好"
 press KEYCODE_N KEYCODE_I KEYCODE_H KEYCODE_A KEYCODE_O
